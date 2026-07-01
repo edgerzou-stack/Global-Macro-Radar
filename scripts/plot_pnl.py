@@ -1,28 +1,201 @@
 import json
-import matplotlib.pyplot as plt
 import os
-import matplotlib
-import numpy as np
-from collections import defaultdict
 import shutil
-
+import datetime
+import pandas as pd
+import matplotlib
 matplotlib.use('Agg') # For headless environments
+import matplotlib.pyplot as plt
+from collections import defaultdict
+
+# ==========================================
+# Bright & Clean Theme (Original layout style)
+# ==========================================
+plt.style.use('default')
 plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'PingFang SC', 'Heiti TC']
 plt.rcParams['axes.unicode_minus'] = False
 
-def main():
-    flow_dir = "/Users/zouzhengting/Workplace/a_share_factor_flow"
-    input_file = os.path.join(flow_dir, "dual_screen.json")
-    output_file = os.path.join(flow_dir, "reports/pnl_chart.png")
+STRAT_NAMES = {
+    "dividend_a_stock": "A股红利",
+    "dividend_us_stock": "美股红利",
+    "dividend_hk_stock": "港股红利",
+    "growth_a_stock": "A股成长",
+    "growth_us_stock": "美股成长",
+    "growth_hk_stock": "港股成长",
+    "hot_spot_a_stock": "A股热点",
+    "hot_spot_a_etf": "A股热点ETF",
+    "hot_spot_us_stock": "美股热点",
+    "hot_spot_us_etf": "美股热点ETF",
+    "hot_spot_hk_stock": "港股热点",
+    "hot_spot_hk_etf": "港股热点ETF"
+}
+
+def build_timeseries_pnl(trades: list) -> pd.Series:
+    """
+    Convert a list of trades into a true cumulative PNL time series.
+    """
+    if not trades:
+        return pd.Series(dtype=float)
+        
+    records = []
+    for t in trades:
+        if "exit_date" in t and "pnl" in t:
+            try:
+                date = pd.to_datetime(t["exit_date"].split()[0])
+                pnl_percent = t["pnl"] * 100
+                records.append({"date": date, "pnl": pnl_percent})
+            except Exception:
+                pass
+                
+    if not records:
+        return pd.Series(dtype=float)
+        
+    # Sort by date and calculate running sum
+    df = pd.DataFrame(records).sort_values("date")
     
-    if not os.path.exists(input_file):
-        print(f"File not found: {input_file}")
-        return
+    # We aggregate PNL per day in case multiple trades exit on the same day
+    daily_pnl = df.groupby("date")["pnl"].sum()
+    cum_pnl = daily_pnl.cumsum()
+    
+    # Prepend 0 to start the curve nicely
+    start_date = cum_pnl.index[0] - pd.Timedelta(days=1)
+    cum_pnl.loc[start_date] = 0.0
+    cum_pnl = cum_pnl.sort_index()
+    
+    return cum_pnl
+
+def plot_strategy(strat_id, name, trades, output_file, color, artifact_dir):
+    ts = build_timeseries_pnl(trades)
+    
+    total = len(trades)
+    cum_pnl_val = sum([t["pnl"] * 100 for t in trades])
+    
+    fig, (ax_table, ax_curve) = plt.subplots(1, 2, figsize=(12, 5), gridspec_kw={'width_ratios': [1, 2.5]})
+    
+    if not ts.empty:
+        # If too many points, hide markers to prevent clutter
+        marker = 'o' if len(ts) <= 30 else None
+        markersize = 4 if len(ts) <= 30 else 0
         
-    with open(input_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        ax_curve.plot(ts.index, ts.values, color=color, linewidth=2, 
+                      marker=marker, markersize=markersize, alpha=0.8, label=f"{name} ({cum_pnl_val:+.2f}%)")
+                      
+    ax_curve.axhline(0, color='gray', linestyle='dashed', linewidth=1)
+    ax_curve.set_title(f'{name} - 累计净收益曲线', fontsize=14)
+    ax_curve.set_xlabel('平仓日期', fontsize=12)
+    ax_curve.set_ylabel('累计净收益率 (%)', fontsize=12)
+    ax_curve.tick_params(axis='x', rotation=45)
+    ax_curve.legend(loc='upper left')
+    ax_curve.grid(True, alpha=0.3)
+    
+    # Table subplot
+    ax_table.axis('tight')
+    ax_table.axis('off')
+    ax_table.set_title(f'{name} - 核心指标统计', fontsize=14, pad=20)
+    
+    cell_text = [[f"{total}", f"{cum_pnl_val:+.2f}%"]]
+    row_labels = [name]
+    col_labels = ['总交易(笔)', '总净收益(%)']
+    
+    table = ax_table.table(cellText=cell_text,
+                           rowLabels=row_labels,
+                           rowColours=[color],
+                           colLabels=col_labels,
+                           loc='center',
+                           cellLoc='center')
+                           
+    table.auto_set_font_size(False)
+    table.set_fontsize(12)
+    table.scale(1, 2.5)
+    
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=300, bbox_inches="tight")
+    plt.close()
+    
+    if os.path.exists(artifact_dir):
+        artifact_path = os.path.join(artifact_dir, f"pnl_chart_{strat_id}.png")
+        shutil.copy2(output_file, artifact_path)
+
+def plot_all(strategy_trades, output_file, strat_colors, artifact_dir):
+    fig, (ax_table, ax_curve) = plt.subplots(1, 2, figsize=(18, 8), gridspec_kw={'width_ratios': [1, 2.5]})
+    
+    cell_text = []
+    row_labels = []
+    row_colors = []
+    
+    # Sort strategies by cum PNL
+    strat_metrics = []
+    for strat, trades in strategy_trades.items():
+        cum_pnl = sum([t["pnl"] * 100 for t in trades])
+        strat_metrics.append({"strat": strat, "cum_pnl": cum_pnl, "total": len(trades), "trades": trades})
+    strat_metrics.sort(key=lambda x: x["cum_pnl"], reverse=True)
+    
+    for m in strat_metrics:
+        strat = m["strat"]
+        trades = m["trades"]
+        cum_pnl_val = m["cum_pnl"]
+        total = m["total"]
+        name = STRAT_NAMES.get(strat, strat)
+        color = strat_colors[strat]
         
-    trade_history = data.get("trade_history", [])
+        ts = build_timeseries_pnl(trades)
+        if not ts.empty:
+            marker = 'o' if len(ts) <= 30 else None
+            markersize = 3 if len(ts) <= 30 else 0
+            
+            ax_curve.plot(ts.index, ts.values, color=color, linewidth=1.5, 
+                          linestyle='-', marker=marker, markersize=markersize, 
+                          alpha=0.8, label=f"{name} ({cum_pnl_val:+.2f}%)")
+                          
+            row_labels.append(name)
+            cell_text.append([f"{total}", f"{cum_pnl_val:+.2f}%"])
+            row_colors.append(color)
+
+    ax_curve.axhline(0, color='gray', linestyle='dashed', linewidth=1)
+    ax_curve.set_title('各策略等权累计净收益曲线综合对比 (Master Chart)', fontsize=16)
+    ax_curve.set_xlabel('平仓日期', fontsize=12)
+    ax_curve.set_ylabel('累计净收益率 (%)', fontsize=12)
+    ax_curve.tick_params(axis='x', rotation=45)
+    
+    ax_curve.legend(loc='upper left', bbox_to_anchor=(1.02, 1), borderaxespad=0.)
+    ax_curve.grid(True, alpha=0.3)
+    
+    ax_table.axis('tight')
+    ax_table.axis('off')
+    ax_table.set_title('综合指标统计', fontsize=14, pad=20)
+    
+    if cell_text:
+        col_labels = ['总交易(笔)', '总净收益(%)']
+        table = ax_table.table(cellText=cell_text, rowLabels=row_labels, rowColours=row_colors, colLabels=col_labels, loc='center', cellLoc='center')
+        table.auto_set_font_size(False)
+        table.set_fontsize(10)
+        table.scale(1, 2.0)
+    
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=300, bbox_inches="tight")
+    plt.close()
+    
+    if os.path.exists(artifact_dir):
+        artifact_path = os.path.join(artifact_dir, "pnl_chart_all.png")
+        shutil.copy2(output_file, artifact_path)
+
+def main():
+    flow_dir = os.path.join(os.path.expanduser("~"), "Workplace", "a_share_factor_flow")
+    reports_dir = os.path.join(flow_dir, "reports")
+    os.makedirs(reports_dir, exist_ok=True)
+    
+    for f in os.listdir(reports_dir):
+        if f.startswith("pnl_chart") and f.endswith(".png"):
+            os.remove(os.path.join(reports_dir, f))
+    
+    import sys
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    import db_utils
+    
+    db_path = os.environ.get("SQLITE_DB_PATH", os.path.join(flow_dir, "quant_system.db"))
+    os.environ["SQLITE_DB_PATH"] = db_path
+    
+    _, trade_history = db_utils.load_portfolio_and_trades()
     if not trade_history:
         print("No trade history available to plot.")
         return
@@ -32,127 +205,33 @@ def main():
         print("No valid completed trades found.")
         return
         
-    # Sort trades globally by exit_date
-    valid_trades.sort(key=lambda x: x["exit_date"])
-    
-    # Group by strategy
     strategy_trades = defaultdict(list)
     for t in valid_trades:
         strat = t.get("strategy", "unknown")
         strategy_trades[strat].append(t)
-        
-    # Add a pseudo-strategy for "ALL"
-    strategy_trades["ALL"] = valid_trades
     
-    # Mapping for display names
-    strat_names = {
-        "dividend": "稳健红利",
-        "growth": "高增成长",
-        "hot_spot": "热点战法",
-        "ALL": "全策略综合"
-    }
+    colors_cycle = [
+        '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', 
+        '#e377c2', '#7f7f7f', '#bcbd22', '#17becf', '#000080', '#FF8C00'
+    ]
     
-    # Calculate metrics per strategy
-    metrics_data = []
-    
-    # Create figure with 2 subplots (Table on left, Curves on right)
-    fig, (ax_table, ax_curve) = plt.subplots(1, 2, figsize=(15, 6), gridspec_kw={'width_ratios': [1, 2]})
-    
-    colors_cycle = ['royalblue', 'orange', 'purple', 'cyan', 'magenta']
-    strat_colors = {"ALL": "red"}
+    strat_colors = {}
     c_idx = 0
-    
-    # Data for the table
-    cell_text = []
-    row_labels = []
-    row_colors = []
-    
-    # We want ALL at the bottom of the table, so sort others first
-    strats_to_process = [k for k in strategy_trades.keys() if k != "ALL"]
-    strats_to_process.append("ALL")
-    
-    for strat in strats_to_process:
-        trades = strategy_trades[strat]
-        name = strat_names.get(strat, strat)
+    for strat in STRAT_NAMES.keys():
+        strat_colors[strat] = colors_cycle[c_idx % len(colors_cycle)]
+        c_idx += 1
         
-        pnls = [t["pnl"] * 100 for t in trades]
-        wins = len([p for p in pnls if p > 0])
-        total = len(pnls)
-        win_rate = (wins / total) * 100 if total > 0 else 0
-        cum_pnl = sum(pnls)
-        
-        # Color assigning
-        if strat not in strat_colors:
-            strat_colors[strat] = colors_cycle[c_idx % len(colors_cycle)]
-            c_idx += 1
+    artifact_dir = os.environ.get("ARTIFACT_DIR", "")
+    
+    for strat in STRAT_NAMES.keys():
+        if strat in strategy_trades and strategy_trades[strat]:
+            out_file = os.path.join(reports_dir, f"pnl_chart_{strat}.png")
+            plot_strategy(strat, STRAT_NAMES.get(strat), strategy_trades[strat], out_file, strat_colors[strat], artifact_dir)
             
-        color = strat_colors[strat]
-        
-        # Build Equity Curve Data
-        dates = []
-        cum_returns = []
-        current_cum = 0.0
-        
-        # Initial point
-        if trades:
-            dates.append(trades[0].get("entry_date", "2026-05-01"))
-            cum_returns.append(0.0)
-            
-        for t in trades:
-            current_cum += (t["pnl"] * 100)
-            dates.append(t["exit_date"])
-            cum_returns.append(current_cum)
-            
-        # Plot curve
-        linewidth = 3 if strat == "ALL" else 2
-        linestyle = '-' if strat == "ALL" else '--'
-        alpha = 1.0 if strat == "ALL" else 0.7
-        
-        ax_curve.plot(dates, cum_returns, marker='o', color=color, linewidth=linewidth, 
-                      linestyle=linestyle, alpha=alpha, markersize=4, label=f"{name} ({cum_pnl:+.2f}%)")
-        
-        # Table row
-        row_labels.append(name)
-        cell_text.append([f"{total}", f"{win_rate:.1f}%", f"{cum_pnl:+.2f}%"])
-        row_colors.append(color)
-
-    # Configure Equity Curve Plot
-    ax_curve.axhline(0, color='gray', linestyle='dashed', linewidth=1)
-    ax_curve.set_title('各策略等权累计净收益曲线 (Equity Curves)', fontsize=14)
-    ax_curve.set_xlabel('平仓日期', fontsize=12)
-    ax_curve.set_ylabel('累计净收益率 (%)', fontsize=12)
-    ax_curve.tick_params(axis='x', rotation=45)
-    ax_curve.legend(loc='upper left')
-    ax_curve.grid(True, alpha=0.3)
-    
-    # Configure Table Plot
-    ax_table.axis('tight')
-    ax_table.axis('off')
-    ax_table.set_title('核心策略指标统计', fontsize=14, pad=20)
-    
-    col_labels = ['总交易(笔)', '胜率(%)', '总净收益(%)']
-    
-    table = ax_table.table(cellText=cell_text,
-                           rowLabels=row_labels,
-                           rowColours=row_colors,
-                           colLabels=col_labels,
-                           loc='center',
-                           cellLoc='center')
-                           
-    table.auto_set_font_size(False)
-    table.set_fontsize(12)
-    table.scale(1, 2.5) # Scale for better padding
-    
-    plt.tight_layout()
-    plt.savefig(output_file, dpi=300)
-    print(f"Chart saved to {output_file}")
-    
-    # Also copy to artifacts directory
-    artifact_dir = "/Users/zouzhengting/.gemini/antigravity/brain/cb368359-75c4-4195-b42f-77230af3485d"
-    if os.path.exists(artifact_dir):
-        artifact_path = os.path.join(artifact_dir, "pnl_chart.png")
-        shutil.copy2(output_file, artifact_path)
-        print(f"Chart copied to {artifact_path}")
+    out_file_all = os.path.join(reports_dir, "pnl_chart_all.png")
+    plot_all(strategy_trades, out_file_all, strat_colors, artifact_dir)
+    print("All charts generated (Original Bright Theme with Dense Point Fix).")
 
 if __name__ == "__main__":
     main()
+
