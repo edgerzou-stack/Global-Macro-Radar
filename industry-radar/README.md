@@ -13,7 +13,7 @@ An automated, dual-track intelligence gathering system that acts as your persona
 - **Triple-Tier Cascade LLM Engine**: Leverages a robust fallback chain (Google Gemini -> OpenAI -> DeepSeek) to maximize stability, prevent API rate limits, and minimize costs.
 - **Strict "Needle in a Haystack" Anti-Spam**: Employs context-aware temporal logic (injecting the precise Current Date) to ruthlessly identify and filter out "炒冷饭" (re-hashed old news), news roundups, and shopping deals.
 - **Intelligent Deduplication**: Automatically merges identical news events reported by multiple outlets into a single, highly condensed summary while preserving the earliest publication date.
-- **Deep Dive Reports**: Automatically generates a multi-thousand-word deep-dive appendix for the rarest "Supernova" events (Requires Innovation >= 9 AND Traffic >= 9), elegantly separated by massive whitespace for a clean reading experience.
+- **Deep Dive Reports**: Automatically generates a multi-thousand-word deep-dive appendix for the rarest "Supernova" events (Requires Innovation Score + Traffic Score >= 18), elegantly separated by massive whitespace for a clean reading experience.
 - **Top-Tier Global Sources**: Pulls raw intelligence from high-signal sources including *The Information, Hacker News, MIT Technology Review, TechCrunch, 36Kr*, and more.
 
 ## Deployment & Execution
