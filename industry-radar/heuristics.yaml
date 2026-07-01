@@ -1,0 +1,123 @@
+keywords:
+  hardcore_tech:
+  - agi
+  - llm
+  - nvidia
+  - openai
+  - gemini
+  - quantum
+  - semiconductor
+  - gpu
+  - tsmc
+  - asml
+  - spacex
+  - robotics
+  - autonomous
+  - breakthrough
+  - foundation model
+  - 机器人
+  - 大模型
+  - 算力
+  - 芯片
+  - 固态电池
+  - 自动驾驶
+  - ai reliability
+  - hallucination mitigation
+  - automated customer interactions
+  - microtomography
+  - machine learning
+  - open science
+  - ugc
+  - mod marketplace
+  - content capture
+  - hbm
+  - ai infrastructure
+  - data center ssd
+  - agentic ai
+  - data center cpu
+  - cuda
+  - llm inference
+  - asic
+  - gigawatt-scale data centers
+  - sub-1nm
+  - ai
+  - cloud native
+  - data flywheel
+  - microtransactions
+  - memory chips
+  - long-term contracts
+  - pdf 1.7
+  - compression stream
+  - object structure
+  - ai data centers
+  - apple intelligence
+  - ai memory
+  - long-term agreements
+  - ai inference
+  - physical ai
+  - tech journalism
+  - creator economy
+  - digital media
+  - pdf parsing
+  - ocr
+  - document ai
+  - recommendation system
+  - platform governance
+  - ai supply chain
+  - exascale computing
+  - cpu-only architecture
+  - technological sovereignty
+  - supercomputing
+  - artificial intelligence
+  - cpu architecture
+  - exascale
+  - hpcg
+  - supercomputer
+  - export controls
+  - exaflop
+  - hpc
+  - ai safety benchmarking
+  - jailbreak robustness
+  - youth-safety policies
+  - sovereign ai
+  - pdf
+  - data extraction
+  business:
+  - funding
+  - series a
+  - series b
+  - acquisition
+  - ipo
+  - valuation
+  - startup
+  - 融资
+  - 上市
+  - 收购
+  - 独角兽
+  - 估值
+  noise:
+  - rumor
+  - review
+  - deals
+  - discount
+  - unboxing
+  - case
+  - accessory
+  - gossip
+  - 传闻
+  - 评测
+  - 开箱
+  - 优惠
+  - 手机壳
+domain_weights:
+  theinformation.com: 10
+  hnrss.org: 9
+  technologyreview.com: 8
+  techcrunch.com: 7
+  wired.com: 7
+  36kr.com: 7
+  huxiu.com: 7
+  cnbc.com: 5
+  venturebeat.com: 5
+  jiqizhixin.com: 5
+  geekpark.net: 5

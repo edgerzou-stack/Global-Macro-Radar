@@ -1,0 +1,83 @@
+industries:
+  - name: 泛科技与核心算力
+    keywords: ["AI", "Semiconductor", "Robotics", "Quantum", "SaaS", "Big Tech", "Hardware", "Startup"]
+  - name: 医药与生物科技
+    keywords: ["Biotech", "Pharma", "CRISPR", "Genomics", "Synthetic Biology", "医药", "生物", "基因", "创新药"]
+  - name: 新能源与气候科技
+    keywords: ["Clean Energy", "EV", "Battery", "Solar", "Fusion", "Material", "新能源", "光伏", "固态电池", "新材料", "核聚变"]
+  - name: 航空航天与深空探索
+    keywords: ["Aerospace", "SpaceX", "Satellite", "Space", "Aviation", "航天", "星链", "商业航天", "卫星"]
+  - name: 脑机接口与下一代交互
+    keywords: ["Brain-Computer Interface", "BCI", "Neuralink", "AR", "VR", "Spatial Computing", "脑机接口", "空间计算"]
+importance_criteria: |
+  请对这篇科技产业新闻进行“双维打分”（硬核创新 vs 流量舆情）：
+  
+  维度一：硬核创新分 (Innovation Score，0-10分)
+  衡量底层技术、长远商业价值和颠覆性。
+  - 8-10分：核心技术的重大跃进。
+  - 【强制审查】：如果文章没有具体事实，仅为公关文，扣分。
+
+  维度二：流量与舆情分 (Traffic & Hype Score，0-10分)
+  衡量消费者狂热度、社交媒体热度、以及对产业链的实际影响。
+  - 8-10分：现象级流量风口。
+  - 【强制审查】：纯二级市场交易信息扣分。
+
+trusted_sources:
+  # 白名单媒体，若在此列表内，打分将在代码中自动享受硬核分数加权 (+1.0)
+  - "Nature"
+  - "Science"
+
+rss_feeds:
+  # 顶级创投内参 & 黑客前沿
+  - "https://www.theinformation.com/feed"  # The Information
+  - "https://hnrss.org/frontpage?points=100" # Hacker News Top 100
+  - "https://www.technologyreview.com/feed/" # MIT科技评论
+  
+  # 综合未来前沿科技 (Singularity, 脑机等)
+  - "https://singularityhub.com/feed/" # Singularity Hub (指数级增长科技，改变未来)
+  
+  # 全球顶级科技媒体 & 产业动态
+  - "https://techcrunch.com/category/artificial-intelligence/feed/" # TechCrunch AI
+  - "https://techcrunch.com/category/startups/feed/" # TechCrunch Startups
+  - "https://techcrunch.com/category/venture/feed/" # TechCrunch VC
+  - "https://feeds.feedburner.com/venturebeat/SpiZ" # VentureBeat (深度关注AI与企服)
+  - "https://www.wired.com/feed/rss" # Wired 连线杂志
+  - "https://www.theverge.com/rss/index.xml" # The Verge (前沿科技与消费电子)
+  - "https://www.tomshardware.com/feeds/all" # Tom's Hardware (硬核半导体与硬件)
+  - "https://www.artificialintelligence-news.com/feed/" # AI News (纯AI产业新闻)
+  - "https://feed.infoq.com/" # InfoQ (硬核软件开发与架构)
+  - "https://siliconangle.com/feed/" # SiliconANGLE (硬核企业级科技/云/芯片)
+  - "https://feeds.arstechnica.com/arstechnica/technology-lab" # Ars Technica
+  
+  # 医药与生物科技
+  - "https://www.fiercebiotech.com/rss/xml" # Fierce Biotech (全球顶级创新药与生物科技)
+  - "https://www.statnews.com/feed/" # STAT News (顶级医疗健康前沿)
+  
+  # 新能源、出行与气候科技
+  - "https://electrek.co/feed/" # Electrek (电动车与绿能)
+  - "https://cleantechnica.com/feed/" # CleanTechnica (清洁能源与光伏)
+  
+  # 航空航天与深空探索
+  - "https://spacenews.com/feed/" # SpaceNews (全球顶级商业航天)
+  - "https://www.space.com/feeds/all" # Space.com (深空探索)
+  
+  # 中国本土顶级科技商业与AI媒体
+  - "https://36kr.com/feed" # 36氪
+  - "https://www.huxiu.com/rss/0.xml" # 虎嗅
+  - "https://www.geekpark.net/rss" # 极客公园
+  - "https://www.jiqizhixin.com/rss" # 机器之心 (中国最硬核的AI媒体)
+  - "https://www.ifanr.com/feed" # 爱范儿 (科技与生活方式)
+
+output:
+  format: "markdown"
+  language: "Chinese"
+  min_score_to_keep: 8 # 任一维度达到 8 分即保留
+  hours_back: 48 # 过去48小时
+  model: "deepseek-chat" # 使用 DeepSeek 进行核心推理
+
+delivery:
+  enabled: true
+  sender_email: "your_sender@example.com" # 填写你的发送邮箱地址
+  recipient_email: "your_recipient@example.com"      # 接收报告的邮箱
+  smtp_server: "smtp.mail.me.com"
+  smtp_port: 587
