@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 import argparse
-from datetime import date, timedelta
 import json
+from datetime import date, timedelta, datetime
 import sys
+import os
 import time
 from typing import Optional
 
@@ -17,7 +18,7 @@ from data_provider import (
 )
 import pandas as pd
 
-AUTO_REPORT_LOOKBACK = 4
+AUTO_REPORT_LOOKBACK = 6
 QUARTER_ENDS = ((3, 31), (6, 30), (9, 30), (12, 31))
 ANNUAL_REPORT_LOOKBACK = 8
 LONG_TERM_CAGR_YEARS = 3
@@ -79,18 +80,33 @@ def load_ttm_dividend_yield_table(
     if target_codes is not None:
         base = base[base["股票代码"].isin(target_codes)].copy()
 
+    import concurrent.futures
+    import time
+    import random
+
+    def fetch_dividend(row):
+        time.sleep(random.uniform(0.01, 0.1))
+        return {
+            "股票代码": row["股票代码"],
+            "TTM股息率": calculate_ttm_dividend_yield_for_code(
+                symbol=row["股票代码"],
+                as_of_date=as_of_date,
+                latest_price=row["最新价"],
+            ),
+        }
+
     rows = []
-    for _, row in base.iterrows():
-        rows.append(
-            {
-                "股票代码": row["股票代码"],
-                "TTM股息率": calculate_ttm_dividend_yield_for_code(
-                    symbol=row["股票代码"],
-                    as_of_date=as_of_date,
-                    latest_price=row["最新价"],
-                ),
-            }
-        )
+    from tqdm import tqdm
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(fetch_dividend, row): row for _, row in base.iterrows()}
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc=f"Fetching dividend yield for {len(base)} candidates"):
+            try:
+                res = future.result()
+                rows.append(res)
+            except Exception as e:
+                # Silently skip or log errors for individual stocks
+                pass
+                
     return pd.DataFrame(rows)
 
 
@@ -222,9 +238,18 @@ def load_dynamic_cagr_table(
         yjbb["年报年份"] = int(report_date[:4])
         return yjbb
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(process_annual, d) for d in annual_report_dates]
-        for future in concurrent.futures.as_completed(futures):
+    from tqdm import tqdm
+    import concurrent.futures
+    import random
+    import time
+    
+    def process_annual_with_delay(d):
+        time.sleep(random.uniform(0.1, 0.4))
+        return process_annual(d)
+        
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(process_annual_with_delay, d): d for d in annual_report_dates}
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Loading A-share dynamic CAGR"):
             res = future.result()
             if res is not None:
                 frames.append(res)
@@ -391,9 +416,18 @@ def load_financial_table_as_of(
             ]
         ]
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(process_candidate, c) for c in candidate_report_dates]
-        for future in concurrent.futures.as_completed(futures):
+    from tqdm import tqdm
+    import concurrent.futures
+    import random
+    import time
+
+    def process_candidate_with_delay(c):
+        time.sleep(random.uniform(0.1, 0.4))
+        return process_candidate(c)
+        
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(process_candidate_with_delay, c): c for c in candidate_report_dates}
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Loading A-share financial tables"):
             res = future.result()
             if res is not None:
                 frames.append(res)
@@ -427,7 +461,27 @@ def load_financial_table_as_of(
     financial = financial.sort_values(
         ["股票代码", "财务报告期_dt", "最新公告日期", "公告日期"],
         ascending=[True, False, False, False],
-    ).drop_duplicates("股票代码", keep="first")
+    )
+    
+    # Add 4-quarter YoY positive growth flag
+    def check_acceleration(grp):
+        import numpy as np
+        if len(grp) < 4:
+            return False
+            
+        grp_asc = grp.sort_values("财务报告期_dt", ascending=True)
+        prof_yoy = pd.to_numeric(grp_asc["净利润-同比增长"].values[-4:], errors="coerce")
+        rev_yoy = pd.to_numeric(grp_asc["营业总收入-同比增长"].values[-4:], errors="coerce")
+        
+        if np.isnan(prof_yoy).any() or np.isnan(rev_yoy).any():
+            return False
+            
+        return (prof_yoy > 0).all() and (rev_yoy > 0).all()
+
+    accel_flags = financial.groupby("股票代码").apply(check_acceleration).reset_index(name="4个季度连续加速增长")
+    financial = financial.merge(accel_flags, on="股票代码", how="left")
+    
+    financial = financial.drop_duplicates("股票代码", keep="first")
     financial = financial.drop(columns=["财务报告期_dt"])
 
     mode = "fixed_report_date" if report_date else "latest_disclosed_as_of_quote_date"
@@ -475,6 +529,7 @@ def attach_latest_financial_fields(
                 "净利润-净利润",
                 "净利润-同比增长",
                 "资产负债率",
+                "4个季度连续加速增长",
                 "所处行业",
                 "最新公告日期",
                 "公告日期",
@@ -610,40 +665,58 @@ def passes_valuation_formula(row: pd.Series, max_value: float) -> bool:
 def filter_dividend_strategy(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
     if df.empty:
         return df.copy()
+        
+    roe_series = df.get("3年平均净资产收益率", df.get("净资产收益率"))
+    net_margin_series = df.get("3年平均净利率", df.get("销售净利率"))
+    
     mask = (
         df["估值公式值"].notna() & (df["估值公式值"] < args.valuation_formula_max)
         & df["3年经营现金流平均增速"].notna() & (df["3年经营现金流平均增速"] > 0)
         & df["总市值"].notna() & (df["总市值"] > args.market_cap_min_yi * 1e8)
         & df["资产负债率"].notna() & (df["资产负债率"] < args.debt_ratio_max)
-        & df["3年平均净利率"].notna() & (df["3年平均净利率"] > args.avg_net_profit_margin_min)
+        & net_margin_series.notna() & (net_margin_series > args.avg_net_profit_margin_min)
         & df["3年净利润CAGR"].notna() & (df["3年净利润CAGR"] > args.profit_cagr_min)
-        & (df["3年营收同比均为正"] == True)
-        & (df["3年净利润同比均为正"] == True)
+        & roe_series.notna() & (roe_series > args.dividend_roe_min)
     )
-    if args.require_continuous_growth:
-        mask = mask & (df["3年连续双增长"] == True)
     return df[mask].copy()
 
-TECH_INDUSTRIES = ["半导体", "计算机设备", "软件开发", "通信设备", "通信服务", "光学光电子", "消费电子", "元件", "其他电子Ⅱ", "电子化学品Ⅱ", "IT服务Ⅱ", "数字媒体"]
+# 成长股科技制造底池
+GROWTH_INDUSTRIES = [
+    # 科技 (Tech)
+    "半导体", "计算机设备", "软件开发", "通信设备", "通信服务",
+    "光学光电子", "消费电子", "元件", "其他电子Ⅱ", "电子化学品Ⅱ",
+    "IT服务Ⅱ", "数字媒体"
+]
 
 def filter_growth_strategy(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+    """
+    4-Quarter Accelerating Growth Strategy (连续4个季度加速爆发):
+    1. Industry in GROWTH_INDUSTRIES
+    2. Latest YoY Profit Growth > args.growth_yoy_min (e.g. 30%)
+    3. Latest YoY Revenue Growth > args.growth_yoy_min (e.g. 30%)
+    4. Past 4 quarters YoY Profit & Revenue Growth must be strictly increasing.
+    5. ROE (latest) > args.growth_roe_min
+    6. Net Margin (latest) > args.avg_net_profit_margin_min
+    7. Market Cap > args.market_cap_min_yi * 100 million
+    8. Debt Ratio < args.debt_ratio_max
+    """
     if df.empty:
         return df.copy()
+
+    roe_series = df.get("3年平均净资产收益率", df.get("净资产收益率"))
+    net_margin_series = df.get("3年平均净利率", df.get("销售净利率"))
+    profit_yoy_series = df.get("净利润-同比增长", df.get("净利润同比增长率"))
+    revenue_yoy_series = df.get("营业总收入-同比增长", df.get("营业总收入同比增长率"))
+
     mask = (
-        df["总市值"].notna() & (df["总市值"] > args.market_cap_min_yi * 1e8)
-        & df["所处行业"].isin(TECH_INDUSTRIES)
-        & df["资产负债率"].notna() & (df["资产负债率"] < args.debt_ratio_max)
-        & df["3年平均净资产收益率"].notna() & (df["3年平均净资产收益率"] > args.growth_roe_min)
-        & df["3年平均净利率"].notna() & (df["3年平均净利率"] > args.avg_net_profit_margin_min)
-        & df["3年净利润CAGR"].notna() & (df["3年净利润CAGR"] > args.growth_profit_cagr_min)
-        & df["3年营收CAGR"].notna() & (df["3年营收CAGR"] > args.growth_revenue_cagr_min)
-        & (df["3年营收同比均为正"] == True)
-        & (df["3年净利润同比均为正"] == True)
-        & df["PE"].notna() & (df["PE"] < df["3年营收CAGR"]) & (df["PE"] < df["3年净利润CAGR"])
+        df["所处行业"].isin(GROWTH_INDUSTRIES)
+        & df["总市值"].notna() & (df["总市值"] > args.market_cap_min_yi * 1e8)
+        & (df["资产负债率"].isna() | (df["资产负债率"] < args.debt_ratio_max))
+        & df["4个季度连续加速增长"].fillna(False)
+        & (df["PE"].isna() | ((df["PE"] < profit_yoy_series) & (df["PE"] < revenue_yoy_series)))
     )
-    if args.require_continuous_growth:
-        mask = mask & (df["3年连续双增长"] == True)
     return df[mask].copy()
+
 def attach_ttm_dividend_yield(
     df: pd.DataFrame, as_of_date: date
 ) -> pd.DataFrame:
@@ -679,32 +752,39 @@ def threshold_payload(args: argparse.Namespace) -> dict:
 
 
 def output_columns(df: pd.DataFrame) -> pd.DataFrame:
-    return df[
-        [
-            "股票代码",
-            "股票简称",
-            "财务报告期",
-            "营业总收入-营业总收入",
-            "净利润-净利润",
-            "PE",
-            "PB",
-            "估值公式值",
-            "TTM股息率",
-            "总市值(亿元)",
-            "CAGR终点年报",
-            "CAGR起点年报",
-            "3年连续双增长",
-            "3年营收同比均为正",
-            "3年净利润同比均为正",
-            "3年平均净资产收益率",
-            "3年平均净利率",
-            "3年经营现金流平均增速",
-            "所处行业",
-            "3年营收CAGR",
-            "3年净利润CAGR",
-            "资产负债率",
-        ]
-    ].sort_values(["PB", "TTM股息率"], ascending=[True, False])
+    cols = [
+        "股票代码",
+        "股票简称",
+        "最新价",
+        "财务报告期",
+        "营业总收入-营业总收入",
+        "净利润-净利润",
+        "PE",
+        "PB",
+        "估值公式值",
+        "TTM股息率",
+        "总市值(亿元)",
+        "CAGR终点年报",
+        "CAGR起点年报",
+        "3年连续双增长",
+        "3年营收同比均为正",
+        "3年净利润同比均为正",
+        "净资产收益率",
+        "销售净利率",
+        "净利润同比增长率",
+        "营业总收入同比增长率",
+        "3年经营现金流平均增速",
+        "所处行业",
+        "3年营收CAGR",
+        "3年净利润CAGR",
+        "资产负债率",
+    ]
+    # Add missing columns as NaN
+    for col in cols:
+        if col not in df.columns:
+            df[col] = pd.NA
+            
+    return df[cols].sort_values(["PB", "TTM股息率"], ascending=[True, False])
 
 
 def number_or_none(value) -> Optional[float]:
@@ -742,9 +822,9 @@ def evaluate_holding(row: pd.Series, args: argparse.Namespace, user_input: str) 
             lambda x: x > args.market_cap_min_yi,
         ),
         (
-            "3年平均净利率",
+            "销售净利率",
             f"过去3年平均净利率 > {args.avg_net_profit_margin_min}%",
-            row["3年平均净利率"],
+            row["销售净利率"],
             lambda x: x > args.avg_net_profit_margin_min,
         ),
         (
@@ -815,7 +895,7 @@ def evaluate_holding(row: pd.Series, args: argparse.Namespace, user_input: str) 
             "3年连续双增长": row.get("3年连续双增长"),
             "3年营收同比均为正": row.get("3年营收同比均为正"),
             "3年净利润同比均为正": row.get("3年净利润同比均为正"),
-            "3年平均净利率": number_or_none(row["3年平均净利率"]),
+            "销售净利率": number_or_none(row["销售净利率"]),
             "3年营收CAGR": number_or_none(row["3年营收CAGR"]),
             "3年净利润CAGR": number_or_none(row["3年净利润CAGR"]),
             "资产负债率": number_or_none(row["资产负债率"]),
@@ -838,12 +918,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dividend-yield-min", type=float, default=3.0)
     parser.add_argument("--market-cap-min-yi", type=float, default=100.0)
     parser.add_argument("--avg-net-profit-margin-min", type=float, default=10.0)
-    parser.add_argument("--require-continuous-growth", action="store_true")
+    parser.add_argument("--require-continuous-growth", action="store_true", default=False)
     parser.add_argument("--profit-cagr-min", type=float, default=5.0)
-    parser.add_argument("--growth-profit-cagr-min", type=float, default=20.0)
-    parser.add_argument("--growth-revenue-cagr-min", type=float, default=20.0)
+    # 1-year explosive growth thresholds
+    parser.add_argument("--growth-yoy-min", type=float, default=30.0)
     parser.add_argument("--growth-roe-min", type=float, default=10.0)
+    # Dividend thresholds
     parser.add_argument("--debt-ratio-max", type=float, default=50.0)
+    parser.add_argument("--dividend-roe-min", type=float, default=10.0,
+                        help="Minimum 3-year avg ROE for dividend strategy (default: 10%%)")
     parser.add_argument(
         "--output-file",
         help="Optional JSON output file path. If omitted, print to stdout.",
@@ -857,13 +940,91 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+
+
+def compute_portfolio_diff(strategy, old_port, new_results_list, current_prices, snapshot_date):
+    diff = {"added": [], "removed": []}
+    new_port = {}
+    trade_history = []
+    
+    old_keys = set(old_port.keys())
+    
+    # We use stock code as key. If old portfolio uses names, we try to match them.
+    # But wait, in new_results_list we have both 股票代码 and 股票简称.
+    new_keys = {r["股票代码"] for r in new_results_list}
+    
+    # Actually, to make it backwards compatible, if old_keys look like names (not digits), we can map them.
+    # We will just assume new keys are codes, and we will try to migrate old keys if they match.
+    old_port_by_code = {}
+    for k, v in old_port.items():
+        if not k.isdigit():
+            # It's a name. Try to find its code in new_results_list or current_prices (if we stored codes).
+            # This is hard. If it's a name, we just keep it as name and let it be removed.
+            old_port_by_code[k] = v
+        else:
+            old_port_by_code[k] = v
+            
+    old_keys = set(old_port_by_code.keys())
+    # Actually, to be safe, let's keep using names for now, or just use code for new added and keep name for old.
+    # Let's use code.
+    added = new_keys - old_keys
+    removed = old_keys - new_keys
+    
+    for key in added:
+        price = current_prices.get(key, 0)
+        diff["added"].append({"name": key, "entry_price": price})
+        new_port[key] = {"entry_date": snapshot_date, "entry_price": price}
+        
+    for key in removed:
+        ep = old_port_by_code.get(key, {}).get("entry_price", 0)
+        entry_date = old_port_by_code.get(key, {}).get("entry_date", "未知")
+        if entry_date == snapshot_date:
+            continue  # T+1 rule
+        cp = current_prices.get(key, 0)
+        fee = 0.001
+        pnl = (cp / ep - 1) - fee if ep > 0 else 0
+        diff["removed"].append({"name": key, "entry_price": ep, "exit_price": cp, "pnl": pnl})
+        trade_history.append({
+            "strategy": strategy, "name": key, "entry_date": entry_date, 
+            "entry_price": ep, "exit_date": snapshot_date, "exit_price": cp, "pnl": pnl
+        })
+        
+    for key in new_keys & old_keys:
+        new_port[key] = old_port_by_code[key]
+        
+    return diff, new_port, trade_history
+
+
+def annotate_pnl(result_list, portfolio, current_prices):
+    for r in result_list:
+        # Use code if present, otherwise name
+        key = r.get("股票代码", r.get("股票简称"))
+        if key in portfolio:
+            ep = portfolio[key].get("entry_price", 0)
+            if ep > 0:
+                cp = current_prices.get(key, 0)
+                r["持仓盈亏(%)"] = round((cp / ep - 1) * 100, 2)
+            else:
+                r["持仓盈亏(%)"] = 0.0
+    return result_list
+
+def normalize_columns(df):
+    col_rename_map = {
+        "净利润-同比增长": "净利润同比增长率",
+        "营业总收入-同比增长": "营业总收入同比增长率",
+        "3年平均净资产收益率": "净资产收益率",
+        "3年平均净利率": "销售净利率"
+    }
+    return df.rename(columns={k: v for k, v in col_rename_map.items() if k in df.columns})
+
 def main() -> int:
     args = build_parser().parse_args()
 
     if args.force_refresh:
         clear_cache()
-    quote_snapshot_date = date.today()
-    snapshot_date = quote_snapshot_date.isoformat()
+    from core.clock import clock
+    quote_snapshot_date = clock.today()
+    snapshot_date = clock.now().strftime("%Y-%m-%d %H:%M")
     holdings = parse_holding_inputs(args.holding)
 
     if holdings:
@@ -883,6 +1044,8 @@ def main() -> int:
             row["股票代码"]: row["输入"]
             for _, row in resolved_holdings.iterrows()
         }
+
+        merged = normalize_columns(merged)
 
         checks = []
         for _, row in merged.sort_values("股票代码").iterrows():
@@ -918,6 +1081,8 @@ def main() -> int:
         combined_df = with_cagr[with_cagr["股票代码"].isin(combined_codes)].copy()
         with_dividend = attach_ttm_dividend_yield(combined_df, quote_snapshot_date)
         
+        with_dividend = normalize_columns(with_dividend)
+        
         # Apply dividend filter for dividend strategy
         final_dividend = with_dividend[with_dividend["股票代码"].isin(dividend_candidates["股票代码"])].copy()
         if not final_dividend.empty:
@@ -931,21 +1096,42 @@ def main() -> int:
         div_result_list = div_result.to_dict(orient="records")
         gro_result_list = gro_result.to_dict(orient="records")
         
-        current_prices = {row["股票简称"]: row.get("最新价", 0) for row in quote_stage.to_dict(orient="records")}
+        current_prices = {row["股票代码"]: row.get("最新价", 0) for row in quote_stage.to_dict(orient="records")}
+        # also fall back to name for backwards compatibility
+        current_prices.update({row["股票简称"]: row.get("最新价", 0) for row in quote_stage.to_dict(orient="records")})
         
+        hot_spot_list = []
+        hot_spot_file = os.environ.get("PROJECT_ROOT", "/Users/zouzhengting/Workplace/a_share_factor_flow") + "/hot_spot_today.json"
+        if os.path.exists(hot_spot_file):
+            try:
+                with open(hot_spot_file, "r", encoding="utf-8") as f:
+                    hot_spot_data = json.load(f)
+                    if isinstance(hot_spot_data, dict):
+                        hot_spot_list = hot_spot_data.get("hot_spot_a_stock", [])
+                    elif isinstance(hot_spot_data, list):
+                        hot_spot_list = hot_spot_data
+                for row in hot_spot_list:
+                    current_prices[row["股票代码"]] = row.get("最新价", 0)
+                    current_prices[row["股票简称"]] = row.get("最新价", 0)
+            except Exception as e:
+                print(f"Error loading hot_spot_today.json: {e}")
+                
         diff = {
             "dividend": {"added": [], "removed": []},
-            "growth": {"added": [], "removed": []}
+            "growth": {"added": [], "removed": []},
+            "hot_spot": {"added": [], "removed": []}
         }
         portfolio = {
             "dividend": {},
-            "growth": {}
+            "growth": {},
+            "hot_spot": {}
         }
+        trade_history = []
         
-        if args.output_file:
-            import os
-            if os.path.exists(args.output_file):
-                try:
+        trade_history = []
+        
+        if args.output_file and os.path.exists(args.output_file):
+            try:
                     with open(args.output_file, "r", encoding="utf-8") as f:
                         old_payload = json.load(f)
                         
@@ -956,85 +1142,42 @@ def main() -> int:
                     
                     # Backwards compatibility: if no portfolio in old json, construct from results
                     if not old_div_port:
-                        old_div_port = {r["股票简称"]: {"entry_date": "未知", "entry_price": r.get("最新价", 0)} for r in old_payload.get("results", {}).get("dividend", [])}
+                        old_div_port = {r.get("股票代码", r["股票简称"]): {"entry_date": "未知", "entry_price": r.get("最新价", 0)} for r in old_payload.get("results", {}).get("dividend", [])}
                     if not old_gro_port:
-                        old_gro_port = {r["股票简称"]: {"entry_date": "未知", "entry_price": r.get("最新价", 0)} for r in old_payload.get("results", {}).get("growth", [])}
+                        old_gro_port = {r.get("股票代码", r["股票简称"]): {"entry_date": "未知", "entry_price": r.get("最新价", 0)} for r in old_payload.get("results", {}).get("growth", [])}
                         
-                    old_div = set(old_div_port.keys())
-                    old_gro = set(old_gro_port.keys())
-                    new_div = {r["股票简称"] for r in div_result_list}
-                    new_gro = {r["股票简称"] for r in gro_result_list}
+                    diff_div, port_div, trades_div = compute_portfolio_diff("dividend", old_div_port, div_result_list, current_prices, snapshot_date)
+                    diff_gro, port_gro, trades_gro = compute_portfolio_diff("growth", old_gro_port, gro_result_list, current_prices, snapshot_date)
+                    diff_hot, port_hot, trades_hot = compute_portfolio_diff("hot_spot", old_portfolio.get("hot_spot", {}), hot_spot_list, current_prices, snapshot_date)
                     
-                    added_div = new_div - old_div
-                    removed_div = old_div - new_div
-                    added_gro = new_gro - old_gro
-                    removed_gro = old_gro - new_gro
+                    diff["dividend"] = diff_div
+                    diff["growth"] = diff_gro
+                    diff["hot_spot"] = diff_hot
                     
-                    for name in added_div:
-                        price = current_prices.get(name, 0)
-                        diff["dividend"]["added"].append({"name": name, "entry_price": price})
-                    for name in removed_div:
-                        ep = old_div_port.get(name, {}).get("entry_price", 0)
-                        cp = current_prices.get(name, 0)
-                        pnl = (cp / ep - 1) if ep > 0 else 0
-                        diff["dividend"]["removed"].append({"name": name, "entry_price": ep, "exit_price": cp, "pnl": pnl})
-                        trade_history.append({"strategy": "dividend", "name": name, "entry_date": old_div_port.get(name, {}).get("entry_date", "未知"), "entry_price": ep, "exit_date": snapshot_date, "exit_price": cp, "pnl": pnl})
-                        
-                    for name in added_gro:
-                        price = current_prices.get(name, 0)
-                        diff["growth"]["added"].append({"name": name, "entry_price": price})
-                    for name in removed_gro:
-                        ep = old_gro_port.get(name, {}).get("entry_price", 0)
-                        cp = current_prices.get(name, 0)
-                        pnl = (cp / ep - 1) if ep > 0 else 0
-                        diff["growth"]["removed"].append({"name": name, "entry_price": ep, "exit_price": cp, "pnl": pnl})
-                        trade_history.append({"strategy": "growth", "name": name, "entry_date": old_gro_port.get(name, {}).get("entry_date", "未知"), "entry_price": ep, "exit_date": snapshot_date, "exit_price": cp, "pnl": pnl})
-                        
-                    for name in new_div:
-                        if name in old_div_port:
-                            portfolio["dividend"][name] = old_div_port[name]
-                        else:
-                            portfolio["dividend"][name] = {"entry_date": snapshot_date, "entry_price": current_prices.get(name, 0)}
-                    for name in new_gro:
-                        if name in old_gro_port:
-                            portfolio["growth"][name] = old_gro_port[name]
-                        else:
-                            portfolio["growth"][name] = {"entry_date": snapshot_date, "entry_price": current_prices.get(name, 0)}
-                        
-                except Exception as e:
-                    print(f"Error processing portfolio tracking: {e}")
-                    trade_history = []
-                    for name in {r["股票简称"] for r in div_result_list}:
-                        portfolio["dividend"][name] = {"entry_date": snapshot_date, "entry_price": current_prices.get(name, 0)}
-                    for name in {r["股票简称"] for r in gro_result_list}:
-                        portfolio["growth"][name] = {"entry_date": snapshot_date, "entry_price": current_prices.get(name, 0)}
-            else:
-                trade_history = []
-                for name in {r["股票简称"] for r in div_result_list}:
-                    portfolio["dividend"][name] = {"entry_date": snapshot_date, "entry_price": current_prices.get(name, 0)}
-                    diff["dividend"]["added"].append({"name": name, "entry_price": current_prices.get(name, 0)})
-                for name in {r["股票简称"] for r in gro_result_list}:
-                    portfolio["growth"][name] = {"entry_date": snapshot_date, "entry_price": current_prices.get(name, 0)}
-                    diff["growth"]["added"].append({"name": name, "entry_price": current_prices.get(name, 0)})
+                    portfolio["dividend"] = port_div
+                    portfolio["growth"] = port_gro
+                    portfolio["hot_spot"] = port_hot
+                    
+                    trade_history.extend(trades_div)
+                    trade_history.extend(trades_gro)
+                    trade_history.extend(trades_hot)
+                    
+            except Exception as e:
+                print(f"Error diffing portfolio: {e}")
+                # On error, just init new portfolio
+                portfolio["dividend"] = {r["股票代码"]: {"entry_date": snapshot_date, "entry_price": r.get("最新价", 0)} for r in div_result_list}
+                portfolio["growth"] = {r["股票代码"]: {"entry_date": snapshot_date, "entry_price": r.get("最新价", 0)} for r in gro_result_list}
+                portfolio["hot_spot"] = {r["股票代码"]: {"entry_date": snapshot_date, "entry_price": r.get("最新价", 0)} for r in hot_spot_list}
         else:
-            trade_history = []
-            for name in {r["股票简称"] for r in div_result_list}:
-                portfolio["dividend"][name] = {"entry_date": snapshot_date, "entry_price": current_prices.get(name, 0)}
-            for name in {r["股票简称"] for r in gro_result_list}:
-                portfolio["growth"][name] = {"entry_date": snapshot_date, "entry_price": current_prices.get(name, 0)}
-                
-        for row in div_result_list:
-            ep = portfolio["dividend"].get(row["股票简称"], {}).get("entry_price", 0)
-            cp = current_prices.get(row["股票简称"], 0)
-            row["入选价格"] = ep
-            row["累计涨跌幅"] = f"{(cp / ep - 1) * 100:.2f}%" if ep > 0 else "0.00%"
-            
-        for row in gro_result_list:
-            ep = portfolio["growth"].get(row["股票简称"], {}).get("entry_price", 0)
-            cp = current_prices.get(row["股票简称"], 0)
-            row["入选价格"] = ep
-            row["累计涨跌幅"] = f"{(cp / ep - 1) * 100:.2f}%" if ep > 0 else "0.00%"
+            portfolio["dividend"] = {r["股票代码"]: {"entry_date": snapshot_date, "entry_price": r.get("最新价", 0)} for r in div_result_list}
+            portfolio["growth"] = {r["股票代码"]: {"entry_date": snapshot_date, "entry_price": r.get("最新价", 0)} for r in gro_result_list}
+            portfolio["hot_spot"] = {r["股票代码"]: {"entry_date": snapshot_date, "entry_price": r.get("最新价", 0)} for r in hot_spot_list}
 
+        # Annotate PnL
+        div_result_list = annotate_pnl(div_result_list, portfolio["dividend"], current_prices)
+        gro_result_list = annotate_pnl(gro_result_list, portfolio["growth"], current_prices)
+        hot_spot_list = annotate_pnl(hot_spot_list, portfolio["hot_spot"], current_prices)
+        
         payload = {
             "mode": "screen_all",
             "snapshot_date": snapshot_date,
@@ -1043,29 +1186,29 @@ def main() -> int:
             "candidate_report_dates": candidate_report_dates,
             "report_date": args.report_date,
             "thresholds": threshold_payload(args),
-            "stage_counts": {
-                "quote_stage": int(len(quote_stage)),
-                "dividend_final": int(len(div_result_list)),
-                "growth_final": int(len(gro_result_list)),
+            "counts": {
+                "dividend": len(div_result_list),
+                "growth": len(gro_result_list),
+                "hot_spot": len(hot_spot_list)
             },
-            "portfolio": portfolio,
-            "trade_history": trade_history,
             "results": {
                 "dividend": div_result_list,
                 "growth": gro_result_list,
+                "hot_spot": hot_spot_list
             },
-            "diff": diff
+            "portfolio": portfolio,
+            "diff": diff,
+            "trade_history": trade_history
         }
 
     if args.output_file:
         with open(args.output_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
-            f.write("\n")
+        print(f"Results saved to {args.output_file}")
     else:
-        json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
-        sys.stdout.write("\n")
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+
     return 0
 
-
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
