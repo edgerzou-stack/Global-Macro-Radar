@@ -1,7 +1,11 @@
 # 🌍 Global Macro Radar (全球宏观量化与产业雷达)
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC_BY--NC_4.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc/4.0/)
+
+> ⚠️ **开源协议声明 (License & Copyright)**
+> 本项目采用 **CC BY-NC 4.0 (知识共享署名-非商业性使用 4.0)** 协议开源。
+> 允许您自由学习、研究及个人日常投资使用。**严格禁止任何未经授权的商业化变现行为**（包括但不限于：基于此代码包装付费投研服务、SaaS产品、将其作为黑盒信号源发行金融私募产品等）。如需商业合作，请单独联系作者获取授权。
 
 **Global Macro Radar** 是一个全自动化的“投研一体化”智能中枢系统。它通过整合**硬核科技产业新闻监控（LLM 驱动）**与**全球多资产量化选股（A股/港股/美股）**，每天为您生成一份结构化、数据驱动且极具洞察力的统一研报。
 
