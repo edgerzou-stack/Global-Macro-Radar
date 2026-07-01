@@ -7,9 +7,9 @@ import os
 
 # === Path Configuration ===
 HOME = os.path.expanduser("~")
-PROJECT_DIR = os.path.join(HOME, "Workplace", "a_share_factor_flow")
-RADAR_DIR = os.path.join(HOME, "Workplace", "industry-radar")
-SCRIPTS_DIR = os.path.join(HOME, ".codex", "skills", "a-share-factor-screen", "scripts")
+PROJECT_DIR = os.path.join(HOME, "Workplace", "a_share_factor_flow") # You may want to migrate this to Global-Macro-Radar later
+RADAR_DIR = os.path.join(HOME, "Workplace", "Global-Macro-Radar", "industry-radar")
+SCRIPTS_DIR = os.path.join(HOME, "Workplace", "Global-Macro-Radar", "quant-strategy", "scripts")
 
 def main():
     print(f"--- Starting daily run at {datetime.datetime.now()} ---")
