@@ -2,6 +2,20 @@
 
 This directory contains the foundational, object-oriented financial modeling components for the quant strategy. It abstracts core financial concepts into reusable modules, including Market data handling, Portfolio management, Historical Price tracking, and simulated System Clocks.
 
+## 📂 Directory Contents
+
+| Item | Type | Description |
+|---|---|---|
+| `__init__.py` | 📄 File | Python Script / Logic |
+| `clock.py` | 📄 File | Python Script / Logic |
+| `historical_price.py` | 📄 File | Python Script / Logic |
+| `market.py` | 📄 File | Python Script / Logic |
+| `portfolio.py` | 📄 File | Python Script / Logic |
+| `strategy.py` | 📄 File | Python Script / Logic |
+| `test_portfolio.py` | 📄 File | Python Script / Logic |
+
+---
+
 [![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC_BY--NC_4.0-lightgrey.svg)](#)
 
 ---

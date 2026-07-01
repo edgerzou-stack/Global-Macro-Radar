@@ -2,6 +2,37 @@
 
 This directory is the engine room of the Quantitative Strategy system. It contains the primary execution scripts (e.g., `daily_runner.py`), backtesting frameworks, data providers (AkShare/YFinance integrations), and multi-market screening logic (A-share, HK, US).
 
+## 📂 Directory Contents
+
+| Item | Type | Description |
+|---|---|---|
+| `backtest.py` | 📄 File | Python Script / Logic |
+| `core` | 📁 Folder | Submodule / Directory for core |
+| `daily_runner.py` | 📄 File | Python Script / Logic |
+| `data_provider.py` | 📄 File | Python Script / Logic |
+| `db_utils.py` | 📄 File | Python Script / Logic |
+| `fetch_universe.py` | 📄 File | Python Script / Logic |
+| `generate_report.py` | 📄 File | Python Script / Logic |
+| `llm_utils.py` | 📄 File | Python Script / Logic |
+| `migrate_to_sqlite.py` | 📄 File | Python Script / Logic |
+| `plot_pnl.py` | 📄 File | Python Script / Logic |
+| `screen_a_share.py` | 📄 File | Python Script / Logic |
+| `screen_global_quant.py` | 📄 File | Python Script / Logic |
+| `screen_global_quant_deps.py` | 📄 File | Python Script / Logic |
+| `screen_hot_spot.py` | 📄 File | Python Script / Logic |
+| `send_unified_email.py` | 📄 File | Python Script / Logic |
+| `test_em.py` | 📄 File | Python Script / Logic |
+| `test_em2.py` | 📄 File | Python Script / Logic |
+| `test_em_quote.py` | 📄 File | Python Script / Logic |
+| `test_em_quote2.py` | 📄 File | Python Script / Logic |
+| `test_fetch.py` | 📄 File | Python Script / Logic |
+| `test_fin.py` | 📄 File | Python Script / Logic |
+| `test_tz.py` | 📄 File | Python Script / Logic |
+| `test_yf_prices.py` | 📄 File | Python Script / Logic |
+| `us_hk_quant.py` | 📄 File | Python Script / Logic |
+
+---
+
 [![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC_BY--NC_4.0-lightgrey.svg)](#)
 
 ---
