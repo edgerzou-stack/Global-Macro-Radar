@@ -1,22 +1,22 @@
-# Quant Core Engine
+# Quant Strategy Core Engine
 
-This directory contains the foundational, object-oriented financial modeling components for the quant strategy. It abstracts core financial concepts into reusable modules, including Market data handling, Portfolio management, Historical Price tracking, and simulated System Clocks.
 
-## 📂 Directory Contents
+[![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC_BY--NC_4.0-lightgrey.svg)](#)
+
+Welcome to the **Quant Strategy Core Engine** directory. This directory contains the foundational, object-oriented financial modeling components for the quant strategy. It abstracts core financial concepts into reusable modules.
+
+## Content Index
 
 | Item | Type | Description |
 |---|---|---|
-| `__init__.py` | 📄 File | Python Script / Logic |
-| `clock.py` | 📄 File | Python Script / Logic |
-| `historical_price.py` | 📄 File | Python Script / Logic |
-| `market.py` | 📄 File | Python Script / Logic |
-| `portfolio.py` | 📄 File | Python Script / Logic |
-| `strategy.py` | 📄 File | Python Script / Logic |
-| `test_portfolio.py` | 📄 File | Python Script / Logic |
+| `__init__.py` | **File** | Core logic or execution script. |
+| `clock.py` | **File** | Core logic or execution script. |
+| `historical_price.py` | **File** | Core logic or execution script. |
+| `market.py` | **File** | Core logic or execution script. |
+| `portfolio.py` | **File** | Core logic or execution script. |
+| `strategy.py` | **File** | Core logic or execution script. |
+| `test_portfolio.py` | **File** | Unit testing script for core functions. |
 
----
-
-[![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC_BY--NC_4.0-lightgrey.svg)](#)
 
 ---
 
