@@ -16,48 +16,13 @@ An automated, dual-track intelligence gathering system that acts as your persona
 - **Deep Dive Reports**: Automatically generates a multi-thousand-word deep-dive appendix for the rarest "Supernova" events (Requires Innovation >= 9 AND Traffic >= 9), elegantly separated by massive whitespace for a clean reading experience.
 - **Top-Tier Global Sources**: Pulls raw intelligence from high-signal sources including *The Information, Hacker News, MIT Technology Review, TechCrunch, 36Kr*, and more.
 
-## Setup & Installation
+## Deployment & Execution
 
-### 1. Clone the repository
-```bash
-git clone https://github.com/edgerzou-stack/industry-radar.git
-cd industry-radar
-```
-
-### 2. Install dependencies
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-### 3. Configuration
-Copy the `.env.example` file to `.env`:
-```bash
-cp .env.example .env
-```
-Fill in your credentials in `.env`:
-- `OPENAI_API_KEY`: Your OpenAI or proxy API key.
-- `OPENAI_BASE_URL`: Base URL for the OpenAI API (defaults to `https://api.openai.com/v1`, change if using a proxy).
-- `ICLOUD_APP_PASSWORD`: An App-Specific Password for your iCloud email (used for SMTP).
-
-Adjust scoring thresholds, AI models (e.g. `gpt-5.4`, `gpt-4o-mini`), and target industries in `config.yaml`.
-
-### 4. Run the Radar
-```bash
-python main.py
-```
-
-### 5. Automation
-To run the radar automatically every day at 2:00 PM, add a cron job:
-```bash
-crontab -e
-# Add the following line:
-0 14 * * * cd /absolute/path/to/industry-radar && source venv/bin/activate && python main.py >> run.log 2>&1
-```
-
-
-
+> **Monorepo Architecture Notice**
+> This module is fully integrated into the **Global Macro Radar** monorepo. 
+> For complete installation, API key configuration, and unified Crontab deployment instructions, please refer to the [Root README.md](../README.md).
+> 
+> The standalone execution scripts (like `main.py` and `score.py`) are now coordinated by the top-level `run_all.sh`.
 
 ---
 
