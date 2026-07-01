@@ -1,6 +1,6 @@
-# Core
+# Quant Core Engine
 
-Core Financial Modeling and Portfolio Object Logic.
+This directory contains the foundational, object-oriented financial modeling components for the quant strategy. It abstracts core financial concepts into reusable modules, including Market data handling, Portfolio management, Historical Price tracking, and simulated System Clocks.
 
 [![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC_BY--NC_4.0-lightgrey.svg)](#)
 

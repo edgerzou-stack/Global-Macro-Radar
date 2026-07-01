@@ -1,6 +1,6 @@
-# Scripts
+# Quant Strategy Scripts
 
-Quantitative Strategy Execution Scripts and Utilities.
+This directory is the engine room of the Quantitative Strategy system. It contains the primary execution scripts (e.g., `daily_runner.py`), backtesting frameworks, data providers (AkShare/YFinance integrations), and multi-market screening logic (A-share, HK, US).
 
 [![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC_BY--NC_4.0-lightgrey.svg)](#)
 
