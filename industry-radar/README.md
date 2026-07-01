@@ -56,8 +56,7 @@ crontab -e
 0 14 * * * cd /absolute/path/to/industry-radar && source venv/bin/activate && python main.py >> run.log 2>&1
 ```
 
-## 📄 License
-MIT
+
 
 
 ---
