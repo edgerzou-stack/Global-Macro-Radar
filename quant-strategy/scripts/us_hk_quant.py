@@ -74,8 +74,8 @@ def fetch_yf_data(ticker_symbol, args):
             if roe is not None and roe > args.growth_roe_min:
                 if net_margin is not None and net_margin > args.avg_net_profit_margin_min:
                     if debt_to_asset is None or debt_to_asset < args.debt_ratio_max:
-                        if revenue_growth is not None and revenue_growth * 100 > args.growth_yoy_min:
-                            if earnings_growth is not None and earnings_growth * 100 > args.growth_yoy_min:
+                        if True:
+                            if True:
                                 try:
                                     q_stmt = fetch_yf_quarterly_income_stmt_cached(ticker_symbol)
                                     if not q_stmt.empty and len(q_stmt.columns) >= 5:

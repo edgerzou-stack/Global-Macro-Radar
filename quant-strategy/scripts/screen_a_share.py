@@ -690,15 +690,12 @@ GROWTH_INDUSTRIES = [
 
 def filter_growth_strategy(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
     """
-    4-Quarter Accelerating Growth Strategy (连续4个季度加速爆发):
+    4-Quarter Continuous Improvement Strategy (连续4个季度业绩改善/减亏):
     1. Industry in GROWTH_INDUSTRIES
-    2. Latest YoY Profit Growth > args.growth_yoy_min (e.g. 30%)
-    3. Latest YoY Revenue Growth > args.growth_yoy_min (e.g. 30%)
-    4. Past 4 quarters YoY Profit & Revenue Growth must be strictly increasing.
-    5. ROE (latest) > args.growth_roe_min
-    6. Net Margin (latest) > args.avg_net_profit_margin_min
-    7. Market Cap > args.market_cap_min_yi * 100 million
-    8. Debt Ratio < args.debt_ratio_max
+    2. Market Cap > args.market_cap_min_yi * 100 million
+    3. Debt Ratio < args.debt_ratio_max
+    4. Past 4 quarters YoY Profit & Revenue Growth must be > 0 (supports loss-reduction)
+    5. PEG constraint: PE < min(Profit YoY, Revenue YoY)
     """
     if df.empty:
         return df.copy()
