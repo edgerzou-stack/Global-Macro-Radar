@@ -34,6 +34,15 @@
 
 ---
 
+---
+
+## 架构哲学 (Architecture Philosophy)
+
+- **Code Logic First (代码逻辑优先)**: All strategy descriptions and documentation strictly map to the exact mathematical operations and logical operators used in the backend codebase (e.g., specific `pandas` filter masks, `if` conditions). We prioritize absolute fidelity to the running code over vague marketing narratives.
+- **Monorepo Cohesion**: Integrated previously scattered tools (`QF_strategy` and `industry-radar`) into a single, unified execution pipeline while maintaining strict sub-module boundaries.
+
+---
+
 ## 目录结构 (Architecture)
 
 ```text
