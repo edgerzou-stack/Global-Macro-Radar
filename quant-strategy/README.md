@@ -9,7 +9,7 @@ QF_strategy 是一个基于 Python 和 [Akshare](https://github.com/akfamily/aks
 
 ---
 
-## 🚀 核心策略矩阵 (Dual-Core Strategies)
+## 核心策略矩阵 (Dual-Core Strategies)
 
 项目目前主打两套并行的实战量化策略，彼此独立且互补：
 
@@ -73,7 +73,7 @@ python3 scripts/generate_report.py dual_screen.json screening_results.md
 
 ---
 
-##  自动化无人值守运行 (Crontab Automation)
+## 自动化无人值守运行 (Crontab Automation)
 
 本项目内置了带交易日历识别的自动调度脚本。如果你希望程序在每个交易日的下午 14:00 自动更新报告，可以在终端配置定时任务：
 
@@ -90,14 +90,23 @@ crontab -e
 
 ---
 
-## 📝 Disclaimer
+## Disclaimer
 本项目的所有代码及选股策略仅供量化程序学习与技术交流使用，所输出的股票名单不构成任何投资建议。股市有风险，投资需谨慎！
 
 
 ---
 
-## License & Copyright
 
+## Content Index
+
+| Item | Type | Description |
+|---|---|---|
+| `SKILL.md` | **File** | Data / Resource File |
+| `scripts` | **Directory** | Submodule / Directory for scripts |
+
+---
+
+## License & Copyright
 > **开源协议声明 (License & Copyright)**
 > 本仓库包含的架构文档、设计思路及配套代码均采用 **CC BY-NC 4.0 (知识共享-署名-非商业性使用)** 协议发布。
 > 允许个人学习、学术研究及开源技术交流。**严格禁止任何企业或个人将其直接或间接用于任何商业目的**（包括但不限于商业芯片研发、企业内部培训、闭源软件开发等）。如需商业使用，请与作者联系获取单独授权。
