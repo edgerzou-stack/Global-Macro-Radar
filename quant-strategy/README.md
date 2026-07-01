@@ -1,5 +1,8 @@
 # QF_strategy: A股全市场双核心选股量化引擎
 
+[![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC_BY--NC_4.0-lightgrey.svg)](#)
+
+
 QF_strategy 是一个基于 Python 和 [Akshare](https://github.com/akfamily/akshare) 的 A 股全市场量化基本面选股框架。该项目聚焦于从全市场近 5000 只股票中，通过严苛的财务与行情多维过滤，自动化筛选出兼顾“高股息现金流护城河”与“硬核科技极度低估”的极品标的。
 
 系统内置自动状态持久化与“调仓嗅探”机制，每次运行都会智能对比上一次的标的池，并输出明确的新增与剔除提示，就像一位不知疲倦的专业量化基金经理。
@@ -47,7 +50,7 @@ QF_strategy 是一个基于 Python 和 [Akshare](https://github.com/akfamily/aks
 通过运行 `plot_pnl.py`，系统会**动态解析**交割单中的策略归属（如稳健红利、高增成长、甚至未来你自定义的“热点战法”），并基于所有的平仓记录绘制出**分策略的等权累计净收益曲线 (Equity Curves)** 与**各策略核心指标表**（包含笔数、胜率、收益），直观展现不同量化策略长期运作中的纯资金走势与抗回撤表现。该图表会被自动内嵌到最终的 HTML 报告中。
 ---
 
-## ⚙️ 快速上手 (Quick Start)
+## ️ 快速上手 (Quick Start)
 
 ### 环境依赖
 ```bash
@@ -70,7 +73,7 @@ python3 scripts/generate_report.py dual_screen.json screening_results.md
 
 ---
 
-## 🤖 自动化无人值守运行 (Crontab Automation)
+##  自动化无人值守运行 (Crontab Automation)
 
 本项目内置了带交易日历识别的自动调度脚本。如果你希望程序在每个交易日的下午 14:00 自动更新报告，可以在终端配置定时任务：
 
@@ -89,3 +92,12 @@ crontab -e
 
 ## 📝 Disclaimer
 本项目的所有代码及选股策略仅供量化程序学习与技术交流使用，所输出的股票名单不构成任何投资建议。股市有风险，投资需谨慎！
+
+
+---
+
+## License & Copyright
+
+> **开源协议声明 (License & Copyright)**
+> 本仓库包含的架构文档、设计思路及配套代码均采用 **CC BY-NC 4.0 (知识共享-署名-非商业性使用)** 协议发布。
+> 允许个人学习、学术研究及开源技术交流。**严格禁止任何企业或个人将其直接或间接用于任何商业目的**（包括但不限于商业芯片研发、企业内部培训、闭源软件开发等）。如需商业使用，请与作者联系获取单独授权。

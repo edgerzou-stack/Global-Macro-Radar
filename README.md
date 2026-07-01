@@ -1,5 +1,8 @@
 # Global Macro Radar
 
+[![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC_BY--NC_4.0-lightgrey.svg)](#)
+
+
 
 
 > **开源协议声明 (License & Copyright)**
