@@ -1,7 +1,6 @@
 # Global Macro Radar
 
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC_BY--NC_4.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc/4.0/)
+
 
 > **开源协议声明 (License & Copyright)**
 > 本项目采用 **CC BY-NC 4.0 (知识共享署名-非商业性使用 4.0)** 协议开源。
