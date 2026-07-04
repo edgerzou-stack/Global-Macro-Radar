@@ -12,7 +12,7 @@ def _load_env(path):
                     os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
     except FileNotFoundError:
         pass
-_load_env(os.environ.get("RADAR_ENV", "/Users/zouzhengting/Workplace/industry-radar/.env"))
+_load_env(os.environ.get("RADAR_ENV", "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/industry-radar_archived/.env"))
 
 def call_llm(prompt, require_json=False):
     # Try Gemini first
@@ -46,6 +46,13 @@ def call_llm(prompt, require_json=False):
             err_msg = re.sub(r"key=([^& ]+)", "key=***HIDDEN***", err_msg)
             print(f"Gemini fallback: {err_msg}")
 
+    # Helper function to fix proxy double-encoding (mojibake)
+    def fix_encoding(s):
+        try:
+            return s.encode('latin-1').decode('utf-8')
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            return s
+
     # 2. Try OpenAI
     if openai_key:
         try:
@@ -62,6 +69,7 @@ def call_llm(prompt, require_json=False):
             resp = requests.post(url, headers=headers, json=data, timeout=60)
             resp.raise_for_status()
             text = resp.json()["choices"][0]["message"]["content"]
+            text = fix_encoding(text)
             return json.loads(text) if require_json else text
         except Exception as e:
             err_msg = str(e)
@@ -83,6 +91,7 @@ def call_llm(prompt, require_json=False):
             resp = requests.post(url, headers=headers, json=data, timeout=60)
             resp.raise_for_status()
             text = resp.json()["choices"][0]["message"]["content"]
+            text = fix_encoding(text)
             return json.loads(text) if require_json else text
         except Exception as e:
             print(f"DeepSeek fallback: {e}")

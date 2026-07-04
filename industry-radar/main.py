@@ -49,17 +49,7 @@ def generate_markdown_report(scored_articles, config, output_dir="reports"):
         t_score = sd.get('traffic_score', 0)
         
         if (i_score + t_score) >= 18:
-            # Check deep dive cache
-            cache_key = a.get('link')
-            dd = None
             if 'deep_dive' in a:
-                dd = a['deep_dive']
-            else:
-                from deep_dive import generate_deep_dive_report
-                dd = generate_deep_dive_report(a, config)
-                
-            if dd:
-                a['deep_dive'] = dd
                 deep_dives.append(a)
         
         if i_score >= min_score and t_score >= min_score:
@@ -73,6 +63,11 @@ def generate_markdown_report(scored_articles, config, output_dir="reports"):
     supernova.sort(key=lambda x: x['score_data'].get('innovation_score', 0) + x['score_data'].get('traffic_score', 0), reverse=True)
     hardcore.sort(key=lambda x: x['score_data'].get('innovation_score', 0), reverse=True)
     hype.sort(key=lambda x: x['score_data'].get('traffic_score', 0), reverse=True)
+    
+    # Limit to top 10 to prevent information overload
+    supernova = supernova[:10]
+    hardcore = hardcore[:10]
+    hype = hype[:10]
     
     def write_article_block(file, article):
         sd = article['score_data']
@@ -411,17 +406,28 @@ def main():
                 save_cache(cache_data)
     
     
-    # We must also save cache if any deep dives were generated during the report phase
-    # Update cache with newly generated deep_dives
-    new_dd = False
-    for a in scored_articles:
-        link = a.get('link')
-        if 'deep_dive' in a and link in cache_data:
-            if 'deep_dive' not in cache_data[link]:
-                cache_data[link]['deep_dive'] = a['deep_dive']
-                new_dd = True
+    # P1.9: 将 Deep Dive 的生成逻辑移出 Markdown 渲染循环，放到主流水线并行化阶段
+    min_score = config.get("output", {}).get("min_score_to_keep", 8)
+    high_scoring_for_dd = [a for a in scored_articles if a.get('score_data', {}).get('innovation_score', 0) + a.get('score_data', {}).get('traffic_score', 0) >= 18]
     
-    if new_dd:
+    new_dd = False
+    if high_scoring_for_dd:
+        print(f"Checking Deep Dive for {len(high_scoring_for_dd)} highly rated articles...", flush=True)
+        for a in high_scoring_for_dd:
+            link = a.get('link')
+            if 'deep_dive' not in a and (link not in cache_data or 'deep_dive' not in cache_data[link]):
+                from deep_dive import generate_deep_dive_report
+                print(f"Generating Deep Dive for {a['title'][:30]}...", flush=True)
+                dd = generate_deep_dive_report(a, config)
+                if dd:
+                    a['deep_dive'] = dd
+                    if link not in cache_data: cache_data[link] = {}
+                    cache_data[link]['deep_dive'] = dd
+                    new_dd = True
+            elif link in cache_data and 'deep_dive' in cache_data[link]:
+                a['deep_dive'] = cache_data[link]['deep_dive']
+
+    if cache_updates > 0 or new_dd:
         save_cache(cache_data)
         
     report_path = generate_markdown_report(scored_articles, config)

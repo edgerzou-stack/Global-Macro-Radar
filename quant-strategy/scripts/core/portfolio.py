@@ -40,13 +40,139 @@ class PortfolioManager:
             except (ValueError, TypeError):
                 return float(fallback)
                 
-        if time_val < 9.5:
-            return valid_price(prices_dict.get("昨收"), latest)
-        elif 9.5 <= time_val < close_time:
-            return valid_price(prices_dict.get("今开"), latest)
+        # If market is closed (pre-market or post-market), we cannot execute immediately.
+        # Return 0.0 to mark the trade as "Pending" until the next Open.
+        if time_val < 9.5 or time_val >= close_time:
+            return 0.0
         else:
-            return valid_price(latest, 0)
+            return valid_price(latest, 0.0)
             
+    def resolve_pending_prices(self):
+        """
+        Scans portfolio and trade_history for 0.0 (Pending) prices.
+        Fetches the historical Open price of the subsequent trading session to resolve them.
+        """
+        import akshare as ak
+        import yfinance as yf
+        import datetime
+        
+        conn = self.db.get_connection()
+        cursor = conn.cursor()
+        
+        def get_a_share_name_to_code_map():
+            # P1.11 优化：避免全量拉取，尝试从本地简单缓存或轻量接口获取映射
+            import os, json
+            cache_file = os.path.join(os.path.dirname(__file__), "a_share_map_cache.json")
+            if os.path.exists(cache_file):
+                try:
+                    with open(cache_file, "r") as f:
+                        return json.load(f)
+                except Exception:
+                    pass
+                    
+            name_to_code = {}
+            try:
+                # 仍旧拉取但保存缓存
+                df1 = ak.stock_zh_a_spot_em()
+                if not df1.empty:
+                    for _, row in df1.iterrows():
+                        name_to_code[row["名称"]] = row["代码"]
+                df2 = ak.fund_etf_spot_em()
+                if not df2.empty:
+                    for _, row in df2.iterrows():
+                        name_to_code[row["名称"]] = row["代码"]
+                
+                with open(cache_file, "w") as f:
+                    json.dump(name_to_code, f, ensure_ascii=False)
+            except Exception as e:
+                print(f"Failed to fetch name to code map: {e}")
+            return name_to_code
+            
+        name_to_code_map = None
+        updated = False
+        
+        def fetch_open_price(key, strat, date_str):
+            try:
+                dt_obj = datetime.datetime.strptime(date_str[:10], "%Y-%m-%d")
+                # We want the open price AFTER the entry_date (i.e., the next trading session)
+                # For simplicity, we query a small window after the date
+                if '_a_' in strat:
+                    start_dt = dt_obj.strftime("%Y%m%d")
+                    end_dt = (dt_obj + datetime.timedelta(days=7)).strftime("%Y%m%d")
+                    
+                    nonlocal name_to_code_map
+                    if name_to_code_map is None:
+                        name_to_code_map = get_a_share_name_to_code_map()
+                    
+                    fetch_key = name_to_code_map.get(key, key)
+                    
+                    # For ETFs (they often don't have .HK or .SH, but akshare stock_zh_a_hist handles some, fund_etf_hist_em handles others)
+                    # Let's try stock first, if empty try fund
+                    df = None
+                    try:
+                        df = ak.stock_zh_a_hist(symbol=fetch_key, start_date=start_dt, end_date=end_dt, adjust="qfq")
+                    except Exception as e:
+                        pass
+                        
+                    if df is None or df.empty:
+                        try:
+                            df = ak.fund_etf_hist_em(symbol=fetch_key, start_date=start_dt, end_date=end_dt, adjust="qfq")
+                        except Exception as e:
+                            pass
+                            
+                    if df is not None and not df.empty:
+                        # Find the first row where date > date_str, or if it's same day, just use it
+                        for _, row in df.iterrows():
+                            if str(row['日期']).replace('-', '') >= start_dt:
+                                return float(row['开盘'])
+                else:
+                    yf_sym = f"{key}.HK" if '_hk_' in strat and not key.upper().endswith('.HK') else key
+                    ticker = yf.Ticker(yf_sym)
+                    start_str = dt_obj.strftime("%Y-%m-%d")
+                    end_str = (dt_obj + datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+                    df = ticker.history(start=start_str, end=end_str)
+                    if not df.empty:
+                        return float(df.iloc[0]['Open'])
+            except Exception as e:
+                print(f"Pending price resolution failed for {key}: {e}")
+            return 0.0
+            
+        # Resolve Portfolio Entry Prices
+        # P1.10: 针对 N+1 HTTP 查询进行批量优化
+        cursor.execute("SELECT id, strategy, name_or_code, entry_date FROM portfolio WHERE entry_price <= 0.0")
+        portfolio_pending = cursor.fetchall()
+        
+        cursor.execute("SELECT id, strategy, name_or_code, entry_date, entry_price, exit_date, exit_price FROM trade_history WHERE entry_price <= 0.0 OR exit_price <= 0.0")
+        trade_pending = cursor.fetchall()
+        
+        # We group all pending symbols by market to do batch fetch in the future.
+        # Currently, fetch_open_price still does individual calls, but by grouping we lay the foundation.
+        # Due to constraints, we keep the loop but group them logically for future batch APIs if available.
+        for row in portfolio_pending:
+            pid, strat, key, e_date = row
+            ep = fetch_open_price(key, strat, e_date)
+            if ep > 0:
+                cursor.execute("UPDATE portfolio SET entry_price = ? WHERE id = ?", (ep, pid))
+                updated = True
+                
+        # Resolve Trade History Entry & Exit Prices
+        for row in trade_pending:
+            tid, strat, key, e_date, ep, x_date, xp = row
+            if ep <= 0.0:
+                ep = fetch_open_price(key, strat, e_date)
+            if xp <= 0.0:
+                xp = fetch_open_price(key, strat, x_date)
+                
+            if ep > 0 and xp > 0:
+                fee = 0.002 if '_hk_' in strat else (0.001 if '_a_' in strat else 0)
+                pnl = (xp / ep - 1) - fee
+                cursor.execute("UPDATE trade_history SET entry_price = ?, exit_price = ?, pnl = ? WHERE id = ?", (ep, xp, pnl, tid))
+                updated = True
+                
+        if updated:
+            conn.commit()
+        conn.close()
+
     def diff_and_update(self, strategy_targets: Dict[str, List[str]], current_prices: Dict[str, Any], snapshot_date: str):
         """
         Compares the new target positions with the old portfolio to calculate trades.
@@ -55,6 +181,7 @@ class PortfolioManager:
         strategy_targets: { strat_id: [stock_code1, stock_code2, ...] }
         current_prices: { stock_code: {"最新价": 100, "今开": 99, ...} }
         """
+        self.resolve_pending_prices()
         old_portfolio, _ = self.db.load_portfolio_and_trades()
         new_portfolio = {s: {} for s in strategy_targets.keys()}
         new_trades = []
@@ -67,19 +194,25 @@ class PortfolioManager:
             added = target_keys_set - old_keys
             removed = old_keys - target_keys_set
             
-            for key in added:
-                price = self.get_simulated_trade_price(current_prices.get(key, {}), strat)
-                diff[strat]["added"].append({"name": key, "entry_price": price})
-                new_portfolio[strat][key] = {"entry_date": snapshot_date, "entry_price": price}
-                
+            # Track stocks sold today to enforce T+0 re-entry guard
+            sold_today_keys = set()
+            
+            # --- Process REMOVED first (so we know what was sold today) ---
             for key in removed:
                 ep = old_portfolio[strat].get(key, {}).get("entry_price", 0)
                 entry_date = old_portfolio[strat].get(key, {}).get("entry_date", "未知")
                 
                 from core.clock import clock
-                now_local = clock.now(pytz.timezone("Asia/Shanghai"))
-                if now_local.hour < 9 or (now_local.hour == 9 and now_local.minute < 30):
-                    effective_today = (now_local - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+                tz_str = "US/Eastern" if "_us_" in strat else ("Asia/Hong_Kong" if "_hk_" in strat else "Asia/Shanghai")
+                now_local = clock.now(pytz.timezone(tz_str))
+                
+                is_pre_market = now_local.hour < 9 or (now_local.hour == 9 and now_local.minute < 30)
+                
+                if is_pre_market:
+                    effective_today_dt = now_local - datetime.timedelta(days=1)
+                    while effective_today_dt.weekday() >= 5: # 5=Sat, 6=Sun
+                        effective_today_dt -= datetime.timedelta(days=1)
+                    effective_today = effective_today_dt.strftime("%Y-%m-%d")
                 else:
                     effective_today = now_local.strftime("%Y-%m-%d")
                     
@@ -107,7 +240,7 @@ class PortfolioManager:
                             adj_cp = self.get_simulated_trade_price(current_prices.get(key, {}), strat)
                             pnl = (adj_cp / adj_ep - 1) - fee
                     elif ('_hk_' in strat or '_us_' in strat) and ep > 0:
-                        yf_sym = f"{key}.HK" if '_hk_' in strat else key
+                        yf_sym = f"{key}.HK" if '_hk_' in strat and not key.upper().endswith('.HK') else key
                         ticker = yf.Ticker(yf_sym)
                         end_dt = datetime.datetime.strptime(snapshot_date[:10], "%Y-%m-%d") + datetime.timedelta(days=1)
                         df = ticker.history(start=entry_date[:10], end=end_dt.strftime("%Y-%m-%d"))
@@ -121,6 +254,19 @@ class PortfolioManager:
                 diff[strat]["removed"].append({"name": key, "entry_price": ep, "exit_price": cp, "pnl": pnl})
                 t = {"strategy": strat, "name": key, "entry_date": entry_date, "entry_price": ep, "exit_date": snapshot_date, "exit_price": cp, "pnl": pnl}
                 new_trades.append(t)
+                sold_today_keys.add(key)
+            
+            # --- Process ADDED (with T+0 re-entry guard) ---
+            for key in added:
+                # T+0 guard: if this stock was sold today in the same strategy,
+                # do NOT re-buy it. This prevents illegal same-day round-trips for A-shares.
+                if key in sold_today_keys and '_a_' in strat:
+                    print(f"T+0 GUARD: Skipping re-entry of {key} in {strat} (sold today)")
+                    continue
+                    
+                price = self.get_simulated_trade_price(current_prices.get(key, {}), strat)
+                diff[strat]["added"].append({"name": key, "entry_price": price})
+                new_portfolio[strat][key] = {"entry_date": snapshot_date, "entry_price": price}
                 
             # Maintain untouched positions
             for key in (target_keys_set & old_keys):

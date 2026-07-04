@@ -24,8 +24,7 @@ from us_hk_quant import screen_us_hk
 from screen_global_quant_deps import STRATEGIES, load_universes, load_hot_spot_today, get_current_prices_for_portfolio
 
 def get_key(row, strat):
-    if "_a_" in strat:
-        return row.get("股票简称", "")
+    # 修改 P0.6：所有市场统一使用股票代码作为 key，不再使用中文简称
     return row.get("股票代码", "")
 import db_utils
 from core.portfolio import PortfolioManager
@@ -109,7 +108,7 @@ def main():
     parser.add_argument("--growth-roe-min", type=float, default=10.0)
     parser.add_argument("--growth-yoy-min", type=float, default=30.0)
     parser.add_argument("--max-stocks", type=int, default=10)
-    parser.add_argument("--output-file", type=str, default=os.path.join(os.environ.get("PROJECT_ROOT", "/Users/zouzhengting/Workplace/a_share_factor_flow"), "global_screen.json"))
+    parser.add_argument("--output-file", type=str, default=os.path.join(os.environ.get("PROJECT_ROOT", "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/a_share_factor_flow"), "global_screen.json"))
     
     args = parser.parse_args()
     from core.clock import clock
@@ -231,28 +230,46 @@ Please return the selected top candidates (maximum 10) as a JSON array of their 
         for target in strategy_targets[s]:
             all_portfolio[s][target] = {}
             
+    # Inject Hot Spot A-share/ETF prices into a_prices so get_current_prices_for_portfolio can map them
+    for hs_key, items in hot_spot_data.items():
+        if '_a_' in hs_key:
+            for item in items:
+                if "股票简称" in item and "最新价" in item:
+                    a_prices[item["股票简称"]] = item["最新价"]
+            
     current_prices = get_current_prices_for_portfolio(all_portfolio, a_prices)
     
-    snapshot_dt = datetime.strptime(snapshot_date[:10], "%Y-%m-%d")
-    is_weekend = snapshot_dt.weekday() >= 5
-    
-    if is_weekend:
-        print(f"Skipping diffing because {snapshot_date} is a weekend. Keeping portfolio unchanged.")
-        diff = {s: {"added": [], "removed": []} for s in STRATEGIES}
-        portfolio = old_portfolio
-        new_trades = []
-    else:
-        portfolio, new_trades, diff = pm.diff_and_update(strategy_targets, current_prices, snapshot_date)
+    # 修改 P0.3：将周末判断按市场区分，不再进行全局一刀切跳过
+    strategy_targets_market_filtered = {}
+    from core.market import AShareMarket, HKMarket, USMarket
+    for strat, targets in strategy_targets.items():
+        if "_us_" in strat:
+            m = USMarket()
+        elif "_hk_" in strat:
+            m = HKMarket()
+        else:
+            m = AShareMarket()
+        # Instead of completely skipping the run, we keep targets empty if the market is closed for weekend/holiday.
+        # This prevents accidental drops or fake transactions.
+        if not m.is_trading_time() and m.get_current_time().weekday() >= 5:
+            # If weekend, we do not update this strategy's target (keep it exactly as old_portfolio)
+            strategy_targets_market_filtered[strat] = list(old_portfolio.get(strat, {}).keys())
+        else:
+            strategy_targets_market_filtered[strat] = targets
+            
+    portfolio, new_trades, diff = pm.diff_and_update(strategy_targets_market_filtered, current_prices, snapshot_date)
         
     # Inject entry_price and ROI back into results for display
     for strat in STRATEGIES:
         for row in results[strat]:
             key = get_key(row, strat)
             ep = portfolio[strat].get(key, {}).get("entry_price", 0)
+            ed = portfolio[strat].get(key, {}).get("entry_date", snapshot_date)
             cp = row.get("最新价", 0)
             if cp is None: cp = 0
             row["入选价格"] = ep
             row["累计涨跌幅"] = f"{(cp / ep - 1) * 100:.2f}%" if ep > 0 else "0.00%"
+            row["入选日期"] = ed
 
     payload = {
         "mode": "global_12_grid",

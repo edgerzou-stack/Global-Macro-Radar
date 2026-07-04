@@ -180,7 +180,7 @@ def plot_all(strategy_trades, output_file, strat_colors, artifact_dir):
         shutil.copy2(output_file, artifact_path)
 
 def main():
-    flow_dir = os.path.join(os.path.expanduser("~"), "Workplace", "a_share_factor_flow")
+    flow_dir = os.path.join(os.path.expanduser("~"), "Workplace", "Global-Macro-Radar-Core", "a_share_factor_flow")
     reports_dir = os.path.join(flow_dir, "reports")
     os.makedirs(reports_dir, exist_ok=True)
     

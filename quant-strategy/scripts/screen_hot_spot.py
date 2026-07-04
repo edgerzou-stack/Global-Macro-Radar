@@ -15,7 +15,7 @@ def _load_env(path):
                     os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
     except FileNotFoundError:
         pass
-_load_env(os.environ.get("RADAR_ENV", "/Users/zouzhengting/Workplace/industry-radar/.env"))
+_load_env(os.environ.get("RADAR_ENV", "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/industry-radar_archived/.env"))
 import yfinance as yf
 from datetime import datetime
 
@@ -24,7 +24,7 @@ from data_provider import fetch_quote_snapshot_cached
 from llm_utils import call_llm
 
 def get_latest_radar_report():
-    radar_reports_dir = os.environ.get("RADAR_REPORTS_DIR", "/Users/zouzhengting/Workplace/industry-radar/reports")
+    radar_reports_dir = os.environ.get("RADAR_REPORTS_DIR", "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/industry-radar_archived/reports")
     if not os.path.exists(radar_reports_dir):
         return None
         
@@ -236,7 +236,7 @@ def main():
     
     # Extract previous holdings to anchor the LLM
     previous_holdings = {}
-    global_screen_path = os.path.join(os.environ.get("PROJECT_ROOT", "/Users/zouzhengting/Workplace/a_share_factor_flow"), "global_screen.json")
+    global_screen_path = os.path.join(os.environ.get("PROJECT_ROOT", "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/a_share_factor_flow"), "global_screen.json")
     if os.path.exists(global_screen_path):
         try:
             with open(global_screen_path, "r", encoding="utf-8") as f:
@@ -314,7 +314,7 @@ def main():
     for k in ["hot_spot_a_stock", "hot_spot_a_etf", "hot_spot_us_stock", "hot_spot_us_etf", "hot_spot_hk_stock", "hot_spot_hk_etf"]:
         final_output[k] = rank_top_10_via_llm(k, final_output[k], hot_news, previous_holdings)
         
-    output_path = os.path.join(os.environ.get("PROJECT_ROOT", "/Users/zouzhengting/Workplace/a_share_factor_flow"), "hot_spot_today.json")
+    output_path = os.path.join(os.environ.get("PROJECT_ROOT", "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/a_share_factor_flow"), "hot_spot_today.json")
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(final_output, f, ensure_ascii=False, indent=2)
         

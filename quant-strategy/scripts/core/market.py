@@ -8,7 +8,8 @@ class Market:
         
     def get_current_time(self) -> datetime.datetime:
         """Get the current time in the market's specific timezone."""
-        return datetime.datetime.now(self.tz)
+        from core.clock import clock
+        return clock.now(self.tz)
         
     def is_trading_time(self) -> bool:
         """Determine if it is currently trading hours. Override in subclasses."""

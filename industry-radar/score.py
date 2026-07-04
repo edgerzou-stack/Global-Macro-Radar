@@ -79,6 +79,12 @@ def deduplicate_articles(articles, config):
     prompt = f"""
     You are a professional industry analyst. I have a list of tech news articles. Some of them are reporting on the exact same underlying event, just from different news outlets (e.g., they might use slightly different numbers or phrasing to describe the same event).
     Your task is to identify all duplicates and group them together.
+    
+    CRITICAL GROUPING RULES:
+    1. If two articles are about the EXACT SAME company's funding round, valuation, or acquisition, THEY ARE DUPLICATES. Even if one highlights "$5B valuation" and the other highlights "$800M funding" or "$1B sales", if it's the same company's milestone event, GROUP THEM.
+    2. If two articles are about the same product launch or major update from the same company, GROUP THEM.
+    3. Be aggressive in grouping. We want to avoid reading about the same company's event twice.
+
     Here is the JSON list of articles:
     {json.dumps(payload, ensure_ascii=False, indent=2)}
 
@@ -109,21 +115,37 @@ def deduplicate_articles(articles, config):
         processed.add(base_idx)
         
         if len(valid_group) > 1:
-            sources = set([base_article['source']])
+            sources = set([base_article.get('source', '')])
             max_inn = base_article.get('score_data', {}).get('innovation_score', 0)
             max_tra = base_article.get('score_data', {}).get('traffic_score', 0)
-            justifications = [base_article.get('score_data', {}).get('justification', '')]
+            
+            # Collect all unique titles, summaries, and justifications
+            titles_to_merge = []
+            summaries_to_merge = []
+            justs_to_merge = []
+            
+            # Add base article
+            ds_base = base_article.get('score_data', {})
+            if base_article.get('title'): titles_to_merge.append(base_article['title'])
+            if ds_base.get('translated_title'): titles_to_merge.append(ds_base['translated_title'])
+            if base_article.get('summary'): summaries_to_merge.append(base_article['summary'])
+            if ds_base.get('translated_summary'): summaries_to_merge.append(ds_base['translated_summary'])
+            if ds_base.get('justification'): justs_to_merge.append(ds_base['justification'])
             
             for dup_idx in valid_group[1:]:
                 dup_art = sorted_articles[dup_idx]
                 processed.add(dup_idx)
-                sources.add(dup_art['source'])
+                sources.add(dup_art.get('source', ''))
                 ds = dup_art.get('score_data', {})
                 max_inn = max(max_inn, ds.get('innovation_score', 0))
                 max_tra = max(max_tra, ds.get('traffic_score', 0))
+                
+                if dup_art.get('title') and dup_art['title'] not in titles_to_merge: titles_to_merge.append(dup_art['title'])
+                if ds.get('translated_title') and ds['translated_title'] not in titles_to_merge: titles_to_merge.append(ds['translated_title'])
+                if dup_art.get('summary') and dup_art['summary'] not in summaries_to_merge: summaries_to_merge.append(dup_art['summary'])
+                if ds.get('translated_summary') and ds['translated_summary'] not in summaries_to_merge: summaries_to_merge.append(ds['translated_summary'])
                 just = ds.get('justification', '')
-                if just and just not in justifications:
-                    justifications.append(just)
+                if just and just not in justs_to_merge: justs_to_merge.append(just)
                     
             if len(sources) > 1:
                 max_tra = min(10.0, max_tra + (len(sources) - 1) * 0.5)
@@ -131,12 +153,54 @@ def deduplicate_articles(articles, config):
             if 'score_data' not in base_article:
                 base_article['score_data'] = {}
                 
-            base_article['source'] = ", ".join(sources)
+            # Call LLM to synthesize
+            lang = config.get('output', {}).get('language', 'Chinese')
+            synth_prompt = f"""
+            You are a master news editor. I have multiple news articles reporting on the exact same event from different angles or highlighting different metrics.
+            Your task is to synthesize them into ONE perfect, comprehensive summary.
+            
+            Collected Titles:
+            {json.dumps(titles_to_merge, ensure_ascii=False)}
+            
+            Collected Summaries:
+            {json.dumps(summaries_to_merge, ensure_ascii=False)}
+            
+            Collected Editor Justifications:
+            {json.dumps(justs_to_merge, ensure_ascii=False)}
+            
+            Please generate:
+            1. A 'translated_title' in {lang} that captures all key metrics (e.g. if one says 800M funding and another says 5B valuation, include both if possible, or pick the most impactful).
+            2. A 'translated_summary' in {lang} that is ONE SINGLE SENTENCE (MAX 50 CHARS) synthesizing the most important facts.
+            3. A 'justification' in {lang} (1 sentence) combining the viewpoints of why this event is highly important.
+            
+            Return STRICTLY in JSON matching this schema:
+            {{
+              "translated_title": "string",
+              "translated_summary": "string",
+              "justification": "string"
+            }}
+            """
+                
+            try:
+                synth_res = _call_llm_with_fallback(synth_prompt, config, system_prompt="You are a helpful JSON-outputting news editor.", title_context="News Synthesis")
+                if synth_res:
+                    if synth_res.get("translated_title"):
+                        base_article['score_data']['translated_title'] = synth_res["translated_title"]
+                    if synth_res.get("translated_summary"):
+                        base_article['score_data']['translated_summary'] = synth_res["translated_summary"]
+                    if synth_res.get("justification"):
+                        base_article['score_data']['justification'] = synth_res["justification"]
+                else:
+                    base_article['score_data']['justification'] = " | ".join(justs_to_merge)
+            except Exception as e:
+                print(f"Synthesis failed: {e}")
+                base_article['score_data']['justification'] = " | ".join(justs_to_merge)
+                
+            base_article['source'] = ", ".join([s for s in sources if s])
             base_article['score_data']['innovation_score'] = round(float(max_inn), 1)
             base_article['score_data']['traffic_score'] = round(float(max_tra), 1)
-            base_article['score_data']['justification'] = " | ".join(justifications)
-            
-        final_articles.append(base_article)
+                
+            final_articles.append(base_article)
         
     # Add back any articles that weren't included in any group
     for i, a in enumerate(sorted_articles):

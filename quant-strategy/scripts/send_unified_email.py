@@ -2,7 +2,7 @@ import os
 import sys
 import re
 from dotenv import load_dotenv
-load_dotenv(os.environ.get("RADAR_ENV", "/Users/zouzhengting/Workplace/industry-radar/.env"))
+load_dotenv(os.environ.get("RADAR_ENV", "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/industry-radar_archived/.env"))
 import glob
 import markdown
 import smtplib
@@ -11,7 +11,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.image import MIMEImage
 
 def get_latest_radar_report():
-    radar_reports_dir = os.environ.get("RADAR_REPORTS_DIR", "/Users/zouzhengting/Workplace/industry-radar/reports")
+    radar_reports_dir = os.environ.get("RADAR_REPORTS_DIR", "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/industry-radar_archived/reports")
     reports = glob.glob(os.path.join(radar_reports_dir, "*.md"))
     if not reports:
         return None
@@ -20,10 +20,10 @@ def get_latest_radar_report():
 
 def main():
     radar_report = get_latest_radar_report()
-    quant_html = os.environ.get("PROJECT_ROOT", "/Users/zouzhengting/Workplace/a_share_factor_flow") + "/reports/screening_results.html"
+    quant_html = os.environ.get("PROJECT_ROOT", "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/a_share_factor_flow") + "/reports/screening_results.html"
     
     import yaml
-    with open(os.environ.get("RADAR_CONFIG", "/Users/zouzhengting/Workplace/industry-radar/config.yaml"), "r", encoding="utf-8") as f:
+    with open(os.environ.get("RADAR_CONFIG", "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/industry-radar_archived/config.yaml"), "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
     delivery_cfg = config.get("delivery", {})
     sender = delivery_cfg.get("sender_email")

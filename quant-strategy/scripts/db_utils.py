@@ -3,7 +3,7 @@ import json
 import os
 
 def get_db_path():
-    default_db = os.path.join(os.environ.get("PROJECT_ROOT", "/Users/zouzhengting/Workplace/a_share_factor_flow"), "quant_system.db")
+    default_db = os.path.join(os.environ.get("PROJECT_ROOT", "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/a_share_factor_flow"), "quant_system.db")
     return os.environ.get("SQLITE_DB_PATH", default_db)
 
 def init_db():
