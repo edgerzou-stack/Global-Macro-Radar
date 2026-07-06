@@ -38,7 +38,7 @@ def process_a_share_data(args, a_tickers, as_of_date):
     
     a_prices = {}
     if not quote_df.empty:
-        a_prices = dict(zip(quote_df["股票简称"], quote_df["最新价"]))
+        a_prices = dict(zip(quote_df["股票代码"], quote_df["最新价"]))
         
     print("Fetching A-share basic financials...", flush=True)
     with_financial, _, _ = attach_latest_financial_fields(
@@ -147,14 +147,17 @@ def main():
         div_us_df, gro_us_df = future_us.result()
         div_hk_df, gro_hk_df = future_hk.result()
 
+    # Load old portfolio early to prevent flapping
+    old_portfolio, _ = db_utils.load_portfolio_and_trades()
+
     # Generate signals via OOP Strategy pattern
     results = {
-        "dividend_a_stock": strategies["dividend_a_stock"].get_signals(df=div_a_df),
-        "growth_a_stock": strategies["growth_a_stock"].get_signals(df=gro_a_df),
-        "dividend_us_stock": strategies["dividend_us_stock"].get_signals(df=div_us_df),
-        "growth_us_stock": strategies["growth_us_stock"].get_signals(df=gro_us_df),
-        "dividend_hk_stock": strategies["dividend_hk_stock"].get_signals(df=div_hk_df),
-        "growth_hk_stock": strategies["growth_hk_stock"].get_signals(df=gro_hk_df),
+        "dividend_a_stock": strategies["dividend_a_stock"].get_signals(df=div_a_df, previous_holdings=list(old_portfolio.get("dividend_a_stock", {}).keys())),
+        "growth_a_stock": strategies["growth_a_stock"].get_signals(df=gro_a_df, previous_holdings=list(old_portfolio.get("growth_a_stock", {}).keys())),
+        "dividend_us_stock": strategies["dividend_us_stock"].get_signals(df=div_us_df, previous_holdings=list(old_portfolio.get("dividend_us_stock", {}).keys())),
+        "growth_us_stock": strategies["growth_us_stock"].get_signals(df=gro_us_df, previous_holdings=list(old_portfolio.get("growth_us_stock", {}).keys())),
+        "dividend_hk_stock": strategies["dividend_hk_stock"].get_signals(df=div_hk_df, previous_holdings=list(old_portfolio.get("dividend_hk_stock", {}).keys())),
+        "growth_hk_stock": strategies["growth_hk_stock"].get_signals(df=gro_hk_df, previous_holdings=list(old_portfolio.get("growth_hk_stock", {}).keys())),
     }
     
     for hs in ["hot_spot_a_stock", "hot_spot_a_etf", "hot_spot_us_stock", "hot_spot_us_etf", "hot_spot_hk_stock", "hot_spot_hk_etf"]:
@@ -182,13 +185,19 @@ def main():
                     cagr = row.get("净利润同比增长率", "")
                     candidates.append({"代码": code, "名称": name, "行业": industry, "增速": cagr})
                 
+                prev_holdings = list(old_portfolio.get(strat, {}).keys())
+                
                 prompt = f"""You are an expert quantitative portfolio manager. We have a list of {len(candidates)} candidate stocks that passed our Growth Strategy quantitative screen.
 We need to select up to 10 best candidates to include in the final portfolio.
 Focus on:
 1. Hard tech dominance (e.g., semiconductors, AI, software, hardware).
 2. Strong fundamentals and momentum.
 
-Here are the candidates:
+"""
+                if prev_holdings:
+                    prompt += f"【重要】：以下是昨日该策略的当前持仓标的代码：{json.dumps(prev_holdings, ensure_ascii=False)}\n为了降低换手率，如果这些持仓标的依然在候选列表中且基本面没有恶化，请优先保留它们。\n\n"
+
+                prompt += f"""Here are the candidates:
 {json.dumps(candidates, ensure_ascii=False, indent=2)}
 
 Please return the selected top candidates (maximum 10) as a JSON array of their '代码' (string). Return ONLY the JSON array. Example: ["000001", "000002"]"""
@@ -222,7 +231,6 @@ Please return the selected top candidates (maximum 10) as a JSON array of their 
     # Build a superset of old and new targets to fetch current prices
     strategy_targets = {strat: [get_key(r, strat) for r in results[strat]] for strat in STRATEGIES}
     
-    old_portfolio, _ = db_utils.load_portfolio_and_trades()
     all_portfolio = {s: {} for s in STRATEGIES}
     for s in STRATEGIES:
         if s in old_portfolio:
@@ -234,8 +242,8 @@ Please return the selected top candidates (maximum 10) as a JSON array of their 
     for hs_key, items in hot_spot_data.items():
         if '_a_' in hs_key:
             for item in items:
-                if "股票简称" in item and "最新价" in item:
-                    a_prices[item["股票简称"]] = item["最新价"]
+                if "股票代码" in item and "最新价" in item:
+                    a_prices[item["股票代码"]] = item["最新价"]
             
     current_prices = get_current_prices_for_portfolio(all_portfolio, a_prices)
     
@@ -263,11 +271,11 @@ Please return the selected top candidates (maximum 10) as a JSON array of their 
     for strat in STRATEGIES:
         for row in results[strat]:
             key = get_key(row, strat)
-            ep = portfolio[strat].get(key, {}).get("entry_price", 0)
+            ep = portfolio[strat].get(key, {}).get("entry_price", 0.0)
             ed = portfolio[strat].get(key, {}).get("entry_date", snapshot_date)
-            cp = row.get("最新价", 0)
-            if cp is None: cp = 0
-            row["入选价格"] = ep
+            cp = row.get("最新价", 0.0)
+            if cp is None: cp = 0.0
+            row["入选价格"] = float(ep)
             row["累计涨跌幅"] = f"{(cp / ep - 1) * 100:.2f}%" if ep > 0 else "0.00%"
             row["入选日期"] = ed
 
@@ -280,6 +288,23 @@ Please return the selected top candidates (maximum 10) as a JSON array of their 
         "diff": diff
     }
     
+    # P3.24: 将大 JSON 保存逻辑从统一的 meta_data 表迁移到按日期和策略拆分的专用表中
+    try:
+        conn = db_utils.get_connection()
+        c = conn.cursor()
+        for strat in STRATEGIES:
+            if results.get(strat):
+                strat_payload = {
+                    "results": results[strat],
+                    "diff": diff.get(strat, {})
+                }
+                c.execute("INSERT INTO strategy_daily_results (result_date, strategy, result_json) VALUES (?, ?, ?)",
+                          (snapshot_date, strat, json.dumps(strat_payload, ensure_ascii=False)))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Warning: Failed to save to strategy_daily_results table: {e}")
+        
     db_utils.save_meta_data("daily_results", payload)
     
     # Save to JSON for UI / email generation backward compatibility

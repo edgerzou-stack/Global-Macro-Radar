@@ -12,8 +12,11 @@ def run_backtest(start_date: datetime.date, end_date: datetime.date, step_days: 
     
     while current_date <= end_date:
         print(f"\n{'='*50}\nRunning Backtest for date: {current_date}\n{'='*50}")
-        # Inject mock time (15:00 to simulate post-market run)
-        clock.set_mock_time(datetime.datetime.combine(current_date, datetime.time(15, 0)))
+        # P3.22: 修复 naive datetime，给回测注入 timezone-aware 的时间 (使用 UTC 或本地时区均可，这里使用 Shanghai 作为基准测试)
+        import pytz
+        naive_dt = datetime.datetime.combine(current_date, datetime.time(15, 0))
+        aware_dt = pytz.timezone("Asia/Shanghai").localize(naive_dt)
+        clock.set_mock_time(aware_dt)
         
         try:
             run_screen()

@@ -1,0 +1,6 @@
+*.db
+*.json
+*.log
+quant-strategy/logs/
+quant-strategy/reports/
+industry-radar/reports/

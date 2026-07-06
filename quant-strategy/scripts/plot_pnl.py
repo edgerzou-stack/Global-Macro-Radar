@@ -180,7 +180,7 @@ def plot_all(strategy_trades, output_file, strat_colors, artifact_dir):
         shutil.copy2(output_file, artifact_path)
 
 def main():
-    flow_dir = os.path.join(os.path.expanduser("~"), "Workplace", "Global-Macro-Radar-Core", "a_share_factor_flow")
+    flow_dir = os.environ.get("PROJECT_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     reports_dir = os.path.join(flow_dir, "reports")
     os.makedirs(reports_dir, exist_ok=True)
     
@@ -191,9 +191,6 @@ def main():
     import sys
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     import db_utils
-    
-    db_path = os.environ.get("SQLITE_DB_PATH", os.path.join(flow_dir, "quant_system.db"))
-    os.environ["SQLITE_DB_PATH"] = db_path
     
     _, trade_history = db_utils.load_portfolio_and_trades()
     if not trade_history:

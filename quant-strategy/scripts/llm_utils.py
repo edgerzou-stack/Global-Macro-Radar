@@ -12,20 +12,33 @@ def _load_env(path):
                     os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
     except FileNotFoundError:
         pass
-_load_env(os.environ.get("RADAR_ENV", "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/industry-radar_archived/.env"))
+_load_env(os.environ.get("RADAR_ENV", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "industry-radar", ".env")))
+
+def _clean_json_output(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    elif text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    return text.strip()
+
 
 def call_llm(prompt, require_json=False):
     # Try Gemini first
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "")
-    openai_key = os.environ.get("OPENAI_API_KEY", "")
+    openai_key = None # Disabled intentionally to match industry-radar
     openai_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
     deepseek_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 
     # 1. Try Gemini
     if gemini_key:
         try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={gemini_key}"
+            # P2.14: 移除硬编码的模型名，使用环境变量配置
+            model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_key}"
             headers = {"Content-Type": "application/json"}
             
             gen_config = {"temperature": 0.0}
@@ -39,7 +52,7 @@ def call_llm(prompt, require_json=False):
             resp = requests.post(url, headers=headers, json=data, timeout=60)
             resp.raise_for_status()
             text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-            return json.loads(text) if require_json else text
+            return json.loads(_clean_json_output(text)) if require_json else text
         except Exception as e:
             err_msg = str(e)
             import re
@@ -54,12 +67,14 @@ def call_llm(prompt, require_json=False):
             return s
 
     # 2. Try OpenAI
+    openai_key = None # Force disable OpenAI fallback
     if openai_key:
         try:
             url = f"{openai_url}/chat/completions"
             headers = {"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"}
+            model_name = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
             data = {
-                "model": "gpt-5.4-mini",
+                "model": model_name,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.0
             }
@@ -70,7 +85,7 @@ def call_llm(prompt, require_json=False):
             resp.raise_for_status()
             text = resp.json()["choices"][0]["message"]["content"]
             text = fix_encoding(text)
-            return json.loads(text) if require_json else text
+            return json.loads(_clean_json_output(text)) if require_json else text
         except Exception as e:
             err_msg = str(e)
             print(f"OpenAI fallback: {err_msg}")
@@ -80,8 +95,9 @@ def call_llm(prompt, require_json=False):
         try:
             url = f"{deepseek_url}/chat/completions"
             headers = {"Authorization": f"Bearer {deepseek_key}", "Content-Type": "application/json"}
+            model_name = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
             data = {
-                "model": "deepseek-v4-flash",
+                "model": model_name,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.0
             }
@@ -92,7 +108,7 @@ def call_llm(prompt, require_json=False):
             resp.raise_for_status()
             text = resp.json()["choices"][0]["message"]["content"]
             text = fix_encoding(text)
-            return json.loads(text) if require_json else text
+            return json.loads(_clean_json_output(text)) if require_json else text
         except Exception as e:
             print(f"DeepSeek fallback: {e}")
 

@@ -2,6 +2,7 @@ import feedparser
 import requests
 import concurrent.futures
 from datetime import datetime, timedelta
+from bs4 import BeautifulSoup
 
 def fetch_rss_feeds(feeds, hours_back=168):
     """Fetches articles from a list of RSS feeds within the last X hours, in parallel."""
@@ -21,13 +22,35 @@ def fetch_rss_feeds(feeds, hours_back=168):
                 elif hasattr(entry, 'updated_parsed') and entry.updated_parsed:
                     pub_date = datetime(*entry.updated_parsed[:6])
                 else:
-                    pub_date = datetime.now()
+                    raw_date = getattr(entry, 'published', getattr(entry, 'updated', None))
+                    if raw_date:
+                        try:
+                            from dateutil import parser as date_parser
+                            pub_date = date_parser.parse(raw_date).replace(tzinfo=None)
+                        except Exception:
+                            pub_date = datetime.now()
+                    else:
+                        pub_date = datetime.now()
 
                 if pub_date >= time_limit:
+                    # P2.16: 为 ingest.py 添加正文抓取
+                    content = ""
+                    if hasattr(entry, 'content'):
+                        content = " ".join([c.value for c in entry.content])
+                    
+                    raw_title = getattr(entry, 'title', '')
+                    clean_title = BeautifulSoup(raw_title, "html.parser").get_text(strip=True) if raw_title else "No Title"
+                    
+                    raw_summary = getattr(entry, 'summary', '')
+                    clean_summary = BeautifulSoup(raw_summary, "html.parser").get_text(separator=" ", strip=True) if raw_summary else ""
+                    
+                    clean_content = BeautifulSoup(content, "html.parser").get_text(separator=" ", strip=True) if content else ""
+
                     local_articles.append({
-                        'title': entry.title,
-                        'link': entry.link,
-                        'summary': getattr(entry, 'summary', ''),
+                        'title': clean_title,
+                        'link': getattr(entry, 'link', ''),
+                        'summary': clean_summary,
+                        'content': clean_content,
                         'source': feed.feed.title if hasattr(feed.feed, 'title') else feed_url,
                         'published_at': pub_date.isoformat()
                     })

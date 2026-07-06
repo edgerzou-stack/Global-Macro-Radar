@@ -466,19 +466,19 @@ def load_financial_table_as_of(
     # Add 4-quarter YoY positive growth flag
     def check_acceleration(grp):
         import numpy as np
-        if len(grp) < 4:
+        if len(grp) < 3:
             return False
             
         grp_asc = grp.sort_values("财务报告期_dt", ascending=True)
-        prof_yoy = pd.to_numeric(grp_asc["净利润-同比增长"].values[-4:], errors="coerce")
-        rev_yoy = pd.to_numeric(grp_asc["营业总收入-同比增长"].values[-4:], errors="coerce")
+        prof_yoy = pd.to_numeric(grp_asc["净利润-同比增长"].values[-3:], errors="coerce")
+        rev_yoy = pd.to_numeric(grp_asc["营业总收入-同比增长"].values[-3:], errors="coerce")
         
         if np.isnan(prof_yoy).any() or np.isnan(rev_yoy).any():
             return False
             
         return (prof_yoy > 0).all() and (rev_yoy > 0).all()
 
-    accel_flags = financial.groupby("股票代码").apply(check_acceleration).reset_index(name="4个季度连续加速增长")
+    accel_flags = financial.groupby("股票代码").apply(check_acceleration).reset_index(name="3个季度连续加速增长")
     financial = financial.merge(accel_flags, on="股票代码", how="left")
     
     financial = financial.drop_duplicates("股票代码", keep="first")
@@ -529,7 +529,7 @@ def attach_latest_financial_fields(
                 "净利润-净利润",
                 "净利润-同比增长",
                 "资产负债率",
-                "4个季度连续加速增长",
+                "3个季度连续加速增长",
                 "所处行业",
                 "最新公告日期",
                 "公告日期",
@@ -709,7 +709,7 @@ def filter_growth_strategy(df: pd.DataFrame, args: argparse.Namespace) -> pd.Dat
         df["所处行业"].isin(GROWTH_INDUSTRIES)
         & df["总市值"].notna() & (df["总市值"] > args.market_cap_min_yi * 1e8)
         & (df["资产负债率"].isna() | (df["资产负债率"] < args.debt_ratio_max))
-        & df["4个季度连续加速增长"].fillna(False)
+        & df["3个季度连续加速增长"].fillna(False)
         & (df["PE"].isna() | ((df["PE"] < profit_yoy_series) & (df["PE"] < revenue_yoy_series)))
     )
     return df[mask].copy()

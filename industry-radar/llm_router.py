@@ -16,11 +16,12 @@ def get_gemini_client():
     return genai.Client(api_key=api_key)
 
 def get_openai_client():
-    api_key = os.getenv("OPENAI_API_KEY")
-    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-    if not api_key:
-        return None
-    return OpenAI(api_key=api_key, base_url=base_url, timeout=120.0)
+    return None
+    # api_key = os.getenv("OPENAI_API_KEY")
+    # base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    # if not api_key:
+    #     return None
+    # return OpenAI(api_key=api_key, base_url=base_url, timeout=120.0)
 
 def get_deepseek_client():
     api_key = os.getenv("DEEPSEEK_API_KEY")
@@ -41,8 +42,13 @@ def _call_llm_with_fallback(prompt, config, system_prompt="You are a helpful ass
     openai_model = "gpt-5.5" if is_heavy else "gpt-5.4-mini"
     deepseek_model = "deepseek-v4-pro" if is_heavy else "deepseek-v4-flash"
     
-    # 1. Gemini
     gemini_client = get_gemini_client()
+    openai_client = get_openai_client()
+    deepseek_client = get_deepseek_client()
+    
+    gemini_fallback = "OpenAI" if openai_client else ("DeepSeek" if deepseek_client else "failure")
+    
+    # 1. Gemini
     if gemini_client:
         with llm_semaphore:
             # P1.7: 增加指数退避重试
@@ -69,14 +75,12 @@ def _call_llm_with_fallback(prompt, config, system_prompt="You are a helpful ass
                             print(f"Gemini limit/overload for '{title_context}'. Retrying in {sleep_time}s...", flush=True)
                             time.sleep(sleep_time)
                             continue
-                        print(f"Gemini limit/overload for '{title_context}' after {max_retries} retries. Falling back to OpenAI...", flush=True)
+                        print(f"Gemini limit/overload for '{title_context}' after {max_retries} retries. Falling back to {gemini_fallback}...", flush=True)
                     else:
-                        print(f"Gemini error for '{title_context}': {e}. Halting execution!", flush=True)
-                        raise e
+                        print(f"Gemini error for '{title_context}': {e}. Falling back to {gemini_fallback}...", flush=True)
                     break # Break out of retry loop to fallback
 
     # 2. OpenAI
-    openai_client = get_openai_client()
     if openai_client:
         with llm_semaphore:
             try:
@@ -91,10 +95,10 @@ def _call_llm_with_fallback(prompt, config, system_prompt="You are a helpful ass
                 )
                 return json.loads(response.choices[0].message.content)
             except Exception as e:
-                print(f"OpenAI error/limit for '{title_context}': {e}. Falling back to DeepSeek...", flush=True)
+                openai_fallback = "DeepSeek" if deepseek_client else "failure"
+                print(f"OpenAI error/limit for '{title_context}': {e}. Falling back to {openai_fallback}...", flush=True)
 
     # 3. DeepSeek
-    deepseek_client = get_deepseek_client()
     if deepseek_client:
         with llm_semaphore:
             try:

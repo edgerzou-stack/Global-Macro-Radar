@@ -1,6 +1,6 @@
 import yaml
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from ingest import fetch_rss_feeds
 from score import score_article
 from dotenv import load_dotenv
@@ -18,10 +18,16 @@ def generate_markdown_report(scored_articles, config, output_dir="reports"):
     date_str = datetime.now().strftime("%Y-%m-%d")
     report_path = os.path.join(output_dir, f"industry_report_{date_str}.md")
     
-    min_score = config.get("output", {}).get("min_score_to_keep", 8)
+    min_score = config.get("output", {}).get("min_score_to_keep", 6)
+    
+    cutoff_date_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     
     high_scoring = []
     for a in scored_articles:
+        pub_date = a.get('published_at', '')[:10]
+        if pub_date and pub_date < cutoff_date_str:
+            continue
+            
         sd = a.get('score_data', {})
         if not sd.get('is_relevant'):
             continue
@@ -263,7 +269,21 @@ def main():
     articles = fetch_rss_feeds(config.get("rss_feeds", []), hours_back=hours_back)
     print(f"Fetched {len(articles)} articles.", flush=True)
     
-    if not os.getenv("OPENAI_API_KEY"):
+    # P3.21: 评分前增加基于 URL/Title 的快速预去重
+    unique_articles = []
+    seen_urls = set()
+    seen_titles = set()
+    for a in articles:
+        if a['link'] not in seen_urls and a['title'].lower() not in seen_titles:
+            unique_articles.append(a)
+            seen_urls.add(a['link'])
+            seen_titles.add(a['title'].lower())
+    
+    if len(unique_articles) < len(articles):
+        print(f"Pre-scoring deduplication removed {len(articles) - len(unique_articles)} duplicates. {len(unique_articles)} articles remaining.", flush=True)
+    articles = unique_articles
+    
+    if not os.getenv("GEMINI_API_KEY") and not os.getenv("DEEPSEEK_API_KEY") and not os.getenv("OPENAI_API_KEY"):
         print("WARNING: OPENAI_API_KEY is not set. Using mock dual-track data.", flush=True)
         from bs4 import BeautifulSoup
         for i, article in enumerate(articles):
@@ -407,7 +427,7 @@ def main():
     
     
     # P1.9: 将 Deep Dive 的生成逻辑移出 Markdown 渲染循环，放到主流水线并行化阶段
-    min_score = config.get("output", {}).get("min_score_to_keep", 8)
+    min_score = config.get("output", {}).get("min_score_to_keep", 6)
     high_scoring_for_dd = [a for a in scored_articles if a.get('score_data', {}).get('innovation_score', 0) + a.get('score_data', {}).get('traffic_score', 0) >= 18]
     
     new_dd = False

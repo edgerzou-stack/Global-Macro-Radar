@@ -201,6 +201,8 @@ def deduplicate_articles(articles, config):
             base_article['score_data']['traffic_score'] = round(float(max_tra), 1)
                 
             final_articles.append(base_article)
+        else:
+            final_articles.append(base_article)
         
     # Add back any articles that weren't included in any group
     for i, a in enumerate(sorted_articles):

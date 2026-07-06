@@ -2,6 +2,7 @@ import json
 import sys
 import os
 import base64
+from core.diagnose import diagnose_elimination
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 try:
@@ -24,6 +25,21 @@ STRAT_NAMES = {
     "hot_spot_hk_etf": "港股热点突击 (ETF)",
 }
 
+STRAT_REASONS = {
+    "dividend_a_stock": "红利避险 (高股息与稳定分红)",
+    "dividend_us_stock": "红利避险 (高股息与稳定分红)",
+    "dividend_hk_stock": "红利避险 (高股息与稳定分红)",
+    "growth_a_stock": "高增成长 (营收利润连续增长及动量)",
+    "growth_us_stock": "高增成长 (营收利润连续增长及动量)",
+    "growth_hk_stock": "高增成长 (营收利润连续增长及动量)",
+    "hot_spot_a_stock": "热点突击 (新闻突发热度及资金流向)",
+    "hot_spot_a_etf": "热点突击 (新闻突发热度及资金流向)",
+    "hot_spot_us_stock": "热点突击 (新闻突发热度及资金流向)",
+    "hot_spot_us_etf": "热点突击 (新闻突发热度及资金流向)",
+    "hot_spot_hk_stock": "热点突击 (新闻突发热度及资金流向)",
+    "hot_spot_hk_etf": "热点突击 (新闻突发热度及资金流向)",
+}
+
 def render_table_md(items, headers):
     if len(items) == 0:
         return "暂无符合条件的标的。\n\n"
@@ -36,11 +52,11 @@ def render_table_md(items, headers):
             val = row.get(h)
             if val is None:
                 cells.append("")
-            elif isinstance(val, float):
+            elif isinstance(val, (float, int)):
                 if h == "入选价格" and val <= 0:
                     cells.append("等待开盘")
                 else:
-                    cells.append(f"{val:.2f}")
+                    cells.append(f"{float(val):.2f}")
             else:
                 cells.append(str(val))
         res += "| " + " | ".join(cells) + " |\n"
@@ -62,11 +78,11 @@ def render_table_html(items, headers):
             val = row.get(h)
             if val is None:
                 cell = ""
-            elif isinstance(val, float):
+            elif isinstance(val, (float, int)):
                 if h == "入选价格" and val <= 0:
                     cell = "等待开盘"
                 else:
-                    cell = f"{val:.2f}"
+                    cell = f"{float(val):.2f}"
             else:
                 cell = str(val)
                 
@@ -83,7 +99,9 @@ def render_table_html(items, headers):
     res += "  </tbody>\n</table>\n"
     return res
 
-def render_history_md(strategy_id, trade_history):
+def render_history_md(strategy_id, trade_history, code_map=None):
+    if code_map is None:
+        code_map = {}
     strat_trades = [t for t in trade_history if t.get("strategy") == strategy_id]
     if not strat_trades:
         return "暂无历史交割记录。\n\n"
@@ -99,7 +117,13 @@ def render_history_md(strategy_id, trade_history):
     res += "| 股票代码/简称 | 买入日期 | 买入价格 | 卖出日期 | 卖出价格 | 最终盈亏率 | 交割单备注 |\n"
     res += "|---|---|---|---|---|---|---|\n"
     for trade in reversed(strat_trades):
-        name = trade.get("name", "")
+        code = trade.get("name", "")
+        name = code_map.get(str(code), code)
+        if name != code:
+            display_name = f"{code} ({name})"
+        else:
+            display_name = code
+            
         in_d = trade.get("entry_date", "")
         in_p = trade.get("entry_price", 0)
         out_d = trade.get("exit_date", "")
@@ -114,11 +138,16 @@ def render_history_md(strategy_id, trade_history):
         else:
             pnl_str = f"<span style='color:red'>+{pnl:.2f}%</span>" if pnl > 0 else f"<span style='color:green'>{pnl:.2f}%</span>"
             
-        reason = trade.get("reason", "")
-        res += f"| {name} | {in_d} | {in_p_str} | {out_d} | {out_p_str} | {pnl_str} | {reason} |\n"
+        reason = trade.get("reason")
+        if reason is None or str(reason).strip() == "" or str(reason).strip().lower() == "none":
+            reason = "-"
+            
+        res += f"| {display_name} | {in_d} | {in_p_str} | {out_d} | {out_p_str} | {pnl_str} | {reason} |\n"
     return res + "\n\n"
 
-def render_history_html(strategy_id, trade_history):
+def render_history_html(strategy_id, trade_history, code_map=None):
+    if code_map is None:
+        code_map = {}
     strat_trades = [t for t in trade_history if t.get("strategy") == strategy_id]
     if not strat_trades:
         return "<p>暂无历史交割记录。</p>\n"
@@ -137,7 +166,13 @@ def render_history_html(strategy_id, trade_history):
     res += "    </tr>\n  </thead>\n  <tbody>\n"
     
     for trade in reversed(strat_trades):
-        name = trade.get("name", "")
+        code = trade.get("name", "")
+        name = code_map.get(str(code), code)
+        if name != code:
+            display_name = f"{code} ({name})"
+        else:
+            display_name = code
+            
         in_d = trade.get("entry_date", "")
         in_p = trade.get("entry_price", 0)
         out_d = trade.get("exit_date", "")
@@ -153,21 +188,25 @@ def render_history_html(strategy_id, trade_history):
             pnl_cls = "win" if pnl > 0 else "loss" if pnl < 0 else ""
             pnl_sign = "+" if pnl > 0 else ""
             pnl_str = f"<span class='{pnl_cls}'>{pnl_sign}{pnl:.2f}%</span>"
+            
+        reason = trade.get("reason")
+        if reason is None or str(reason).strip() == "" or str(reason).strip().lower() == "none":
+            reason = "-"
         
         res += f"    <tr>\n"
-        res += f"      <td class='nowrap' style='text-align:left'>{name}</td>\n"
+        res += f"      <td class='nowrap' style='text-align:left'>{display_name}</td>\n"
         res += f"      <td class='nowrap'>{in_d}</td>\n"
         res += f"      <td class='nowrap'>{in_p_str}</td>\n"
         res += f"      <td class='nowrap'>{out_d}</td>\n"
         res += f"      <td class='nowrap'>{out_p_str}</td>\n"
         res += f"      <td class='nowrap'>{pnl_str}</td>\n"
-        res += f"      <td>{trade.get('reason', '')}</td>\n"
+        res += f"      <td>{reason}</td>\n"
         res += f"    </tr>\n"
     res += "  </tbody>\n</table>\n"
     return res
 
 def get_chart_md(chart_name):
-    artifact_dir = "/Users/zouzhengting/.gemini/antigravity/brain/cb368359-75c4-4195-b42f-77230af3485d"
+    artifact_dir = os.getenv("ARTIFACT_DIR", "/Users/zouzhengting/.gemini/antigravity/brain/cb368359-75c4-4195-b42f-77230af3485d")
     chart_path = os.path.join(artifact_dir, chart_name)
     if os.path.exists(chart_path):
         return f"![{chart_name}]({artifact_dir}/{chart_name})\n\n"
@@ -176,7 +215,7 @@ def get_chart_md(chart_name):
 def get_chart_html(chart_name, base_dir):
     chart_path = os.path.join(base_dir, "reports", chart_name)
     if not os.path.exists(chart_path):
-        artifact_dir = "/Users/zouzhengting/.gemini/antigravity/brain/cb368359-75c4-4195-b42f-77230af3485d"
+        artifact_dir = os.getenv("ARTIFACT_DIR", "/Users/zouzhengting/.gemini/antigravity/brain/cb368359-75c4-4195-b42f-77230af3485d")
         chart_path = os.path.join(artifact_dir, chart_name)
         
     if os.path.exists(chart_path):
@@ -242,7 +281,7 @@ def generate_llm_review(strategy_id, results):
             
     return ""
 
-def generate_subsection_md(strategy_id, results, headers, diff, trade_history, llm_review=""):
+def generate_subsection_md(strategy_id, results, headers, diff, trade_history, llm_review="", code_map=None):
     strat_trades = [t for t in trade_history if t.get("strategy") == strategy_id]
     if not results and not strat_trades:
         return ""
@@ -261,7 +300,11 @@ def generate_subsection_md(strategy_id, results, headers, diff, trade_history, l
                 if isinstance(item, dict):
                     ep = item.get('entry_price', 0)
                     ep_str = f"{ep:.2f}" if ep > 0 else "等待开盘"
-                    added_strs.append(f"{item['name']} (入选价: {ep_str})")
+                    code = str(item['name'])
+                    name = code_map.get(code, code) if code_map else code
+                    display_name = f"{code} ({name})" if name != code else code
+                    strat_reason = STRAT_REASONS.get(strategy_id, "策略量化指标")
+                    added_strs.append(f"{display_name} (入选价: {ep_str}, 原因: 满足【{strat_reason}】入选标准)")
                 else:
                     added_strs.append(str(item))
             out += f"> 🟢 **新增入池**：{', '.join(added_strs)}\n"
@@ -277,7 +320,12 @@ def generate_subsection_md(strategy_id, results, headers, diff, trade_history, l
                     cp_str = f"{cp:.2f}" if cp > 0 else "等待开盘"
                     pnl_str = f"{pnl:.2f}%" if ep > 0 and cp > 0 else "N/A"
                     
-                    removed_strs.append(f"{item['name']} (入选价: {ep_str}, 剔除价: {cp_str}, 盈亏: {pnl_str})")
+                    code = str(item['name'])
+                    name = code_map.get(code, code) if code_map else code
+                    display_name = f"{code} ({name})" if name != code else code
+                    
+                    specific_reason = diagnose_elimination(code, strategy_id)
+                    removed_strs.append(f"{display_name} (入选价: {ep_str}, 剔除价: {cp_str}, 盈亏: {pnl_str}, 原因: {specific_reason})")
                 else:
                     removed_strs.append(str(item))
             out += f"> 🔴 **掉出观测**：{', '.join(removed_strs)}\n"
@@ -288,12 +336,12 @@ def generate_subsection_md(strategy_id, results, headers, diff, trade_history, l
 
     if strat_trades:
         out += "**历史平仓交割单明细**\n\n"
-        out += render_history_md(strategy_id, trade_history)
+        out += render_history_md(strategy_id, trade_history, code_map)
         out += "**资金净值曲线图**\n\n"
         out += get_chart_md(f"pnl_chart_{strategy_id}.png")
     return out
 
-def generate_subsection_html(strategy_id, results, headers, diff, trade_history, base_dir, llm_review=""):
+def generate_subsection_html(strategy_id, results, headers, diff, trade_history, base_dir, llm_review="", code_map=None):
     strat_trades = [t for t in trade_history if t.get("strategy") == strategy_id]
     if not results and not strat_trades:
         return ""
@@ -312,7 +360,11 @@ def generate_subsection_html(strategy_id, results, headers, diff, trade_history,
                 if isinstance(item, dict):
                     ep = item.get('entry_price', 0)
                     ep_str = f"{ep:.2f}" if ep > 0 else "等待开盘"
-                    added_strs.append(f"{item['name']} (入选价: {ep_str})")
+                    code = str(item['name'])
+                    name = code_map.get(code, code) if code_map else code
+                    display_name = f"{code} ({name})" if name != code else code
+                    strat_reason = STRAT_REASONS.get(strategy_id, "策略量化指标")
+                    added_strs.append(f"{display_name} (入选价: {ep_str}, 原因: 满足【{strat_reason}】入选标准)")
                 else:
                     added_strs.append(str(item))
             html += f"  <p>🟢 <strong>新增入池</strong>：{', '.join(added_strs)}</p>\n"
@@ -327,8 +379,15 @@ def generate_subsection_html(strategy_id, results, headers, diff, trade_history,
                     ep_str = f"{ep:.2f}" if ep > 0 else "等待开盘"
                     cp_str = f"{cp:.2f}" if cp > 0 else "等待开盘"
                     pnl_str = f"{pnl:.2f}%" if ep > 0 and cp > 0 else "N/A"
+                    pnl_cls = "win" if pnl > 0 else "loss" if pnl < 0 else ""
+                    pnl_sign = "+" if pnl > 0 else ""
                     
-                    removed_strs.append(f"{item['name']} (入选价: {ep_str}, 剔除价: {cp_str}, 盈亏: {pnl_str})")
+                    code = str(item['name'])
+                    name = code_map.get(code, code) if code_map else code
+                    display_name = f"{code} ({name})" if name != code else code
+                    
+                    specific_reason = diagnose_elimination(code, strategy_id)
+                    removed_strs.append(f"{display_name} (入选价: {ep_str}, 剔除价: {cp_str}, <span class='{pnl_cls}'>盈亏: {pnl_sign}{pnl_str}</span>, 原因: {specific_reason})")
                 else:
                     removed_strs.append(str(item))
             html += f"  <p>🔴 <strong>掉出观测</strong>：{', '.join(removed_strs)}</p>\n"
@@ -338,7 +397,7 @@ def generate_subsection_html(strategy_id, results, headers, diff, trade_history,
         html += f"<div style='margin-top:20px; padding:15px; background-color:#eef2ff; border-radius:8px;'>{llm_review}</div>\n"
     if strat_trades:
         html += "<h4>历史平仓交割单明细</h4>\n"
-        html += render_history_html(strategy_id, trade_history)
+        html += render_history_html(strategy_id, trade_history, code_map)
         html += "<h4>资金净值曲线图</h4>\n"
         html += get_chart_html(f"pnl_chart_{strategy_id}.png", base_dir)
     return html
@@ -394,30 +453,46 @@ def main():
                 return strat, generate_llm_review(strat, res)
             return strat, ""
             
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             future_to_strat = {executor.submit(fetch_review, strat): strat for strat in strategies_to_review}
             for future in concurrent.futures.as_completed(future_to_strat):
                 strat, review = future.result()
                 llm_reviews[strat] = review
                 
+    code_map = {}
+    for strat, items in results.items():
+        for item in items:
+            code = item.get("股票代码")
+            name = item.get("股票简称")
+            if code and name:
+                code_map[str(code)] = str(name)
+                
+    try:
+        from screen_a_share import load_code_name_table
+        a_share_df = load_code_name_table()
+        for _, row in a_share_df.iterrows():
+            code_map[str(row["股票代码"])] = str(row["股票简称"])
+    except Exception as e:
+        print(f"Warning: Could not load A-share code map: {e}")
+
     # ================= MARKDOWN GENERATION =================
     out = f"# 每日全球策略量化报告\n\n"
 
     out += "## 🟢 第一章：稳健红利策略 (基本面护城河)\n\n"
-    out += generate_subsection_md("dividend_a_stock", results.get("dividend_a_stock", []), div_headers, diff, trade_history, llm_reviews.get("dividend_a_stock", ""))
+    out += generate_subsection_md("dividend_a_stock", results.get("dividend_a_stock", []), div_headers, diff, trade_history, llm_reviews.get("dividend_a_stock", ""), code_map)
 
     out += "---\n\n## 🔵 第二章：高增成长策略 (基本面护城河)\n\n"
-    out += generate_subsection_md("growth_a_stock", results.get("growth_a_stock", []), gro_headers, diff, trade_history, llm_reviews.get("growth_a_stock", ""))
-    out += generate_subsection_md("growth_us_stock", results.get("growth_us_stock", []), gro_headers, diff, trade_history, llm_reviews.get("growth_us_stock", ""))
-    out += generate_subsection_md("growth_hk_stock", results.get("growth_hk_stock", []), gro_headers, diff, trade_history, llm_reviews.get("growth_hk_stock", ""))
+    out += generate_subsection_md("growth_a_stock", results.get("growth_a_stock", []), gro_headers, diff, trade_history, llm_reviews.get("growth_a_stock", ""), code_map)
+    out += generate_subsection_md("growth_us_stock", results.get("growth_us_stock", []), gro_headers, diff, trade_history, llm_reviews.get("growth_us_stock", ""), code_map)
+    out += generate_subsection_md("growth_hk_stock", results.get("growth_hk_stock", []), gro_headers, diff, trade_history, llm_reviews.get("growth_hk_stock", ""), code_map)
 
     out += "---\n\n## 🔴 第三章：产业热点战法 (AI 宏观洞察与事件驱动)\n\n"
-    out += generate_subsection_md("hot_spot_a_stock", results.get("hot_spot_a_stock", []), hot_headers, diff, trade_history, llm_reviews.get("hot_spot_a_stock", ""))
-    out += generate_subsection_md("hot_spot_a_etf", results.get("hot_spot_a_etf", []), hot_headers, diff, trade_history, llm_reviews.get("hot_spot_a_etf", ""))
-    out += generate_subsection_md("hot_spot_us_stock", results.get("hot_spot_us_stock", []), hot_headers, diff, trade_history, llm_reviews.get("hot_spot_us_stock", ""))
-    out += generate_subsection_md("hot_spot_us_etf", results.get("hot_spot_us_etf", []), hot_headers, diff, trade_history, llm_reviews.get("hot_spot_us_etf", ""))
-    out += generate_subsection_md("hot_spot_hk_stock", results.get("hot_spot_hk_stock", []), hot_headers, diff, trade_history, llm_reviews.get("hot_spot_hk_stock", ""))
-    out += generate_subsection_md("hot_spot_hk_etf", results.get("hot_spot_hk_etf", []), hot_headers, diff, trade_history, llm_reviews.get("hot_spot_hk_etf", ""))
+    out += generate_subsection_md("hot_spot_a_stock", results.get("hot_spot_a_stock", []), hot_headers, diff, trade_history, llm_reviews.get("hot_spot_a_stock", ""), code_map)
+    out += generate_subsection_md("hot_spot_a_etf", results.get("hot_spot_a_etf", []), hot_headers, diff, trade_history, llm_reviews.get("hot_spot_a_etf", ""), code_map)
+    out += generate_subsection_md("hot_spot_us_stock", results.get("hot_spot_us_stock", []), hot_headers, diff, trade_history, llm_reviews.get("hot_spot_us_stock", ""), code_map)
+    out += generate_subsection_md("hot_spot_us_etf", results.get("hot_spot_us_etf", []), hot_headers, diff, trade_history, llm_reviews.get("hot_spot_us_etf", ""), code_map)
+    out += generate_subsection_md("hot_spot_hk_stock", results.get("hot_spot_hk_stock", []), hot_headers, diff, trade_history, llm_reviews.get("hot_spot_hk_stock", ""), code_map)
+    out += generate_subsection_md("hot_spot_hk_etf", results.get("hot_spot_hk_etf", []), hot_headers, diff, trade_history, llm_reviews.get("hot_spot_hk_etf", ""), code_map)
 
     out += "---\n\n## 🌟 四、全策略综合对比总结 (Master Chart)\n\n"
     out += get_chart_md("pnl_chart_all.png")
@@ -458,20 +533,20 @@ def main():
 """
     
     html += "<h2>🟢 第一章：稳健红利策略 (基本面护城河)</h2>\n"
-    html += generate_subsection_html("dividend_a_stock", results.get("dividend_a_stock", []), div_headers, diff, trade_history, base_dir, llm_reviews.get("dividend_a_stock", ""))
+    html += generate_subsection_html("dividend_a_stock", results.get("dividend_a_stock", []), div_headers, diff, trade_history, base_dir, llm_reviews.get("dividend_a_stock", ""), code_map)
     
     html += "<hr>\n<h2>🔵 第二章：高增成长策略 (基本面护城河)</h2>\n"
-    html += generate_subsection_html("growth_a_stock", results.get("growth_a_stock", []), gro_headers, diff, trade_history, base_dir, llm_reviews.get("growth_a_stock", ""))
-    html += generate_subsection_html("growth_us_stock", results.get("growth_us_stock", []), gro_headers, diff, trade_history, base_dir, llm_reviews.get("growth_us_stock", ""))
-    html += generate_subsection_html("growth_hk_stock", results.get("growth_hk_stock", []), gro_headers, diff, trade_history, base_dir, llm_reviews.get("growth_hk_stock", ""))
+    html += generate_subsection_html("growth_a_stock", results.get("growth_a_stock", []), gro_headers, diff, trade_history, base_dir, llm_reviews.get("growth_a_stock", ""), code_map)
+    html += generate_subsection_html("growth_us_stock", results.get("growth_us_stock", []), gro_headers, diff, trade_history, base_dir, llm_reviews.get("growth_us_stock", ""), code_map)
+    html += generate_subsection_html("growth_hk_stock", results.get("growth_hk_stock", []), gro_headers, diff, trade_history, base_dir, llm_reviews.get("growth_hk_stock", ""), code_map)
 
     html += "<h2>🔴 第三章：产业热点战法 (AI 宏观洞察与事件驱动)</h2>\n"
-    html += generate_subsection_html("hot_spot_a_stock", results.get("hot_spot_a_stock", []), hot_headers, diff, trade_history, base_dir, llm_reviews.get("hot_spot_a_stock", ""))
-    html += generate_subsection_html("hot_spot_a_etf", results.get("hot_spot_a_etf", []), hot_headers, diff, trade_history, base_dir, llm_reviews.get("hot_spot_a_etf", ""))
-    html += generate_subsection_html("hot_spot_us_stock", results.get("hot_spot_us_stock", []), hot_headers, diff, trade_history, base_dir, llm_reviews.get("hot_spot_us_stock", ""))
-    html += generate_subsection_html("hot_spot_us_etf", results.get("hot_spot_us_etf", []), hot_headers, diff, trade_history, base_dir, llm_reviews.get("hot_spot_us_etf", ""))
-    html += generate_subsection_html("hot_spot_hk_stock", results.get("hot_spot_hk_stock", []), hot_headers, diff, trade_history, base_dir, llm_reviews.get("hot_spot_hk_stock", ""))
-    html += generate_subsection_html("hot_spot_hk_etf", results.get("hot_spot_hk_etf", []), hot_headers, diff, trade_history, base_dir, llm_reviews.get("hot_spot_hk_etf", ""))
+    html += generate_subsection_html("hot_spot_a_stock", results.get("hot_spot_a_stock", []), hot_headers, diff, trade_history, base_dir, llm_reviews.get("hot_spot_a_stock", ""), code_map)
+    html += generate_subsection_html("hot_spot_a_etf", results.get("hot_spot_a_etf", []), hot_headers, diff, trade_history, base_dir, llm_reviews.get("hot_spot_a_etf", ""), code_map)
+    html += generate_subsection_html("hot_spot_us_stock", results.get("hot_spot_us_stock", []), hot_headers, diff, trade_history, base_dir, llm_reviews.get("hot_spot_us_stock", ""), code_map)
+    html += generate_subsection_html("hot_spot_us_etf", results.get("hot_spot_us_etf", []), hot_headers, diff, trade_history, base_dir, llm_reviews.get("hot_spot_us_etf", ""), code_map)
+    html += generate_subsection_html("hot_spot_hk_stock", results.get("hot_spot_hk_stock", []), hot_headers, diff, trade_history, base_dir, llm_reviews.get("hot_spot_hk_stock", ""), code_map)
+    html += generate_subsection_html("hot_spot_hk_etf", results.get("hot_spot_hk_etf", []), hot_headers, diff, trade_history, base_dir, llm_reviews.get("hot_spot_hk_etf", ""), code_map)
 
     html += "<h2>🌟 四、全策略综合对比总结 (Master Chart)</h2>\n"
     html += get_chart_html("pnl_chart_all.png", base_dir)

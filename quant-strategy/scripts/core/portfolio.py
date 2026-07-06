@@ -3,6 +3,15 @@ import pytz
 import yfinance as yf
 import akshare as ak
 from typing import Dict, List, Any
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def _fetch_a_hist(*args, **kwargs):
+    return ak.stock_zh_a_hist(*args, **kwargs)
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def _fetch_etf_hist(*args, **kwargs):
+    return ak.fund_etf_hist_em(*args, **kwargs)
 
 class PortfolioManager:
     def __init__(self, db_utils_module):
@@ -110,13 +119,13 @@ class PortfolioManager:
                     # Let's try stock first, if empty try fund
                     df = None
                     try:
-                        df = ak.stock_zh_a_hist(symbol=fetch_key, start_date=start_dt, end_date=end_dt, adjust="qfq")
+                        df = _fetch_a_hist(symbol=fetch_key, start_date=start_dt, end_date=end_dt, adjust="")
                     except Exception as e:
                         pass
                         
                     if df is None or df.empty:
                         try:
-                            df = ak.fund_etf_hist_em(symbol=fetch_key, start_date=start_dt, end_date=end_dt, adjust="qfq")
+                            df = _fetch_etf_hist(symbol=fetch_key, start_date=start_dt, end_date=end_dt, adjust="")
                         except Exception as e:
                             pass
                             
@@ -164,7 +173,19 @@ class PortfolioManager:
                 xp = fetch_open_price(key, strat, x_date)
                 
             if ep > 0 and xp > 0:
-                fee = 0.002 if '_hk_' in strat else (0.001 if '_a_' in strat else 0)
+                import os
+                # P2.14 优化：从环境变量获取费率，去除硬编码
+                fee_hk = float(os.getenv("FEE_HK", 0.002))
+                fee_a = float(os.getenv("FEE_A", 0.001))
+                fee_us = float(os.getenv("FEE_US", 0.000))
+                
+                if '_hk_' in strat:
+                    fee = fee_hk
+                elif '_a_' in strat:
+                    fee = fee_a
+                else:
+                    fee = fee_us
+                    
                 pnl = (xp / ep - 1) - fee
                 cursor.execute("UPDATE trade_history SET entry_price = ?, exit_price = ?, pnl = ? WHERE id = ?", (ep, xp, pnl, tid))
                 updated = True
@@ -227,17 +248,41 @@ class PortfolioManager:
                     print(f"WARNING: Could not fetch exit price for {key}, using entry price as fallback")
                     cp = ep
                     
-                fee = 0.002 if '_hk_' in strat else (0.001 if '_a_' in strat else 0)
+                fee = 0.0  # calculated below
+                import os
+                fee_hk = float(os.getenv("FEE_HK", 0.002))
+                fee_a = float(os.getenv("FEE_A", 0.001))
+                fee_us = float(os.getenv("FEE_US", 0.000))
+                
+                if '_hk_' in strat:
+                    fee = fee_hk
+                elif '_a_' in strat:
+                    fee = fee_a
+                else:
+                    fee = fee_us
+                    
                 raw_pnl = (cp / ep - 1) - fee if ep > 0 else 0
                 pnl = raw_pnl
                 
                 # Fetch adjusted prices for accurate returns
                 try:
+                    import os
+                    fee_hk = float(os.getenv("FEE_HK", 0.002))
+                    fee_a = float(os.getenv("FEE_A", 0.001))
+                    fee_us = float(os.getenv("FEE_US", 0.000))
+                    
+                    if '_hk_' in strat:
+                        fee = fee_hk
+                    elif '_a_' in strat:
+                        fee = fee_a
+                    else:
+                        fee = fee_us
+                        
                     if '_a_' in strat and ep > 0:
-                        df = ak.stock_zh_a_hist(symbol=key, start_date=entry_date.replace('-','')[:8], end_date=snapshot_date.replace('-','')[:8], adjust="qfq")
+                        df = _fetch_a_hist(symbol=key, start_date=entry_date.replace('-','')[:8], end_date=snapshot_date.replace('-','')[:8], adjust="hfq")
                         if not df.empty and len(df) >= 2:
                             adj_ep = float(df.iloc[0]['收盘'])
-                            adj_cp = self.get_simulated_trade_price(current_prices.get(key, {}), strat)
+                            adj_cp = float(df.iloc[-1]['收盘'])
                             pnl = (adj_cp / adj_ep - 1) - fee
                     elif ('_hk_' in strat or '_us_' in strat) and ep > 0:
                         yf_sym = f"{key}.HK" if '_hk_' in strat and not key.upper().endswith('.HK') else key
@@ -246,13 +291,20 @@ class PortfolioManager:
                         df = ticker.history(start=entry_date[:10], end=end_dt.strftime("%Y-%m-%d"))
                         if not df.empty and len(df) >= 2:
                             adj_ep = float(df.iloc[0]['Close'])
-                            adj_cp = self.get_simulated_trade_price(current_prices.get(key, {}), strat)
+                            adj_cp = float(df.iloc[-1]['Close'])
                             pnl = (adj_cp / adj_ep - 1) - fee
                 except Exception as e:
                     print(f"Warning: Failed to fetch adjusted prices for {key}: {e}. Falling back to raw PNL.")
                     
-                diff[strat]["removed"].append({"name": key, "entry_price": ep, "exit_price": cp, "pnl": pnl})
-                t = {"strategy": strat, "name": key, "entry_date": entry_date, "entry_price": ep, "exit_date": snapshot_date, "exit_price": cp, "pnl": pnl}
+                try:
+                    from core.diagnose import diagnose_elimination
+                    reason = diagnose_elimination(key, strat)
+                except Exception as e:
+                    print(f"Failed to diagnose elimination for {key}: {e}")
+                    reason = ""
+                    
+                diff[strat]["removed"].append({"name": key, "entry_price": ep, "exit_price": cp, "pnl": pnl, "reason": reason})
+                t = {"strategy": strat, "name": key, "entry_date": entry_date, "entry_price": ep, "exit_date": snapshot_date, "exit_price": cp, "pnl": pnl, "reason": reason}
                 new_trades.append(t)
                 sold_today_keys.add(key)
             
@@ -273,6 +325,6 @@ class PortfolioManager:
                 new_portfolio[strat][key] = old_portfolio[strat][key]
                 
         # Persist transactions safely (Phase 2 Transactional requirement)
-        self.db.update_portfolio_and_trades(new_portfolio, new_trades)
+        self.db.update_portfolio_and_trades(new_portfolio, new_trades, snapshot_date=snapshot_date)
         
         return new_portfolio, new_trades, diff

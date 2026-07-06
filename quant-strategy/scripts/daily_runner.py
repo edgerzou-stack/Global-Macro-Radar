@@ -4,24 +4,39 @@ import datetime
 import subprocess
 import sys
 import os
+import logging
 
 # === Path Configuration ===
 HOME = os.path.expanduser("~")
-PROJECT_DIR = os.path.join(HOME, "Workplace", "Global-Macro-Radar-Core", "a_share_factor_flow") # You may want to migrate this to Global-Macro-Radar later
-RADAR_DIR = os.path.join(HOME, "Workplace", "Global-Macro-Radar-Core", "industry-radar_archived")
-SCRIPTS_DIR = os.path.join(HOME, "Workplace", "Global-Macro-Radar", "quant-strategy", "scripts")
+# P2.13: 使用相对路径和环境变量，去除硬编码
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(os.path.dirname(CURRENT_DIR))
+PROJECT_DIR = os.environ.get("PROJECT_ROOT", os.path.join(ROOT_DIR, "quant-strategy"))
+RADAR_DIR = os.environ.get("RADAR_ROOT", os.path.join(ROOT_DIR, "industry-radar"))
+SCRIPTS_DIR = CURRENT_DIR
+
+# P3.19 优化：引入 logging 系统替代 print
+os.makedirs(os.path.join(PROJECT_DIR, "logs"), exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(PROJECT_DIR, "logs", "daily_runner.log")),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
 
 def main():
-    print(f"--- Starting daily run at {datetime.datetime.now()} ---")
+    logger.info(f"--- Starting daily run at {datetime.datetime.now()} ---")
     
     # 1. Check if today is a trading day
     today = datetime.date.today()
     try:
         if os.environ.get("FORCE_RUN") == "1":
-            print("FORCE_RUN=1 detected. Bypassing trading day check.")
+            logger.info("FORCE_RUN=1 detected. Bypassing trading day check.")
         else:
             # 修改 P0.4: 分别检查 A股, 美股, 港股 的节假日日历
-            import ecal
             import warnings
             
             is_a_trade = False
@@ -34,7 +49,7 @@ def main():
                 trade_dates_list = pd.to_datetime(trade_dates['trade_date']).dt.date.tolist()
                 is_a_trade = today in trade_dates_list
             except Exception as e:
-                print(f"Failed to fetch A-share trading calendar via akshare: {e}")
+                logger.warning(f"Failed to fetch A-share trading calendar via akshare: {e}")
                 is_a_trade = today.weekday() < 5
                 
             # US/HK Check via pandas_market_calendars (or fallback)
@@ -50,30 +65,30 @@ def main():
                 hk_sched = hkex.schedule(start_date=today, end_date=today)
                 is_hk_trade = not hk_sched.empty
             except ImportError:
-                print("pandas_market_calendars not installed. Using simple weekday check for US/HK as fallback.")
+                logger.warning("pandas_market_calendars not installed. Using simple weekday check for US/HK as fallback.")
                 is_us_trade = today.weekday() < 5
                 is_hk_trade = today.weekday() < 5
             except Exception as e:
-                print(f"Error checking US/HK calendar: {e}")
+                logger.warning(f"Error checking US/HK calendar: {e}")
                 is_us_trade = today.weekday() < 5
                 is_hk_trade = today.weekday() < 5
 
             if not (is_a_trade or is_us_trade or is_hk_trade):
-                print(f"{today} is a holiday/weekend across all monitored markets (A/US/HK). Exiting.")
+                logger.info(f"{today} is a holiday/weekend across all monitored markets (A/US/HK). Exiting.")
                 sys.exit(0)
             
-            print(f"Trading day status -> A-Share: {is_a_trade}, US: {is_us_trade}, HK: {is_hk_trade}")
+            logger.info(f"Trading day status -> A-Share: {is_a_trade}, US: {is_us_trade}, HK: {is_hk_trade}")
             
     except Exception as e:
-        print(f"Failed to fetch trading calendar: {e}")
+        logger.error(f"Failed to fetch trading calendar: {e}")
         # Fallback to weekday check
         if today.weekday() >= 5:
-            print(f"{today} is a weekend. Exiting.")
+            logger.info(f"{today} is a weekend. Exiting.")
             sys.exit(0)
         else:
-            print(f"Assuming {today} is a trading day as fallback.")
+            logger.info(f"Assuming {today} is a trading day as fallback.")
             
-    print(f"{today} is a trading day. Running global strategy pipeline...")
+    logger.info(f"{today} is a trading day. Running global strategy pipeline...")
     checkpoint_file = os.path.join(PROJECT_DIR, ".daily_checkpoint.json")
     checkpoint_data = {"date": "", "completed_steps": []}
     
@@ -90,23 +105,23 @@ def main():
         
     def run_cmd(cmd, cwd):
         if cmd in checkpoint_data["completed_steps"]:
-            print(f"Skipping already completed step: {cmd}")
+            logger.info(f"Skipping already completed step: {cmd}")
             return
             
-        print(f"Running: {cmd}", flush=True)
-        log_file = os.path.join(PROJECT_DIR, "reports", "daily_run.log")
-        with open(log_file, "a") as lf:
-            lf.write(f"\n[{datetime.datetime.now()}] Running: {cmd}\n")
-            lf.flush()
-            process = subprocess.Popen(cmd, shell=True, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            for line in process.stdout:
-                print(line, end='', flush=True)
-                lf.write(line)
-                lf.flush()
-            process.wait()
+        logger.info(f"Running: {cmd}")
+        
+        env = os.environ.copy()
+        env["PROJECT_ROOT"] = PROJECT_DIR
+        env["RADAR_ROOT"] = RADAR_DIR
+        env["RADAR_REPORTS_DIR"] = os.path.join(RADAR_DIR, "reports")
+        
+        process = subprocess.Popen(cmd, shell=True, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+        for line in process.stdout:
+            logger.info(line.strip())
+        process.wait()
             
         if process.returncode != 0:
-            print(f"Command failed with exit code {process.returncode}", flush=True)
+            logger.error(f"Command failed with exit code {process.returncode}")
             sys.exit(process.returncode)
             
         # Record success
@@ -115,16 +130,18 @@ def main():
         with open(checkpoint_file, "w") as f:
             json.dump(checkpoint_data, f)
 
-    run_cmd("venv/bin/python main.py", RADAR_DIR)
+    radar_python = os.environ.get("RADAR_PYTHON", "python3")
+    run_cmd(f"{radar_python} main.py", RADAR_DIR)
         
     # Commands for screening
+    quant_python = os.environ.get("QUANT_PYTHON", "python3")
     cmds = [
-        f"python3 {SCRIPTS_DIR}/fetch_universe.py",
-        f"python3 {SCRIPTS_DIR}/screen_hot_spot.py",
-        f"python3 {SCRIPTS_DIR}/screen_global_quant.py --require-continuous-growth --output-file {PROJECT_DIR}/global_screen.json",
-        f"python3 {SCRIPTS_DIR}/plot_pnl.py",
-        f"python3 {SCRIPTS_DIR}/generate_report.py {PROJECT_DIR}/global_screen.json {PROJECT_DIR}/reports/screening_results.md",
-        f"/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/industry-radar_archived/venv/bin/python {SCRIPTS_DIR}/send_unified_email.py"
+        f"{quant_python} {SCRIPTS_DIR}/fetch_universe.py",
+        f"{quant_python} {SCRIPTS_DIR}/screen_hot_spot.py",
+        f"{quant_python} {SCRIPTS_DIR}/screen_global_quant.py --require-continuous-growth --output-file {PROJECT_DIR}/global_screen.json",
+        f"{quant_python} {SCRIPTS_DIR}/plot_pnl.py",
+        f"{quant_python} {SCRIPTS_DIR}/generate_report.py {PROJECT_DIR}/global_screen.json {PROJECT_DIR}/reports/screening_results.md",
+        f"{quant_python} {SCRIPTS_DIR}/send_unified_email.py"
     ]
     
     os.makedirs(os.path.join(PROJECT_DIR, "reports"), exist_ok=True)
@@ -132,7 +149,7 @@ def main():
     for cmd in cmds:
         run_cmd(cmd, PROJECT_DIR)
             
-    print("Daily global strategy run completed successfully.\n")
+    logger.info("Daily global strategy run completed successfully.")
 
 if __name__ == "__main__":
     main()

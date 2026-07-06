@@ -24,7 +24,28 @@ class ADividendStrategy(Strategy):
         df = kwargs.get("df")
         if df is None or df.empty:
             return []
-        df = df.sort_values(by="TTM股息率", ascending=False).head(self.top_n)
+            
+        previous_holdings = kwargs.get("previous_holdings", [])
+        
+        # Buffer zone logic to prevent flapping
+        df = df.sort_values(by="TTM股息率", ascending=False)
+        if previous_holdings:
+            buffer_n = self.top_n * 2
+            top_buffer_df = df.head(buffer_n)
+            kept_mask = top_buffer_df["股票代码"].isin(previous_holdings)
+            kept_df = top_buffer_df[kept_mask]
+            
+            if len(kept_df) >= self.top_n:
+                df = kept_df.head(self.top_n)
+            else:
+                needed = self.top_n - len(kept_df)
+                remaining_df = df[~df["股票代码"].isin(previous_holdings)]
+                new_df = remaining_df.head(needed)
+                import pandas as pd
+                df = pd.concat([kept_df, new_df]).sort_values(by="TTM股息率", ascending=False)
+        else:
+            df = df.head(self.top_n)
+            
         return df.to_dict('records')
 
 class AGrowthStrategy(Strategy):
@@ -49,10 +70,28 @@ class USHKQuantStrategy(Strategy):
         df = kwargs.get("df")
         if df is None or df.empty:
             return []
+            
+        previous_holdings = kwargs.get("previous_holdings", [])
         
         if 'dividend' in self.strat_id:
             if "TTM股息率" in df.columns:
-                df = df.sort_values(by="TTM股息率", ascending=False).head(self.top_n)
+                df = df.sort_values(by="TTM股息率", ascending=False)
+                if previous_holdings:
+                    buffer_n = self.top_n * 2
+                    top_buffer_df = df.head(buffer_n)
+                    kept_mask = top_buffer_df["股票代码"].isin(previous_holdings)
+                    kept_df = top_buffer_df[kept_mask]
+                    
+                    if len(kept_df) >= self.top_n:
+                        df = kept_df.head(self.top_n)
+                    else:
+                        needed = self.top_n - len(kept_df)
+                        remaining_df = df[~df["股票代码"].isin(previous_holdings)]
+                        new_df = remaining_df.head(needed)
+                        import pandas as pd
+                        df = pd.concat([kept_df, new_df]).sort_values(by="TTM股息率", ascending=False)
+                else:
+                    df = df.head(self.top_n)
             else:
                 df = df.head(self.top_n)
         elif 'growth' in self.strat_id:

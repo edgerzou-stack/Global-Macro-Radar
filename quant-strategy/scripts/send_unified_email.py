@@ -2,7 +2,13 @@ import os
 import sys
 import re
 from dotenv import load_dotenv
-load_dotenv(os.environ.get("RADAR_ENV", "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/industry-radar_archived/.env"))
+import os
+
+env_path = os.environ.get("RADAR_ENV", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "industry-radar", ".env"))
+if env_path and os.path.exists(env_path):
+    load_dotenv(env_path)
+else:
+    load_dotenv() # Load from current directory if possible
 import glob
 import markdown
 import smtplib
@@ -11,7 +17,9 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.image import MIMEImage
 
 def get_latest_radar_report():
-    radar_reports_dir = os.environ.get("RADAR_REPORTS_DIR", "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/industry-radar_archived/reports")
+    # P2.13: 移除硬编码路径，使用基于当前文件的相对路径或环境变量
+    default_reports_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "industry-radar", "reports")
+    radar_reports_dir = os.environ.get("RADAR_REPORTS_DIR", default_reports_dir)
     reports = glob.glob(os.path.join(radar_reports_dir, "*.md"))
     if not reports:
         return None
@@ -20,11 +28,17 @@ def get_latest_radar_report():
 
 def main():
     radar_report = get_latest_radar_report()
-    quant_html = os.environ.get("PROJECT_ROOT", "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/a_share_factor_flow") + "/reports/screening_results.html"
+    default_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    quant_html = os.path.join(os.environ.get("PROJECT_ROOT", default_project_root), "reports", "screening_results.html")
     
     import yaml
-    with open(os.environ.get("RADAR_CONFIG", "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/industry-radar_archived/config.yaml"), "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
+    default_radar_config = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "industry-radar", "config.yaml")
+    config_path = os.environ.get("RADAR_CONFIG", default_radar_config)
+    
+    config = {}
+    if os.path.exists(config_path):
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
     delivery_cfg = config.get("delivery", {})
     sender = delivery_cfg.get("sender_email")
     recipient = delivery_cfg.get("recipient_email")

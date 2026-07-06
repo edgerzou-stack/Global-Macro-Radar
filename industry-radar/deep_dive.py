@@ -120,27 +120,7 @@ def generate_deep_dive_report(article, config):
         report_content = result_json.get("report", "")
         trending_keywords = result_json.get("trending_keywords", [])
         
-        # Auto-evolution: append new keywords to heuristics.yaml
-        if trending_keywords:
-            try:
-                heuristics_path = os.path.join(os.path.dirname(__file__), "heuristics.yaml")
-                with open(heuristics_path, 'r', encoding='utf-8') as f:
-                    heuristics = yaml.safe_load(f)
-                    
-                existing_tech_kws = [k.lower() for k in heuristics['keywords']['hardcore_tech']]
-                added = []
-                for kw in trending_keywords:
-                    if kw.lower() not in existing_tech_kws:
-                        heuristics['keywords']['hardcore_tech'].append(kw.lower())
-                        added.append(kw)
-                        
-                if added:
-                    with open(heuristics_path, 'w', encoding='utf-8') as f:
-                        yaml.dump(heuristics, f, allow_unicode=True, sort_keys=False)
-                    print(f"  [Auto-Evolution] Learned new keywords: {added}", flush=True)
-            except Exception as e:
-                print(f"  [Auto-Evolution] Error updating heuristics: {e}", flush=True)
-                
+        # P2.15: 移除对死代码 heuristics.yaml 的无用写入逻辑
         return {
             "primary_url": primary_url,
             "report_content": report_content

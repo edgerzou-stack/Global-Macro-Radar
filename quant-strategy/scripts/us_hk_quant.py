@@ -74,29 +74,11 @@ def fetch_yf_data(ticker_symbol, args):
             if roe is not None and roe > args.growth_roe_min:
                 if net_margin is not None and net_margin > args.avg_net_profit_margin_min:
                     if debt_to_asset is None or debt_to_asset < args.debt_ratio_max:
-                        if True:
-                            if True:
-                                try:
-                                    q_stmt = fetch_yf_quarterly_income_stmt_cached(ticker_symbol)
-                                    if not q_stmt.empty and len(q_stmt.columns) >= 5:
-                                        if "Net Income" in q_stmt.index and "Total Revenue" in q_stmt.index:
-                                            net_income = q_stmt.loc["Net Income"].values[:5]
-                                            total_rev = q_stmt.loc["Total Revenue"].values[:5]
-                                            
-                                            # Instead of strictly accelerating, just check if they are all positive
-                                            try:
-                                                ni_g = [(net_income[i] - net_income[i+1]) / abs(net_income[i+1]) for i in range(4)]
-                                                rev_g = [(total_rev[i] - total_rev[i+1]) / abs(total_rev[i+1]) for i in range(4)]
-                                                
-                                                ni_accel = all(g > 0 for g in ni_g)
-                                                rev_accel = all(g > 0 for g in rev_g)
-                                                
-                                                if ni_accel and rev_accel:
-                                                    pass_gro_precheck = True
-                                            except ZeroDivisionError:
-                                                pass
-                                except Exception as e:
-                                    pass # If missing data, just fail
+                        # Align with A-shares: Require YoY growth (同比增长) > 0
+                        # yfinance provides this directly via earningsGrowth and revenueGrowth for the latest quarter
+                        if revenue_growth is not None and revenue_growth > 0:
+                            if earnings_growth is not None and earnings_growth > 0:
+                                pass_gro_precheck = True
                     
         if not pass_div_precheck and not pass_gro_precheck:
             # Skip fetching 3-year financials
