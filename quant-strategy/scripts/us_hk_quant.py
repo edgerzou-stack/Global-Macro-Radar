@@ -70,15 +70,35 @@ def fetch_yf_data(ticker_symbol, args):
                     
         # 2. Growth Pre-check
         pass_gro_precheck = False
+        latest_qoq_dual_growth = False
         if market_cap is not None and market_cap / 1e8 > args.market_cap_min_yi:
             if roe is not None and roe > args.growth_roe_min:
                 if net_margin is not None and net_margin > args.avg_net_profit_margin_min:
                     if debt_to_asset is None or debt_to_asset < args.debt_ratio_max:
-                        # Align with A-shares: Require YoY growth (同比增长) > 0
-                        # yfinance provides this directly via earningsGrowth and revenueGrowth for the latest quarter
                         if revenue_growth is not None and revenue_growth > 0:
                             if earnings_growth is not None and earnings_growth > 0:
-                                pass_gro_precheck = True
+                                # YoY passed. Now check QoQ
+                                try:
+                                    import yfinance as yf
+                                    stmt = yf.Ticker(ticker_symbol).quarterly_income_stmt
+                                    if stmt is not None and not stmt.empty and stmt.shape[1] >= 2:
+                                        if 'Total Revenue' in stmt.index and 'Net Income' in stmt.index:
+                                            rev = stmt.loc['Total Revenue'].values
+                                            net = stmt.loc['Net Income'].values
+                                            if len(rev) >= 2 and len(net) >= 2:
+                                                import math
+                                                if not math.isnan(rev[0]) and not math.isnan(rev[1]) and not math.isnan(net[0]) and not math.isnan(net[1]):
+                                                    if rev[0] > rev[1] and net[0] > net[1]:
+                                                        latest_qoq_dual_growth = True
+                                        else:
+                                            latest_qoq_dual_growth = True # Fallback if missing rows
+                                    else:
+                                        latest_qoq_dual_growth = True # Fallback if missing stmt
+                                except Exception:
+                                    latest_qoq_dual_growth = True # Fallback on error
+                                
+                                if latest_qoq_dual_growth:
+                                    pass_gro_precheck = True
                     
         if not pass_div_precheck and not pass_gro_precheck:
             # Skip fetching 3-year financials
@@ -96,6 +116,7 @@ def fetch_yf_data(ticker_symbol, args):
             "销售净利率": net_margin,
             "净利润同比增长率": earnings_growth * 100 if earnings_growth else None,
             "营业总收入同比增长率": revenue_growth * 100 if revenue_growth else None,
+            "最新单季环比双增": latest_qoq_dual_growth,
             "资产负债率": debt_to_asset,
             "最新价": info.get("currentPrice", info.get("previousClose")),
             "所处行业": info.get("sector")
@@ -132,6 +153,7 @@ def screen_us_hk(tickers, args, market_type="US"):
         df["总市值(亿元)"].notna() & (df["总市值(亿元)"] > args.market_cap_min_yi)
         & df["净利润同比增长率"].notna() 
         & df["营业总收入同比增长率"].notna() 
+        & (df["最新单季环比双增"] == True)
         & (df["PE"].isna() | ((df["PE"] < df["净利润同比增长率"]) & (df["PE"] < df["营业总收入同比增长率"])))
         & (df["资产负债率"].isna() | (df["资产负债率"] < args.debt_ratio_max))
     )
