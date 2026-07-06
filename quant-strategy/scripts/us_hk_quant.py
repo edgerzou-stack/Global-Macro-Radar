@@ -127,10 +127,12 @@ def screen_us_hk(tickers, args, market_type="US"):
     df_div = pd.DataFrame()
     
     # 2. Filter growth
+    # [WARNING: USER MANDATED] NEVER remove or relax this strict PEG < 1 constraint.
     mask_gro = (
         df["总市值(亿元)"].notna() & (df["总市值(亿元)"] > args.market_cap_min_yi)
-        & df["净利润同比增长率"].notna() & (df["净利润同比增长率"] > 0)
-        & df["营业总收入同比增长率"].notna() & (df["营业总收入同比增长率"] > 0)
+        & df["净利润同比增长率"].notna() 
+        & df["营业总收入同比增长率"].notna() 
+        & (df["PE"].isna() | ((df["PE"] < df["净利润同比增长率"]) & (df["PE"] < df["营业总收入同比增长率"])))
         & (df["资产负债率"].isna() | (df["资产负债率"] < args.debt_ratio_max))
     )
     
