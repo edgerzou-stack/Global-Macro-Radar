@@ -18,11 +18,8 @@ STRAT_NAMES = {
     "growth_us_stock": "美股高增成长精选",
     "growth_hk_stock": "港股高增成长精选",
     "hot_spot_a_stock": "A股热点突击 (个股)",
-    "hot_spot_a_etf": "A股热点突击 (ETF)",
     "hot_spot_us_stock": "美股热点突击 (个股)",
-    "hot_spot_us_etf": "美股热点突击 (ETF)",
     "hot_spot_hk_stock": "港股热点突击 (个股)",
-    "hot_spot_hk_etf": "港股热点突击 (ETF)",
 }
 
 STRAT_REASONS = {
@@ -33,11 +30,8 @@ STRAT_REASONS = {
     "growth_us_stock": "高增成长 (营收利润连续增长及动量)",
     "growth_hk_stock": "高增成长 (营收利润连续增长及动量)",
     "hot_spot_a_stock": "热点突击 (新闻突发热度及资金流向)",
-    "hot_spot_a_etf": "热点突击 (新闻突发热度及资金流向)",
     "hot_spot_us_stock": "热点突击 (新闻突发热度及资金流向)",
-    "hot_spot_us_etf": "热点突击 (新闻突发热度及资金流向)",
     "hot_spot_hk_stock": "热点突击 (新闻突发热度及资金流向)",
-    "hot_spot_hk_etf": "热点突击 (新闻突发热度及资金流向)",
 }
 
 def render_table_md(items, headers):
@@ -443,8 +437,7 @@ def main():
     if call_llm:
         strategies_to_review = [
             "dividend_a_stock", "growth_a_stock", "growth_us_stock", "growth_hk_stock",
-            "hot_spot_a_stock", "hot_spot_a_etf", "hot_spot_us_stock", "hot_spot_us_etf",
-            "hot_spot_hk_stock", "hot_spot_hk_etf"
+            "hot_spot_a_stock", "hot_spot_us_stock", "hot_spot_hk_stock"
         ]
         
         def fetch_review(strat):
@@ -488,11 +481,8 @@ def main():
 
     out += "---\n\n## 🔴 第三章：产业热点战法 (AI 宏观洞察与事件驱动)\n\n"
     out += generate_subsection_md("hot_spot_a_stock", results.get("hot_spot_a_stock", []), hot_headers, diff, trade_history, llm_reviews.get("hot_spot_a_stock", ""), code_map)
-    out += generate_subsection_md("hot_spot_a_etf", results.get("hot_spot_a_etf", []), hot_headers, diff, trade_history, llm_reviews.get("hot_spot_a_etf", ""), code_map)
     out += generate_subsection_md("hot_spot_us_stock", results.get("hot_spot_us_stock", []), hot_headers, diff, trade_history, llm_reviews.get("hot_spot_us_stock", ""), code_map)
-    out += generate_subsection_md("hot_spot_us_etf", results.get("hot_spot_us_etf", []), hot_headers, diff, trade_history, llm_reviews.get("hot_spot_us_etf", ""), code_map)
     out += generate_subsection_md("hot_spot_hk_stock", results.get("hot_spot_hk_stock", []), hot_headers, diff, trade_history, llm_reviews.get("hot_spot_hk_stock", ""), code_map)
-    out += generate_subsection_md("hot_spot_hk_etf", results.get("hot_spot_hk_etf", []), hot_headers, diff, trade_history, llm_reviews.get("hot_spot_hk_etf", ""), code_map)
 
     out += "---\n\n## 🌟 四、全策略综合对比总结 (Master Chart)\n\n"
     out += get_chart_md("pnl_chart_all.png")
@@ -542,11 +532,8 @@ def main():
 
     html += "<h2>🔴 第三章：产业热点战法 (AI 宏观洞察与事件驱动)</h2>\n"
     html += generate_subsection_html("hot_spot_a_stock", results.get("hot_spot_a_stock", []), hot_headers, diff, trade_history, base_dir, llm_reviews.get("hot_spot_a_stock", ""), code_map)
-    html += generate_subsection_html("hot_spot_a_etf", results.get("hot_spot_a_etf", []), hot_headers, diff, trade_history, base_dir, llm_reviews.get("hot_spot_a_etf", ""), code_map)
     html += generate_subsection_html("hot_spot_us_stock", results.get("hot_spot_us_stock", []), hot_headers, diff, trade_history, base_dir, llm_reviews.get("hot_spot_us_stock", ""), code_map)
-    html += generate_subsection_html("hot_spot_us_etf", results.get("hot_spot_us_etf", []), hot_headers, diff, trade_history, base_dir, llm_reviews.get("hot_spot_us_etf", ""), code_map)
     html += generate_subsection_html("hot_spot_hk_stock", results.get("hot_spot_hk_stock", []), hot_headers, diff, trade_history, base_dir, llm_reviews.get("hot_spot_hk_stock", ""), code_map)
-    html += generate_subsection_html("hot_spot_hk_etf", results.get("hot_spot_hk_etf", []), hot_headers, diff, trade_history, base_dir, llm_reviews.get("hot_spot_hk_etf", ""), code_map)
 
     html += "<h2>🌟 四、全策略综合对比总结 (Master Chart)</h2>\n"
     html += get_chart_html("pnl_chart_all.png", base_dir)

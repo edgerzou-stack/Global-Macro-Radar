@@ -124,7 +124,7 @@ def main():
         "dividend_hk_stock": USHKQuantStrategy("dividend_hk_stock", args.max_stocks),
         "growth_hk_stock": USHKQuantStrategy("growth_hk_stock", args.max_stocks),
     }
-    for hs in ["hot_spot_a_stock", "hot_spot_a_etf", "hot_spot_us_stock", "hot_spot_us_etf", "hot_spot_hk_stock", "hot_spot_hk_etf"]:
+    for hs in ["hot_spot_a_stock", "hot_spot_us_stock", "hot_spot_hk_stock"]:
         strategies[hs] = HotSpotStrategy(hs)
         
     universes = load_universes()
@@ -160,7 +160,7 @@ def main():
         "growth_hk_stock": strategies["growth_hk_stock"].get_signals(df=gro_hk_df, previous_holdings=list(old_portfolio.get("growth_hk_stock", {}).keys())),
     }
     
-    for hs in ["hot_spot_a_stock", "hot_spot_a_etf", "hot_spot_us_stock", "hot_spot_us_etf", "hot_spot_hk_stock", "hot_spot_hk_etf"]:
+    for hs in ["hot_spot_a_stock", "hot_spot_us_stock", "hot_spot_hk_stock"]:
         results[hs] = strategies[hs].get_signals(target_list=hot_spot_data.get(hs, []))
 
     # A-Share number parsing fix (from original screen_global_quant.py)
