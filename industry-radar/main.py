@@ -432,20 +432,33 @@ def main():
     
     new_dd = False
     if high_scoring_for_dd:
-        print(f"Checking Deep Dive for {len(high_scoring_for_dd)} highly rated articles...", flush=True)
-        for a in high_scoring_for_dd:
+        import concurrent.futures
+        from deep_dive import generate_deep_dive_report
+        
+        print(f"Checking Deep Dive for {len(high_scoring_for_dd)} highly rated articles (concurrently)...", flush=True)
+        
+        def process_dd(a):
             link = a.get('link')
             if 'deep_dive' not in a and (link not in cache_data or 'deep_dive' not in cache_data[link]):
-                from deep_dive import generate_deep_dive_report
                 print(f"Generating Deep Dive for {a['title'][:30]}...", flush=True)
                 dd = generate_deep_dive_report(a, config)
-                if dd:
-                    a['deep_dive'] = dd
-                    if link not in cache_data: cache_data[link] = {}
-                    cache_data[link]['deep_dive'] = dd
-                    new_dd = True
+                return a, link, dd
             elif link in cache_data and 'deep_dive' in cache_data[link]:
                 a['deep_dive'] = cache_data[link]['deep_dive']
+            return None, None, None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(process_dd, a) for a in high_scoring_for_dd]
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    a, link, dd = future.result()
+                    if dd:
+                        a['deep_dive'] = dd
+                        if link not in cache_data: cache_data[link] = {}
+                        cache_data[link]['deep_dive'] = dd
+                        new_dd = True
+                except Exception as e:
+                    print(f"Error in deep dive worker: {e}", flush=True)
 
     if cache_updates > 0 or new_dd:
         save_cache(cache_data)

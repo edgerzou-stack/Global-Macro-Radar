@@ -59,13 +59,46 @@ def deduplicate_articles(articles, config):
     sorted_articles = sorted(articles, key=lambda x: x.get('published_at', '9999-12-31'))
     
     from llm_router import _call_llm_with_fallback
-    import json
+    import difflib
+    
+    # Pre-deduplicate using local string matching to save LLM tokens
+    local_dedup_groups = [] # list of lists of articles
+    for a in sorted_articles:
+        long_text = a.get('content', a.get('summary', ''))
+        if long_text: long_text = long_text[:800]
+        text_to_match = (a.get('title', '') + " " + long_text).lower()
+        
+        found_group = False
+        for group in local_dedup_groups:
+            # Compare against the first article in the group
+            rep = group[0]
+            rep_text = rep.get('content', rep.get('summary', ''))
+            if rep_text: rep_text = rep_text[:800]
+            rep_match = (rep.get('title', '') + " " + rep_text).lower()
+            
+            similarity = difflib.SequenceMatcher(None, text_to_match, rep_match).ratio()
+            if similarity > 0.85:
+                group.append(a)
+                found_group = True
+                break
+                
+        if not found_group:
+            local_dedup_groups.append([a])
+            
+    print(f"Local pre-deduplication grouped {len(sorted_articles)} articles into {len(local_dedup_groups)} groups.", flush=True)
 
-    # Prepare payload for LLM
+    if len(local_dedup_groups) <= 1:
+        # If local grouping already reduced it to 1, just return the first of the group
+        final_list = []
+        for g in local_dedup_groups:
+            best_article = max(g, key=lambda x: x.get('score_data', {}).get('innovation_score', 0) + x.get('score_data', {}).get('traffic_score', 0))
+            final_list.append(best_article)
+        return final_list
+
+    # Prepare payload for LLM from the reduced groups
     payload = []
-    for i, a in enumerate(sorted_articles):
-        # Pass the original long summary or content (up to 800 chars) instead of the truncated 50-char summary
-        # This gives the LLM enough context to realize they are the same event.
+    for i, group in enumerate(local_dedup_groups):
+        a = group[0] # Use the representative for LLM scoring
         long_text = a.get('content', a.get('summary', ''))
         if long_text:
             long_text = long_text[:800]
@@ -99,22 +132,31 @@ def deduplicate_articles(articles, config):
         groups = res.get("groups", [])
     except Exception as e:
         print(f"LLM Deduplication error: {e}. Falling back to returning original articles.", flush=True)
-        return sorted_articles
+        # Fallback: just pick the best from each local group
+        final_list = []
+        for g in local_dedup_groups:
+            best_article = max(g, key=lambda x: x.get('score_data', {}).get('innovation_score', 0) + x.get('score_data', {}).get('traffic_score', 0))
+            final_list.append(best_article)
+        return final_list
         
     final_articles = []
     processed = set()
     for group in groups:
         if not group:
             continue
-        valid_group = [idx for idx in group if 0 <= idx < len(sorted_articles) and idx not in processed]
-        if not valid_group:
+        valid_group_indices = [idx for idx in group if 0 <= idx < len(local_dedup_groups) and idx not in processed]
+        if not valid_group_indices:
             continue
             
-        base_idx = valid_group[0]
-        base_article = sorted_articles[base_idx]
-        processed.add(base_idx)
+        # Flatten the local groups corresponding to the LLM chosen indices into a single big group
+        combined_articles = []
+        for idx in valid_group_indices:
+            combined_articles.extend(local_dedup_groups[idx])
+            processed.add(idx)
+            
+        base_article = combined_articles[0]
         
-        if len(valid_group) > 1:
+        if len(combined_articles) > 1:
             sources = set([base_article.get('source', '')])
             max_inn = base_article.get('score_data', {}).get('innovation_score', 0)
             max_tra = base_article.get('score_data', {}).get('traffic_score', 0)
@@ -132,9 +174,7 @@ def deduplicate_articles(articles, config):
             if ds_base.get('translated_summary'): summaries_to_merge.append(ds_base['translated_summary'])
             if ds_base.get('justification'): justs_to_merge.append(ds_base['justification'])
             
-            for dup_idx in valid_group[1:]:
-                dup_art = sorted_articles[dup_idx]
-                processed.add(dup_idx)
+            for dup_art in combined_articles[1:]:
                 sources.add(dup_art.get('source', ''))
                 ds = dup_art.get('score_data', {})
                 max_inn = max(max_inn, ds.get('innovation_score', 0))

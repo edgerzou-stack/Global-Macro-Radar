@@ -6,13 +6,14 @@ CACHE_FILE = "article_cache.json"
 CACHE_TTL_DAYS = 30
 SECONDS_IN_A_DAY = 86400
 
+MAX_CACHE_ENTRIES = 1000
+
 def load_cache():
     if os.path.exists(CACHE_FILE):
         try:
             with open(CACHE_FILE, 'r', encoding='utf-8') as f:
                 cache_data = json.load(f)
                 
-            # 修改 P1.8: 清理超过 30 天的缓存
             current_time = time.time()
             keys_to_delete = []
             for key, value in cache_data.items():
@@ -24,6 +25,18 @@ def load_cache():
                 for key in keys_to_delete:
                     del cache_data[key]
                 print(f"Pruned {len(keys_to_delete)} expired cache entries.", flush=True)
+                
+            # Limit to MAX_CACHE_ENTRIES
+            if len(cache_data) > MAX_CACHE_ENTRIES:
+                sorted_entries = sorted(
+                    cache_data.items(), 
+                    key=lambda item: item[1].get("timestamp", 0) if isinstance(item[1], dict) else 0,
+                    reverse=True
+                )
+                keys_to_delete = [item[0] for item in sorted_entries[MAX_CACHE_ENTRIES:]]
+                for key in keys_to_delete:
+                    del cache_data[key]
+                print(f"Pruned {len(keys_to_delete)} cache entries to maintain max size.", flush=True)
                 
             return cache_data
         except Exception as e:

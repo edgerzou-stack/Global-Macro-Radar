@@ -35,29 +35,41 @@ def call_llm(prompt, require_json=False):
 
     # 1. Try Gemini
     if gemini_key:
-        try:
-            # P2.14: 移除硬编码的模型名，使用环境变量配置
-            model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_key}"
-            headers = {"Content-Type": "application/json"}
-            
-            gen_config = {"temperature": 0.0}
-            if require_json:
-                gen_config["responseMimeType"] = "application/json"
+        import time
+        max_retries = 3
+        base_delay = 5
+        for attempt in range(max_retries):
+            try:
+                # P2.14: 移除硬编码的模型名，使用环境变量配置
+                model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_key}"
+                headers = {"Content-Type": "application/json"}
                 
-            data = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": gen_config
-            }
-            resp = requests.post(url, headers=headers, json=data, timeout=60)
-            resp.raise_for_status()
-            text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-            return json.loads(_clean_json_output(text)) if require_json else text
-        except Exception as e:
-            err_msg = str(e)
-            import re
-            err_msg = re.sub(r"key=([^& ]+)", "key=***HIDDEN***", err_msg)
-            print(f"Gemini fallback: {err_msg}")
+                gen_config = {"temperature": 0.0}
+                if require_json:
+                    gen_config["responseMimeType"] = "application/json"
+                    
+                data = {
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": gen_config
+                }
+                resp = requests.post(url, headers=headers, json=data, timeout=60)
+                resp.raise_for_status()
+                text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+                return json.loads(_clean_json_output(text)) if require_json else text
+            except Exception as e:
+                err_str = str(e).lower()
+                if "429" in err_str or "too many" in err_str or "quota" in err_str or "503" in err_str:
+                    if attempt < max_retries - 1:
+                        sleep_time = base_delay * (2 ** attempt)
+                        print(f"Gemini rate limit/overload. Retrying in {sleep_time}s...", flush=True)
+                        time.sleep(sleep_time)
+                        continue
+                err_msg = str(e)
+                import re
+                err_msg = re.sub(r"key=([^& ]+)", "key=***HIDDEN***", err_msg)
+                print(f"Gemini fallback after {attempt+1} attempts: {err_msg}")
+                break
 
     # Helper function to fix proxy double-encoding (mojibake)
     def fix_encoding(s):
