@@ -7,9 +7,9 @@ STRATEGIES = [
     "dividend_a_stock", "growth_a_stock",
     "dividend_us_stock", "growth_us_stock",
     "dividend_hk_stock", "growth_hk_stock",
-    "hot_spot_a_stock", "hot_spot_a_etf",
-    "hot_spot_us_stock", "hot_spot_us_etf",
-    "hot_spot_hk_stock", "hot_spot_hk_etf"
+    "hot_spot_a_stock",
+    "hot_spot_us_stock",
+    "hot_spot_hk_stock"
 ]
 
 def load_universes():
