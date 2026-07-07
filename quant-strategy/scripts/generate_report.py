@@ -287,8 +287,9 @@ def generate_llm_review(strategy_id, results):
 
 def generate_subsection_md(strategy_id, results, headers, diff, trade_history, llm_review="", code_map=None):
     strat_trades = [t for t in trade_history if t.get("strategy") == strategy_id]
+    title = STRAT_NAMES.get(strategy_id, strategy_id)
     if not results and not strat_trades:
-        return ""
+        return f"### {title}\n\n**当前持仓列表**\n\n暂无符合条件的标的，且暂无历史平仓交割单。\n\n"
 
     title = STRAT_NAMES.get(strategy_id, strategy_id)
     out = f"### {title}\n\n"
@@ -351,8 +352,9 @@ def generate_subsection_md(strategy_id, results, headers, diff, trade_history, l
 
 def generate_subsection_html(strategy_id, results, headers, diff, trade_history, base_dir, llm_review="", code_map=None):
     strat_trades = [t for t in trade_history if t.get("strategy") == strategy_id]
+    title = STRAT_NAMES.get(strategy_id, strategy_id)
     if not results and not strat_trades:
-        return ""
+        return f"<h3>{title}</h3>\n<h4>当前持仓列表</h4>\n<p>暂无符合条件的标的，且暂无历史平仓交割单。</p>\n"
 
     title = STRAT_NAMES.get(strategy_id, strategy_id)
     html = f"<h3>{title}</h3>\n"
