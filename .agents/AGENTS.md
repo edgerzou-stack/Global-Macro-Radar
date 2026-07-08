@@ -39,3 +39,9 @@ Format it strictly as follows:
         *   [Sub-task/Constraint 1]
         *   [Sub-task/Constraint 2]
 *   **❓ Dropped/Forgotten Items:** [List explicitly dropped items. If not empty, add: "Did you still need me to retain these for later, or can they be permanently discarded?"]
+
+# Project Specific Rule: Code Synchronization & Git Push Strategy
+- When instructed to push code to GitHub for this project (Global-Macro-Radar), you MUST strictly follow the dual-repo segregation strategy:
+  1. **Public Repository (main branch)**: Commit and push all core system logic, pipelines, UI, and configuration (excluding sensitive keys and the `tests/` directory) to the `public` remote's `main` branch.
+  2. **Private Repository (private-main branch)**: Switch to the `private-main` branch, merge `main`, add the `tests/` directory (which contains proprietary regression testing logic), commit, and push to the `private` remote (`git push private private-main:main`).
+  3. **Cleanup**: Always switch back to the `main` branch after syncing to leave the workspace in a clean state.
