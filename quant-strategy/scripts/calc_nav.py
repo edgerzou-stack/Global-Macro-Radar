@@ -61,7 +61,7 @@ def calc_nav():
                 # Total invested capital = 33000 * shares
                 # Current value = (cp / ep) * Total invested capital
                 invested_capital = 1000000.0 * 0.033 * shares
-                current_value = (cp / ep) * invested_capital if ep > 0 else 0
+                current_value = (cp / ep) * invested_capital if ep > 0 else invested_capital
                 holdings_value += current_value
                 
             total_nav = cash + holdings_value
