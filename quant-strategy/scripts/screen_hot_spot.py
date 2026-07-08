@@ -270,9 +270,9 @@ def main():
         if cat_holdings:
             prompt += f"【注意】：以下是昨日该策略的持仓标的：{json.dumps(cat_holdings, ensure_ascii=False)}\n为了保证策略稳定性，如果新闻热点依然和它们高度相关，请优先保留它们以降低换手率。\n\n"
         prompt += (
-            "仓位有限，我们只能上车 10 只股票。请结合它们与新闻的绝对相关度、以及今天的市场活跃度（成交额越大越好、表现强势），精挑细选出最核心的最多 10 只龙头股。\n"
-            "如果值得买的不足 10 只，宁缺毋滥，只返回值得买的几只即可。\n"
-            "请严格返回一个 JSON 数组，只包含你选出的股票的「股票代码」（如 [\"600519\", \"AAPL\", \"0700.HK\"]）。不要输出任何其他文本或解释理由。"
+            "请结合它们与新闻的绝对相关度、以及今天的市场活跃度（成交额越大越好、表现强势），精挑细选出最核心的最多 15 只龙头股，并务必【按相关度从高到低排序】。\n"
+            "如果值得买的不足 15 只，宁缺毋滥，只返回值得买的几只即可。\n"
+            "请严格返回一个 JSON 数组，只包含你选出的股票的「股票代码」，并按优先级排序（如 [\"600519\", \"AAPL\", \"0700.HK\"]）。不要输出任何其他文本或解释理由。"
         )
         
         max_retries = 3
@@ -280,13 +280,28 @@ def main():
             try:
                 res = call_llm(prompt, require_json=True)
                 if isinstance(res, list):
-                    selected_codes = set(str(c) for c in res)
+                    selected_codes = [str(c) for c in res]
                 else:
                     # Attempt regex if json extraction yielded a dict or something weird
                     res_str = json.dumps(res) if isinstance(res, dict) else str(res)
-                    selected_codes = set(re.findall(r'([A-Za-z0-9.]+)', res_str))
+                    selected_codes = re.findall(r'([A-Za-z0-9.]+)', res_str)
                     
-                filtered = [c for c in candidates if str(c.get("股票代码", "")) in selected_codes]
+                cand_map = {str(c.get("股票代码", "")): c for c in candidates}
+                filtered = []
+                for idx, code in enumerate(selected_codes):
+                    if code not in cand_map:
+                        continue
+                        
+                    if len(filtered) < 10:
+                        filtered.append(cand_map[code])
+                    else:
+                        # 出池缓冲机制 (Buffer Zone): 跌出前 10，但在前 15 名内的原持仓予以保留
+                        if code in cat_holdings:
+                            print(f"BUFFER ZONE RETAIN: {code} ranked {idx+1}, kept to reduce turnover.")
+                            filtered.append(cand_map[code])
+                            
+                    if len(filtered) >= 15:
+                        break
                 
                 if not filtered:
                     print(f"Warning: LLM returned no matching valid codes for {category_name}.")
