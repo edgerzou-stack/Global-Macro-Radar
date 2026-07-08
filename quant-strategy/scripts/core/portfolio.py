@@ -346,7 +346,6 @@ class PortfolioManager:
                 # Fetch adjusted prices for accurate returns
                 try:
                     if '_a_' in strat and ep > 0:
-                        from core.data_fetcher import _fetch_a_hist
                         df = pd.DataFrame()
                         try:
                             df = _fetch_a_hist(symbol=key, start_date=entry_date.replace('-','')[:8], end_date=snapshot_date.replace('-','')[:8], adjust="hfq")
