@@ -61,7 +61,7 @@ def get_a_tickers():
         return []
 
 def main():
-    project_dir = "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/a_share_factor_flow"
+    project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     out_path = os.path.join(project_dir, "universes.json")
     backup_path = os.path.join(project_dir, "universes_backup.json")
     

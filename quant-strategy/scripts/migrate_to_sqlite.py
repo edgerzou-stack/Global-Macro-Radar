@@ -2,8 +2,8 @@ import json
 import sqlite3
 import os
 
-DB_PATH = "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/a_share_factor_flow/quant_system.db"
-JSON_PATH = "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/a_share_factor_flow/global_screen.json"
+DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "quant_system.db")
+JSON_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "global_screen.json")
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)

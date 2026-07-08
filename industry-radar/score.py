@@ -25,8 +25,8 @@ def score_article(article, config):
        - A news roundup, summary, or digest (e.g., "Top 10 news", "Morning brief", "Weekly digest", "8点1氪", "氪星晚报", "晚报").
        - A shopping deal, discount, or advertisement (e.g., "Prime Day deals", "Black Friday", "Save $50 on...", "优惠精选", "购物指南").
        - Re-hashed old news or an old event being re-reported as new (e.g., "炒冷饭" - a breakthrough or event that actually happened months or years prior to the Current Date). If you recognize the event as historical relative to the Current Date, YOU MUST REJECT IT by setting is_relevant to False.
-    2. If relevant, score its 'innovation_score' (0.0-10.0, can use 1 decimal place e.g., 7.5).
-    3. Score its 'traffic_score' (0.0-10.0, can use 1 decimal place e.g., 8.2).
+    2. Output 4 core sub-scores (0-100 integers): 'tech_score', 'commercial_score', 'hype_score', 'macro_score'.
+    3. Output a 'reasoning_chain' explaining the rationale BEFORE giving the scores.
     4. Provide a concise 1-sentence justification explaining the scores in {config.get('output', {}).get('language', 'Chinese')}.
     5. Provide the translation of the 'Article Title' into {config.get('output', {}).get('language', 'Chinese')}.
     6. Provide a HIGHLY CONDENSED summary of the article content. **CRITICAL RULE: The translated_summary MUST be ONE SINGLE SENTENCE and MUST NOT exceed 50 Chinese characters. Be extremely brief.**
@@ -34,8 +34,11 @@ def score_article(article, config):
     You must output strictly in JSON format matching this schema:
     {{
       "is_relevant": boolean,
-      "innovation_score": float,
-      "traffic_score": float,
+      "reasoning_chain": string,
+      "tech_score": integer,
+      "commercial_score": integer,
+      "hype_score": integer,
+      "macro_score": integer,
       "justification": string,
       "translated_title": string,
       "translated_summary": string
@@ -44,6 +47,17 @@ def score_article(article, config):
     
     result = _call_llm_with_fallback(prompt, config, title_context=article['title'][:30])
     if result:
+        tech = float(result.get("tech_score", 0))
+        comm = float(result.get("commercial_score", 0))
+        hype = float(result.get("hype_score", 0))
+        macro = float(result.get("macro_score", 0))
+        
+        weights = config.get("scoring_weights", {})
+        inn_weights = weights.get("innovation", {"tech": 0.6, "commercial": 0.4})
+        traf_weights = weights.get("traffic", {"hype": 0.6, "macro": 0.4})
+        
+        result["innovation_score"] = (tech * inn_weights.get("tech", 0.6) + comm * inn_weights.get("commercial", 0.4)) / 10.0
+        result["traffic_score"] = (hype * traf_weights.get("hype", 0.6) + macro * traf_weights.get("macro", 0.4)) / 10.0
         return result
         
     return {"innovation_score": 0, "traffic_score": 0, "justification": "All API endpoints failed or unconfigured", "is_relevant": False, "translated_title": article['title'], "translated_summary": "Error"}
@@ -101,7 +115,7 @@ def deduplicate_articles(articles, config):
         a = group[0] # Use the representative for LLM scoring
         long_text = a.get('content', a.get('summary', ''))
         if long_text:
-            long_text = long_text[:800]
+            long_text = long_text[:250]
         
         payload.append({
             "id": i,
@@ -306,8 +320,8 @@ def score_articles_batch(articles_batch, config):
     {json.dumps(payload, ensure_ascii=False)}
     
     For EACH article in the input, provide:
-    1. 'innovation_score' (0.0-10.0, allows 1 decimal place)
-    2. 'traffic_score' (0.0-10.0, allows 1 decimal place)
+    1. 'reasoning_chain': A short paragraph explaining the logic BEFORE scoring.
+    2. 4 sub-scores (0-100 integers): 'tech_score', 'commercial_score', 'hype_score', 'macro_score'.
     3. 'justification': 1-sentence explanation of scores in {config.get('output', {}).get('language', 'Chinese')}
     4. 'translated_title': Translate title to {config.get('output', {}).get('language', 'Chinese')}
     5. 'translated_summary': HIGHLY CONDENSED summary (MAX 50 Chinese characters)
@@ -318,8 +332,11 @@ def score_articles_batch(articles_batch, config):
         {{
           "id": integer,
           "is_relevant": true,
-          "innovation_score": number (e.g. 8.5),
-          "traffic_score": number (e.g. 8.5),
+          "reasoning_chain": string,
+          "tech_score": integer (e.g. 83),
+          "commercial_score": integer (e.g. 76),
+          "hype_score": integer (e.g. 90),
+          "macro_score": integer (e.g. 60),
           "justification": string,
           "translated_title": string,
           "translated_summary": string
@@ -333,6 +350,17 @@ def score_articles_batch(articles_batch, config):
     if result and "results" in result:
         trusted_sources = config.get("trusted_sources", [])
         for res_item in result["results"]:
+            tech = float(res_item.get("tech_score", 0))
+            comm = float(res_item.get("commercial_score", 0))
+            hype = float(res_item.get("hype_score", 0))
+            macro = float(res_item.get("macro_score", 0))
+            
+            weights = config.get("scoring_weights", {})
+            inn_weights = weights.get("innovation", {"tech": 0.6, "commercial": 0.4})
+            traf_weights = weights.get("traffic", {"hype": 0.6, "macro": 0.4})
+            
+            res_item["innovation_score"] = (tech * inn_weights.get("tech", 0.6) + comm * inn_weights.get("commercial", 0.4)) / 10.0
+            res_item["traffic_score"] = (hype * traf_weights.get("hype", 0.6) + macro * traf_weights.get("macro", 0.4)) / 10.0
             # Find original article by id
             a_id = res_item.get("id")
             original_a = next((a for a in articles_batch if a["id"] == a_id), None)

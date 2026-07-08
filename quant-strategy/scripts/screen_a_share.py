@@ -1098,7 +1098,8 @@ def main() -> int:
         current_prices.update({row["股票简称"]: row.get("最新价", 0) for row in quote_stage.to_dict(orient="records")})
         
         hot_spot_list = []
-        hot_spot_file = os.environ.get("PROJECT_ROOT", "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/a_share_factor_flow") + "/hot_spot_today.json"
+        from config import PROJECT_ROOT
+        hot_spot_file = os.path.join(PROJECT_ROOT, "hot_spot_today.json")
         if os.path.exists(hot_spot_file):
             try:
                 with open(hot_spot_file, "r", encoding="utf-8") as f:

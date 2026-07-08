@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  radar-app:
+    build: .
+    container_name: global-macro-radar
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      # 持久化数据库
+      - ./quant_system.db:/app/quant_system.db
+      # 持久化量化策略生成的图表和报告
+      - ./quant-strategy/reports:/app/quant-strategy/reports
+      # 持久化雷达生成的报告
+      - ./industry-radar/reports:/app/industry-radar/reports
+      # 持久化日志
+      - ./logs:/app/logs
+      # 持久化文章缓存
+      - ./industry-radar/article_cache.json:/app/industry-radar/article_cache.json
+    environment:
+      - TZ=Asia/Shanghai

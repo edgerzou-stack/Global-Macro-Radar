@@ -102,12 +102,9 @@ def generate_deep_dive_report(article, config):
     Write the report in {config.get('output', {}).get('language', 'Chinese')}.
     Use professional markdown formatting (headings, bullet points, bold text).
     
-    ALSO, extract exactly 3 cutting-edge trending technology keywords (single words or short phrases in English, e.g. "AGI", "Solid-state battery") that are central to this article.
-    
     Output strictly in JSON format matching this schema:
     {{
-      "report": "Your full markdown report here",
-      "trending_keywords": ["keyword1", "keyword2", "keyword3"]
+      "report": "Your full markdown report here"
     }}
     
     Raw Text:
@@ -118,7 +115,6 @@ def generate_deep_dive_report(article, config):
             
     if result_json:
         report_content = result_json.get("report", "")
-        trending_keywords = result_json.get("trending_keywords", [])
         
         # P2.15: 移除对死代码 heuristics.yaml 的无用写入逻辑
         return {

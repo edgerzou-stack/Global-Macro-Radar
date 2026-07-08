@@ -261,12 +261,14 @@ def stock_zcfz_em_cached(date: str) -> pd.DataFrame:
 @with_retry(max_retries=3, delay=2)
 def stock_dividend_cninfo_cached(symbol: str) -> pd.DataFrame:
     import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        future = executor.submit(ak.stock_dividend_cninfo, symbol=symbol)
-        try:
-            return future.result(timeout=10)
-        except concurrent.futures.TimeoutError:
-            raise Exception("Timeout fetching dividend data")
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(ak.stock_dividend_cninfo, symbol=symbol)
+    try:
+        return future.result(timeout=10)
+    except concurrent.futures.TimeoutError:
+        raise Exception("Timeout fetching dividend data")
+    finally:
+        executor.shutdown(wait=False)
 @disk_cache(expire_hours=24)
 @with_retry(max_retries=3, delay=2)
 def stock_info_a_code_name_cached() -> pd.DataFrame:

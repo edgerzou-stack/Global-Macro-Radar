@@ -11,7 +11,8 @@ HOME = os.path.expanduser("~")
 # P2.13: 使用相对路径和环境变量，去除硬编码
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(os.path.dirname(CURRENT_DIR))
-PROJECT_DIR = os.environ.get("PROJECT_ROOT", os.path.join(ROOT_DIR, "quant-strategy"))
+from config import PROJECT_ROOT
+PROJECT_DIR = PROJECT_ROOT
 RADAR_DIR = os.environ.get("RADAR_ROOT", os.path.join(ROOT_DIR, "industry-radar"))
 SCRIPTS_DIR = CURRENT_DIR
 
@@ -59,10 +60,11 @@ def main():
                 hkex = mcal.get_calendar('HKEX')
                 
                 # Check if today is in the schedule
-                us_sched = nyse.schedule(start_date=today, end_date=today)
+                today_str = today.strftime('%Y-%m-%d')
+                us_sched = nyse.schedule(start_date=today_str, end_date=today_str)
                 is_us_trade = not us_sched.empty
                 
-                hk_sched = hkex.schedule(start_date=today, end_date=today)
+                hk_sched = hkex.schedule(start_date=today_str, end_date=today_str)
                 is_hk_trade = not hk_sched.empty
             except ImportError:
                 logger.warning("pandas_market_calendars not installed. Using simple weekday check for US/HK as fallback.")
@@ -139,6 +141,7 @@ def main():
         f"{quant_python} {SCRIPTS_DIR}/fetch_universe.py",
         f"{quant_python} {SCRIPTS_DIR}/screen_hot_spot.py",
         f"{quant_python} {SCRIPTS_DIR}/screen_global_quant.py --require-continuous-growth --output-file {PROJECT_DIR}/global_screen.json",
+        f"{quant_python} {SCRIPTS_DIR}/calc_nav.py",
         f"{quant_python} {SCRIPTS_DIR}/plot_pnl.py",
         f"{quant_python} {SCRIPTS_DIR}/generate_report.py {PROJECT_DIR}/global_screen.json {PROJECT_DIR}/reports/screening_results.md",
         f"{quant_python} {SCRIPTS_DIR}/send_unified_email.py"

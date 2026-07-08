@@ -10,10 +10,11 @@ from openai import OpenAI
 llm_semaphore = threading.Semaphore(10)
 
 def get_gemini_client():
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        return None
-    return genai.Client(api_key=api_key)
+    return None
+    # api_key = os.getenv("GEMINI_API_KEY")
+    # if not api_key:
+    #     return None
+    # return genai.Client(api_key=api_key)
 
 def get_openai_client():
     return None

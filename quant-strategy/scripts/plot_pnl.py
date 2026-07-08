@@ -123,6 +123,8 @@ def plot_all(strategy_trades, output_file, strat_colors, artifact_dir):
     # Sort strategies by cum PNL
     strat_metrics = []
     for strat, trades in strategy_trades.items():
+        if strat not in STRAT_NAMES:
+            continue
         cum_pnl = sum([t["pnl"] * 100 for t in trades])
         strat_metrics.append({"strat": strat, "cum_pnl": cum_pnl, "total": len(trades), "trades": trades})
     strat_metrics.sort(key=lambda x: x["cum_pnl"], reverse=True)
@@ -133,7 +135,7 @@ def plot_all(strategy_trades, output_file, strat_colors, artifact_dir):
         cum_pnl_val = m["cum_pnl"]
         total = m["total"]
         name = STRAT_NAMES.get(strat, strat)
-        color = strat_colors[strat]
+        color = strat_colors.get(strat, '#999999')  # fallback for deprecated strategies
         
         ts = build_timeseries_pnl(trades)
         if not ts.empty:
@@ -176,8 +178,50 @@ def plot_all(strategy_trades, output_file, strat_colors, artifact_dir):
         artifact_path = os.path.join(artifact_dir, "pnl_chart_all.png")
         shutil.copy2(output_file, artifact_path)
 
+def plot_nav_all(nav_records, output_file, strat_colors, artifact_dir):
+    """
+    Plots the true Net Asset Value (NAV) curves from the database.
+    nav_records is a list of dicts: {"date": "...", "strategy_id": "...", "nav": ...}
+    """
+    if not nav_records:
+        return
+        
+    df = pd.DataFrame(nav_records)
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date')
+    
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    for strat, group in df.groupby('strategy_id'):
+        name = STRAT_NAMES.get(strat, strat)
+        color = strat_colors.get(strat, '#999999')
+        
+        # Calculate percentage return relative to initial capital (1,000,000)
+        group['nav_pct'] = (group['nav'] / 1000000.0 - 1) * 100
+        
+        ax.plot(group['date'], group['nav_pct'], color=color, linewidth=2, 
+                linestyle='-', marker='o' if len(group) <= 30 else None, markersize=4,
+                alpha=0.9, label=f"{name} ({group['nav_pct'].iloc[-1]:+.2f}%)")
+                
+    ax.axhline(0, color='gray', linestyle='dashed', linewidth=1)
+    ax.set_title('全球多策略沙盒 - 真实净值收益率走势 (True NAV Curve)', fontsize=16)
+    ax.set_xlabel('日期', fontsize=12)
+    ax.set_ylabel('净值收益率 (%)', fontsize=12)
+    ax.tick_params(axis='x', rotation=45)
+    ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1), borderaxespad=0.)
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=300, bbox_inches="tight")
+    plt.close()
+    
+    if os.path.exists(artifact_dir):
+        artifact_path = os.path.join(artifact_dir, "nav_chart_all.png")
+        shutil.copy2(output_file, artifact_path)
+
 def main():
-    flow_dir = os.environ.get("PROJECT_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from config import PROJECT_ROOT
+    flow_dir = PROJECT_ROOT
     reports_dir = os.path.join(flow_dir, "reports")
     os.makedirs(reports_dir, exist_ok=True)
     
@@ -224,6 +268,25 @@ def main():
             
     out_file_all = os.path.join(reports_dir, "pnl_chart_all.png")
     plot_all(strategy_trades, out_file_all, strat_colors, artifact_dir)
+    
+    # Also fetch and plot true NAV
+    import sqlite3
+    from core.cash_manager import get_db_path
+    conn = sqlite3.connect(get_db_path())
+    try:
+        c = conn.cursor()
+        c.execute("SELECT date, strategy_id, nav FROM strategy_nav_history")
+        nav_rows = c.fetchall()
+        if nav_rows:
+            nav_records = [{"date": r[0], "strategy_id": r[1], "nav": r[2]} for r in nav_rows]
+            out_nav_file = os.path.join(reports_dir, "nav_chart_all.png")
+            plot_nav_all(nav_records, out_nav_file, strat_colors, artifact_dir)
+            print("NAV chart generated.")
+    except Exception as e:
+        print(f"Failed to plot NAV chart: {e}")
+    finally:
+        conn.close()
+        
     print("All charts generated (Original Bright Theme with Dense Point Fix).")
 
 if __name__ == "__main__":

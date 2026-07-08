@@ -283,36 +283,14 @@ def main():
         print(f"Pre-scoring deduplication removed {len(articles) - len(unique_articles)} duplicates. {len(unique_articles)} articles remaining.", flush=True)
     articles = unique_articles
     
+    # Load incremental cache
+    cache_data = load_cache()
+    cache_updates = 0
+    
     if not os.getenv("GEMINI_API_KEY") and not os.getenv("DEEPSEEK_API_KEY") and not os.getenv("OPENAI_API_KEY"):
-        print("WARNING: OPENAI_API_KEY is not set. Using mock dual-track data.", flush=True)
-        from bs4 import BeautifulSoup
-        for i, article in enumerate(articles):
-            summary = article.get('summary', '')
-            clean_summary = BeautifulSoup(summary, "html.parser").get_text()[:200] + "..." if summary else "无摘要"
-            
-            # Mock distribution
-            if i % 3 == 0:
-                i_score, t_score = 9, 9
-            elif i % 3 == 1:
-                i_score, t_score = 9, 5
-            else:
-                i_score, t_score = 4, 9
-                
-            article['score_data'] = {
-                "innovation_score": i_score, 
-                "traffic_score": t_score,
-                "justification": "未配置 API Key，展示双轨制模拟打分。", 
-                "is_relevant": True, 
-                "translated_title": article['title'],
-                "translated_summary": clean_summary
-            }
-        scored_articles = articles
+        raise ValueError("CRITICAL ERROR: No LLM API Key is configured. Please configure GEMINI_API_KEY, DEEPSEEK_API_KEY, or OPENAI_API_KEY in .env.")
     else:
         scored_articles = []
-        
-        # Load incremental cache
-        cache_data = load_cache()
-        
         print(f"Loaded {len(cache_data)} articles from incremental cache.", flush=True)
         print("Scoring articles using Dual-Track LLM...", flush=True)
         
@@ -328,7 +306,12 @@ def main():
             
             if link in cache_data and 'score_data' in cache_data[link]:
                 sd = cache_data[link]['score_data']
-                print(f"[{idx+1}/{len(articles)}] (Cached) [I:{sd.get('innovation_score',0)} T:{sd.get('traffic_score',0)}] {article['title'][:30]}...", flush=True)
+                try:
+                    i_score = float(sd.get('innovation_score', 0))
+                    t_score = float(sd.get('traffic_score', 0))
+                except:
+                    i_score = t_score = 0
+                print(f"[{idx+1}/{len(articles)}] (Cached) [I:{i_score:.1f} T:{t_score:.1f}] {article['title'][:30]}...", flush=True)
                 article['score_data'] = sd
                 if 'deep_dive' in cache_data[link]:
                     article['deep_dive'] = cache_data[link]['deep_dive']
@@ -339,6 +322,33 @@ def main():
         print(f"Found {len(new_articles)} new articles to process.", flush=True)
         
         if new_articles:
+            # P3.21: 评分前去重 (Pre-deduplication before hitting LLM APIs)
+            import difflib
+            print("--- Phase 0: Local String Deduplication ---", flush=True)
+            local_dedup_groups = []
+            for a in new_articles:
+                long_text = a.get('content', a.get('summary', ''))
+                if long_text: long_text = long_text[:800]
+                text_to_match = (a.get('title', '') + " " + long_text).lower()
+                
+                found_group = False
+                for group in local_dedup_groups:
+                    rep = group[0]
+                    rep_text = rep.get('content', rep.get('summary', ''))
+                    if rep_text: rep_text = rep_text[:800]
+                    rep_match = (rep.get('title', '') + " " + rep_text).lower()
+                    
+                    if difflib.SequenceMatcher(None, text_to_match, rep_match).ratio() > 0.85:
+                        group.append(a)
+                        found_group = True
+                        break
+                if not found_group:
+                    local_dedup_groups.append([a])
+                    
+            deduped_new_articles = [g[0] for g in local_dedup_groups]
+            print(f"Reduced from {len(new_articles)} to {len(deduped_new_articles)} unique events.", flush=True)
+            new_articles = deduped_new_articles
+            
             print("--- Phase 1: Pre-filtering (Batches of 20) ---", flush=True)
             passed_pre_filter = []
             
@@ -415,7 +425,12 @@ def main():
                                     "translated_summary": r.get("translated_summary", "")
                                 }
                                 scored_articles.append(matched)
-                                print(f"  -> Scored [{matched['id']}] [I:{matched['score_data']['innovation_score']} T:{matched['score_data']['traffic_score']}] {matched['title'][:30]}", flush=True)
+                                try:
+                                    i_s = float(matched['score_data']['innovation_score'])
+                                    t_s = float(matched['score_data']['traffic_score'])
+                                except:
+                                    i_s = t_s = 0
+                                print(f"  -> Scored [{matched['id']}] [I:{i_s:.1f} T:{t_s:.1f}] {matched['title'][:30]}", flush=True)
                                 
                                 link = matched.get('link')
                                 if link not in cache_data: cache_data[link] = {}

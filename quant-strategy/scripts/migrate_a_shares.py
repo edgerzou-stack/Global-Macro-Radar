@@ -1,8 +1,9 @@
 import sqlite3
+import os
 import akshare as ak
 import time
 
-db_path = '/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/a_share_factor_flow/quant_system.db'
+db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "quant_system.db")
 conn = sqlite3.connect(db_path)
 cur = conn.cursor()
 

@@ -112,8 +112,8 @@ def render_history_md(strategy_id, trade_history, code_map=None):
     total_pnl_str = f"<span style='color:red'>+{total_pnl:.2f}%</span>" if total_pnl > 0 else f"<span style='color:green'>{total_pnl:.2f}%</span>"
     
     res = f"**历史总净收益：{total_pnl_str}** (共 {len(strat_trades)} 笔交易)\n\n"
-    res += "| 股票代码/简称 | 买入日期 | 买入价格 | 卖出日期 | 卖出价格 | 最终盈亏率 | 交割单备注 |\n"
-    res += "|---|---|---|---|---|---|---|\n"
+    res += "| 股票代码/简称 | 买入日期 | 均价 | 投入份数 | 卖出日期 | 卖出价格 | 最终盈亏率 | 交割单备注 |\n"
+    res += "|---|---|---|---|---|---|---|---|\n"
     for trade in reversed(strat_trades):
         code = trade.get("name", "")
         name = code_map.get(str(code), code)
@@ -127,6 +127,7 @@ def render_history_md(strategy_id, trade_history, code_map=None):
             
         in_d = trade.get("entry_date", "")
         in_p = trade.get("entry_price", 0)
+        shares = trade.get("shares", 1)
         out_d = trade.get("exit_date", "")
         out_p = trade.get("exit_price", 0)
         pnl = trade.get("pnl", 0) * 100
@@ -143,7 +144,7 @@ def render_history_md(strategy_id, trade_history, code_map=None):
         if reason is None or str(reason).strip() == "" or str(reason).strip().lower() == "none":
             reason = "-"
             
-        res += f"| {display_name} | {in_d} | {in_p_str} | {out_d} | {out_p_str} | {pnl_str} | {reason} |\n"
+        res += f"| {display_name} | {in_d} | {in_p_str} | {shares} | {out_d} | {out_p_str} | {pnl_str} | {reason} |\n"
     return res + "\n\n"
 
 def render_history_html(strategy_id, trade_history, code_map=None):
@@ -162,7 +163,7 @@ def render_history_html(strategy_id, trade_history, code_map=None):
     
     res = f"<p><strong>历史总净收益：{total_pnl_str}</strong> (共 {len(strat_trades)} 笔交易)</p>\n"
     res += "<table>\n  <thead>\n    <tr>\n"
-    for h in ["股票代码/简称", "买入日期", "买入价格", "卖出日期", "卖出价格", "最终盈亏率", "交割单备注"]:
+    for h in ["股票代码/简称", "买入日期", "均价", "投入份数", "卖出日期", "卖出价格", "最终盈亏率", "交割单备注"]:
         res += f"      <th class='nowrap'>{h}</th>\n"
     res += "    </tr>\n  </thead>\n  <tbody>\n"
     
@@ -179,6 +180,7 @@ def render_history_html(strategy_id, trade_history, code_map=None):
             
         in_d = trade.get("entry_date", "")
         in_p = trade.get("entry_price", 0)
+        shares = trade.get("shares", 1)
         out_d = trade.get("exit_date", "")
         out_p = trade.get("exit_price", 0)
         pnl = trade.get("pnl", 0) * 100
@@ -201,6 +203,7 @@ def render_history_html(strategy_id, trade_history, code_map=None):
         res += f"      <td class='nowrap' style='text-align:left'>{display_name}</td>\n"
         res += f"      <td class='nowrap'>{in_d}</td>\n"
         res += f"      <td class='nowrap'>{in_p_str}</td>\n"
+        res += f"      <td class='nowrap'>{shares}</td>\n"
         res += f"      <td class='nowrap'>{out_d}</td>\n"
         res += f"      <td class='nowrap'>{out_p_str}</td>\n"
         res += f"      <td class='nowrap'>{pnl_str}</td>\n"
@@ -209,18 +212,18 @@ def render_history_html(strategy_id, trade_history, code_map=None):
     res += "  </tbody>\n</table>\n"
     return res
 
-def get_chart_md(chart_name):
-    artifact_dir = os.getenv("ARTIFACT_DIR", "/Users/zouzhengting/.gemini/antigravity/brain/cb368359-75c4-4195-b42f-77230af3485d")
-    chart_path = os.path.join(artifact_dir, chart_name)
+def get_chart_md(chart_name, base_dir):
+    chart_path = os.path.join(base_dir, "reports", chart_name)
+    if not os.path.exists(chart_path):
+        chart_path = os.path.join(base_dir, chart_name)
     if os.path.exists(chart_path):
-        return f"![{chart_name}]({artifact_dir}/{chart_name})\n\n"
+        return f"![{chart_name}]({chart_path})\n\n"
     return ""
 
 def get_chart_html(chart_name, base_dir):
     chart_path = os.path.join(base_dir, "reports", chart_name)
     if not os.path.exists(chart_path):
-        artifact_dir = os.getenv("ARTIFACT_DIR", "/Users/zouzhengting/.gemini/antigravity/brain/cb368359-75c4-4195-b42f-77230af3485d")
-        chart_path = os.path.join(artifact_dir, chart_name)
+        chart_path = os.path.join(base_dir, chart_name)
         
     if os.path.exists(chart_path):
         with open(chart_path, "rb") as img:
@@ -228,24 +231,49 @@ def get_chart_html(chart_name, base_dir):
             return f"<div class='chart-container'><img src='data:image/png;base64,{b64}' alt='{chart_name}'></div>\n"
     return ""
 
-def generate_llm_review(strategy_id, results):
-    if not results or not call_llm:
-        return ""
+def generate_batch_llm_reviews(strategies_dict):
+    if not strategies_dict or not call_llm:
+        return {}
         
-    prompt = f"""作为资深量化基金经理，以下是量化模型今日选出的 Top 10 股票及其核心指标：
-{json.dumps(results, ensure_ascii=False)}
-请你结合这些公司的基本面常识和行业地位，给出一个简短的质性评价。请以 JSON 格式返回，结构如下：
+    # Slim down payload to save tokens
+    slim_payload = {}
+    for strat, items in strategies_dict.items():
+        if not items: continue
+        slim_items = []
+        for item in items[:10]: # Only top 10
+            slim_items.append({
+                "代码": item.get("股票代码", ""),
+                "简称": item.get("股票简称", ""),
+                "行业": item.get("所属行业", ""),
+                "市值": item.get("总市值", item.get("总市值(元)", "")),
+                "PE": item.get("PE", item.get("市盈率(TTM)", "")),
+                "最新价": item.get("最新价", "")
+            })
+        if slim_items:
+            slim_payload[strat] = slim_items
+            
+    if not slim_payload:
+        return {}
+        
+    prompt = f"""作为资深量化基金经理，以下是各大子策略今日选出的 Top 10 股票核心指标：
+{json.dumps(slim_payload, ensure_ascii=False)}
+
+请结合基本面常识，为每个策略分别给出质性评价。请严格以 JSON 格式返回，结构如下：
 {{
-  "reviews": [
-    {{
-      "股票代码": "代码",
-      "股票简称": "简称",
-      "护城河打分": 3.5,
-      "成长性打分": 4.2,
-      "一句话点评": "点评内容"
+  "strategy_reviews": {{
+    "strategy_name": {{
+      "reviews": [
+        {{
+          "股票代码": "代码",
+          "股票简称": "简称",
+          "护城河打分": 3.5,
+          "成长性打分": 4.2,
+          "一句话点评": "极短点评内容"
+        }}
+      ],
+      "summary": "该策略总结"
     }}
-  ],
-  "summary": "总结一小段总评"
+  }}
 }}
 """
     
@@ -254,38 +282,38 @@ def generate_llm_review(strategy_id, results):
     base_delay = 5
     
     for attempt in range(max_retries):
-        print(f"Generating LLM review for {strategy_id} (Attempt {attempt+1}/{max_retries})...", flush=True)
+        print(f"Generating LLM batch reviews (Attempt {attempt+1}/{max_retries})...", flush=True)
         try:
             res = call_llm(prompt, require_json=True)
-            if res and isinstance(res, dict) and "reviews" in res:
-                reviews = res["reviews"]
-                # Sort by (护城河打分 + 成长性打分) descending
-                for r in reviews:
-                    r["合计分"] = float(r.get("护城河打分", 0)) + float(r.get("成长性打分", 0))
-                reviews.sort(key=lambda x: x["合计分"], reverse=True)
-                
-                html = "<div class='llm-review'>\n<h3>🤖 AI 质性点评与打分</h3>\n"
-                html += "<table>\n  <thead>\n    <tr>\n      <th>股票代码</th><th>股票简称</th><th>护城河打分(1-5)</th><th>成长性打分(1-5)</th><th>合计分(满分10)</th><th>一句话点评</th>\n    </tr>\n  </thead>\n  <tbody>\n"
-                for r in reviews:
-                    html += f"    <tr>\n      <td>{r.get('股票代码','')}</td><td>{r.get('股票简称','')}</td><td>{r.get('护城河打分','')}</td><td>{r.get('成长性打分','')}</td><td>{r['合计分']:.1f}</td><td>{r.get('一句话点评','')}</td>\n    </tr>\n"
-                html += "  </tbody>\n</table>\n"
-                if res.get("summary"):
-                    html += f"<p><strong>总评：</strong>{res['summary']}</p>\n"
-                html += "</div>\n"
-                return html
+            if res and isinstance(res, dict) and "strategy_reviews" in res:
+                html_outputs = {}
+                for strat, strat_data in res["strategy_reviews"].items():
+                    reviews = strat_data.get("reviews", [])
+                    for r in reviews:
+                        r["合计分"] = float(r.get("护城河打分", 0)) + float(r.get("成长性打分", 0))
+                    reviews.sort(key=lambda x: x.get("合计分", 0), reverse=True)
+                    
+                    html = "<div class='llm-review'>\n<h3>🤖 AI 质性点评与打分</h3>\n"
+                    html += "<table>\n  <thead>\n    <tr>\n      <th>股票代码</th><th>股票简称</th><th>护城河打分(1-5)</th><th>成长性打分(1-5)</th><th>合计分(满分10)</th><th>一句话点评</th>\n    </tr>\n  </thead>\n  <tbody>\n"
+                    for r in reviews:
+                        html += f"    <tr>\n      <td>{r.get('股票代码','')}</td><td>{r.get('股票简称','')}</td><td>{r.get('护城河打分','')}</td><td>{r.get('成长性打分','')}</td><td>{r.get('合计分',0):.1f}</td><td>{r.get('一句话点评','')}</td>\n    </tr>\n"
+                    html += "  </tbody>\n</table>\n"
+                    if strat_data.get("summary"):
+                        html += f"<p><strong>总评：</strong>{strat_data['summary']}</p>\n"
+                    html += "</div>\n"
+                    html_outputs[strat] = html
+                return html_outputs
             else:
-                print(f"LLM returned invalid json for {strategy_id}: {res}")
+                print(f"LLM returned invalid json for batch: {res}")
         except Exception as e:
-            print(f"Failed to generate LLM review for {strategy_id}: {e}")
+            print(f"Failed to generate LLM batch reviews: {e}")
             
         if attempt < max_retries - 1:
-            sleep_time = base_delay * (2 ** attempt)
-            print(f"Rate limited or failed. Retrying {strategy_id} in {sleep_time}s...")
-            time.sleep(sleep_time)
+            time.sleep(base_delay * (2 ** attempt))
             
-    return ""
+    return {}
 
-def generate_subsection_md(strategy_id, results, headers, diff, trade_history, llm_review="", code_map=None):
+def generate_subsection_md(strategy_id, results, headers, diff, trade_history, base_dir, llm_review="", code_map=None):
     strat_trades = [t for t in trade_history if t.get("strategy") == strategy_id]
     title = STRAT_NAMES.get(strategy_id, strategy_id)
     if not results and not strat_trades:
@@ -347,7 +375,7 @@ def generate_subsection_md(strategy_id, results, headers, diff, trade_history, l
         out += "**历史平仓交割单明细**\n\n"
         out += render_history_md(strategy_id, trade_history, code_map)
         out += "**资金净值曲线图**\n\n"
-        out += get_chart_md(f"pnl_chart_{strategy_id}.png")
+        out += get_chart_md(f"pnl_chart_{strategy_id}.png", base_dir)
     return out
 
 def generate_subsection_html(strategy_id, results, headers, diff, trade_history, base_dir, llm_review="", code_map=None):
@@ -429,9 +457,9 @@ def main():
     import db_utils
     
     _, trade_history = db_utils.load_portfolio_and_trades()
-    payload = db_utils.load_meta_data("daily_results")
+    payload = db_utils.load_latest_daily_results()
     if not payload:
-        print("No daily_results found in database")
+        print("No daily_results found in strategy_daily_results table")
         sys.exit(1)
         
     results = payload.get("results", {})
@@ -447,12 +475,11 @@ def main():
         elif "hot_spot" in strat:
             pass # Keep original sorting which is by turnover
 
-    div_headers = ["股票代码", "股票简称", "PE", "PB", "估值公式值", "TTM股息率", "3年净利润CAGR", "入选日期", "入选价格", "累计涨跌幅"]
-    gro_headers = ["股票代码", "股票简称", "PE", "净资产收益率", "营业总收入同比增长率", "净利润同比增长率", "入选日期", "入选价格", "累计涨跌幅"]
-    hot_headers = ["股票代码", "股票简称", "最新价", "涨跌幅(%)", "成交额(亿)", "入选日期", "入选价格", "累计涨跌幅", "入选理由"]
+    div_headers = ["股票代码", "股票简称", "PE", "PB", "估值公式值", "TTM股息率", "3年净利润CAGR", "入选日期", "入选价格", "仓位份数", "累计涨跌幅"]
+    gro_headers = ["股票代码", "股票简称", "PE", "净资产收益率", "营业总收入同比增长率", "净利润同比增长率", "入选日期", "入选价格", "仓位份数", "累计涨跌幅"]
+    hot_headers = ["股票代码", "股票简称", "最新价", "涨跌幅(%)", "成交额(亿)", "入选日期", "入选价格", "仓位份数", "累计涨跌幅", "入选理由"]
 
-    # Pre-generate LLM reviews concurrently for all strategies
-    import concurrent.futures
+    # Pre-generate LLM batch review for all strategies at once to save tokens and threads
     llm_reviews = {}
     if call_llm:
         strategies_to_review = [
@@ -460,17 +487,13 @@ def main():
             "hot_spot_a_stock", "hot_spot_us_stock", "hot_spot_hk_stock"
         ]
         
-        def fetch_review(strat):
-            res = results.get(strat, [])
-            if res:
-                return strat, generate_llm_review(strat, res)
-            return strat, ""
-            
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            future_to_strat = {executor.submit(fetch_review, strat): strat for strat in strategies_to_review}
-            for future in concurrent.futures.as_completed(future_to_strat):
-                strat, review = future.result()
-                llm_reviews[strat] = review
+        batch_input = {}
+        for strat in strategies_to_review:
+            if results.get(strat):
+                batch_input[strat] = results[strat]
+                
+        if batch_input:
+            llm_reviews = generate_batch_llm_reviews(batch_input)
                 
     code_map = {}
     for strat, items in results.items():
@@ -488,25 +511,74 @@ def main():
     except Exception as e:
         print(f"Warning: Could not load A-share code map: {e}")
 
+    def get_cash_overview_md():
+        try:
+            import sqlite3
+            from core.cash_manager import get_db_path
+            conn = sqlite3.connect(get_db_path())
+            c = conn.cursor()
+            c.execute("SELECT strategy_id, total_capital, available_cash FROM strategy_accounts ORDER BY strategy_id")
+            rows = c.fetchall()
+            conn.close()
+            if not rows: return ""
+            
+            md = "## 🏦 全球多策略子基金台账概览 (Sandbox Benchmark Engine)\n\n"
+            md += "| 策略沙盒 (Strategy) | 当前总净值 (NAV) | 当前可用现金 (Cash) | 资金利用率 |\n"
+            md += "| --- | --- | --- | --- |\n"
+            for row in rows:
+                sid, cap, cash = row
+                util = ((cap - cash) / cap) * 100 if cap > 0 else 0
+                md += f"| `{sid}` | ¥{cap:,.2f} | ¥{cash:,.2f} | {util:.1f}% |\n"
+            md += "\n---\n\n"
+            return md
+        except Exception as e:
+            return f"<!-- Failed to load cash overview: {e} -->\n"
+
+    def get_cash_overview_html():
+        try:
+            import sqlite3
+            from core.cash_manager import get_db_path
+            conn = sqlite3.connect(get_db_path())
+            c = conn.cursor()
+            c.execute("SELECT strategy_id, total_capital, available_cash FROM strategy_accounts ORDER BY strategy_id")
+            rows = c.fetchall()
+            conn.close()
+            if not rows: return ""
+            
+            html = "<h2>🏦 全球多策略子基金台账概览 (Sandbox Benchmark Engine)</h2>\n"
+            html += "<table>\n<thead><tr><th>策略沙盒 (Strategy)</th><th>当前总净值 (NAV)</th><th>当前可用现金 (Cash)</th><th>资金利用率</th></tr></thead>\n<tbody>\n"
+            for row in rows:
+                sid, cap, cash = row
+                util = ((cap - cash) / cap) * 100 if cap > 0 else 0
+                html += f"<tr><td><code>{sid}</code></td><td>¥{cap:,.2f}</td><td>¥{cash:,.2f}</td><td>{util:.1f}%</td></tr>\n"
+            html += "</tbody></table>\n<hr>\n"
+            return html
+        except Exception as e:
+            return ""
+
     # ================= MARKDOWN GENERATION =================
     out = f"# 每日全球策略量化报告\n\n"
+    out += get_cash_overview_md()
 
     out += "## 🟢 第一章：稳健红利策略 (基本面护城河)\n\n"
-    out += generate_subsection_md("dividend_a_stock", results.get("dividend_a_stock", []), div_headers, diff, trade_history, llm_reviews.get("dividend_a_stock", ""), code_map)
+    out += generate_subsection_md("dividend_a_stock", results.get("dividend_a_stock", []), div_headers, diff, trade_history, base_dir, llm_reviews.get("dividend_a_stock", ""), code_map)
 
     out += "---\n\n## 🔵 第二章：高增成长策略 (基本面护城河)\n\n"
-    out += generate_subsection_md("growth_a_stock", results.get("growth_a_stock", []), gro_headers, diff, trade_history, llm_reviews.get("growth_a_stock", ""), code_map)
-    out += generate_subsection_md("growth_us_stock", results.get("growth_us_stock", []), gro_headers, diff, trade_history, llm_reviews.get("growth_us_stock", ""), code_map)
-    out += generate_subsection_md("growth_hk_stock", results.get("growth_hk_stock", []), gro_headers, diff, trade_history, llm_reviews.get("growth_hk_stock", ""), code_map)
+    out += generate_subsection_md("growth_a_stock", results.get("growth_a_stock", []), gro_headers, diff, trade_history, base_dir, llm_reviews.get("growth_a_stock", ""), code_map)
+    out += generate_subsection_md("growth_us_stock", results.get("growth_us_stock", []), gro_headers, diff, trade_history, base_dir, llm_reviews.get("growth_us_stock", ""), code_map)
+    out += generate_subsection_md("growth_hk_stock", results.get("growth_hk_stock", []), gro_headers, diff, trade_history, base_dir, llm_reviews.get("growth_hk_stock", ""), code_map)
 
     out += "---\n\n## 🔴 第三章：产业热点战法 (AI 宏观洞察与事件驱动)\n\n"
-    out += generate_subsection_md("hot_spot_a_stock", results.get("hot_spot_a_stock", []), hot_headers, diff, trade_history, llm_reviews.get("hot_spot_a_stock", ""), code_map)
-    out += generate_subsection_md("hot_spot_us_stock", results.get("hot_spot_us_stock", []), hot_headers, diff, trade_history, llm_reviews.get("hot_spot_us_stock", ""), code_map)
-    out += generate_subsection_md("hot_spot_hk_stock", results.get("hot_spot_hk_stock", []), hot_headers, diff, trade_history, llm_reviews.get("hot_spot_hk_stock", ""), code_map)
+    out += generate_subsection_md("hot_spot_a_stock", results.get("hot_spot_a_stock", []), hot_headers, diff, trade_history, base_dir, llm_reviews.get("hot_spot_a_stock", ""), code_map)
+    out += generate_subsection_md("hot_spot_us_stock", results.get("hot_spot_us_stock", []), hot_headers, diff, trade_history, base_dir, llm_reviews.get("hot_spot_us_stock", ""), code_map)
+    out += generate_subsection_md("hot_spot_hk_stock", results.get("hot_spot_hk_stock", []), hot_headers, diff, trade_history, base_dir, llm_reviews.get("hot_spot_hk_stock", ""), code_map)
 
     out += "---\n\n## 🌟 四、全策略综合对比总结 (Master Chart)\n\n"
-    out += get_chart_md("pnl_chart_all.png")
+    if os.path.exists(os.path.join(base_dir, "nav_chart_all.png")):
+        out += get_chart_md("nav_chart_all.png", base_dir)
+    out += get_chart_md("pnl_chart_all.png", base_dir)
         
+    os.makedirs(os.path.dirname(output_md_file), exist_ok=True)
     with open(output_md_file, "w", encoding="utf-8") as f:
         f.write(out)
         
@@ -518,18 +590,18 @@ def main():
     <title>每日全球策略量化报告</title>
     <style>
         :root { --bg: #f9fafb; --card: #ffffff; --text: #1f2937; --border: #e5e7eb; --red: #dc2626; --green: #16a34a; }
-        body { font-family: -apple-system, sans-serif; background: var(--bg); color: var(--text); padding: 20px; }
-        .container { max-width: 1200px; margin: 0 auto; background: var(--card); padding: 40px; border-radius: 12px; }
+        body { font-family: -apple-system, sans-serif; background: var(--bg); color: var(--text); padding: 10px; }
+        .container { max-width: 98%; margin: 0 auto; background: var(--card); padding: 20px; border-radius: 12px; }
         h1 { text-align: center; color: #4f46e5; }
         h2 { border-bottom: 2px solid var(--border); padding-bottom: 10px; margin-top: 40px; }
         h3 { color: #4b5563; border-left: 4px solid #4f46e5; padding-left: 10px; }
         h4 { margin-top: 20px; }
-        table { width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 14px; }
-        th, td { padding: 10px; text-align: right; border-bottom: 1px solid var(--border); white-space: nowrap; }
-        td:last-child, th:last-child { white-space: normal; min-width: 300px; }
+        table { width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 13px; }
+        th, td { padding: 8px 10px; text-align: right; border-bottom: 1px solid var(--border); white-space: nowrap; }
+        td:last-child, th:last-child { white-space: normal; min-width: 150px; max-width: 400px; }
         .nowrap { white-space: nowrap; }
         th { background: #f3f4f6; position: sticky; top: 0; }
-        th:first-child, td:first-child { text-align: left; }
+        th:nth-child(1), td:nth-child(1), th:nth-child(2), td:nth-child(2) { text-align: left; }
         .win { color: var(--red); font-weight: bold; }
         .loss { color: var(--green); font-weight: bold; }
         .alert { background: #eff6ff; border-left: 4px solid #4f46e5; padding: 15px; margin: 20px 0; }
@@ -541,6 +613,8 @@ def main():
     <div class="container">
         <h1>每日全球策略量化报告</h1>
 """
+    
+    html += get_cash_overview_html()
     
     html += "<h2>🟢 第一章：稳健红利策略 (基本面护城河)</h2>\n"
     html += generate_subsection_html("dividend_a_stock", results.get("dividend_a_stock", []), div_headers, diff, trade_history, base_dir, llm_reviews.get("dividend_a_stock", ""), code_map)
@@ -556,6 +630,8 @@ def main():
     html += generate_subsection_html("hot_spot_hk_stock", results.get("hot_spot_hk_stock", []), hot_headers, diff, trade_history, base_dir, llm_reviews.get("hot_spot_hk_stock", ""), code_map)
 
     html += "<h2>🌟 四、全策略综合对比总结 (Master Chart)</h2>\n"
+    if os.path.exists(os.path.join(base_dir, "nav_chart_all.png")):
+        html += get_chart_html("nav_chart_all.png", base_dir)
     html += get_chart_html("pnl_chart_all.png", base_dir)
                 
     html += "    </div>\n</body>\n</html>\n"

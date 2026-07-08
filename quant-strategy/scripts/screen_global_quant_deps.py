@@ -13,7 +13,8 @@ STRATEGIES = [
 ]
 
 def load_universes():
-    project_root = os.environ.get("PROJECT_ROOT", "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/a_share_factor_flow")
+    from config import PROJECT_ROOT
+    project_root = PROJECT_ROOT
     uni_path = os.path.join(project_root, "universes.json")
     try:
         with open(uni_path, "r") as f:
@@ -28,7 +29,8 @@ def load_universes():
 
 def load_hot_spot_today():
     try:
-        project_root = os.environ.get("PROJECT_ROOT", "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/a_share_factor_flow")
+        from config import PROJECT_ROOT
+        project_root = PROJECT_ROOT
         with open(os.path.join(project_root, "hot_spot_today.json"), "r") as f:
             return json.load(f)
     except:
@@ -83,6 +85,6 @@ def get_current_prices_for_portfolio(all_portfolio, a_prices):
                         k = yf_to_k_map.get(sym, sym)
                         current_prices[k] = {"最新价": last_closes}
         except Exception as e:
-            print(f"Failed to fetch YF prices: {e}")
+            raise ConnectionError(f"CRITICAL: Failed to fetch YF spot prices: {e}. Aborting pipeline.")
             
     return current_prices

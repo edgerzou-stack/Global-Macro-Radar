@@ -28,8 +28,8 @@ def get_latest_radar_report():
 
 def main():
     radar_report = get_latest_radar_report()
-    default_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    quant_html = os.path.join(os.environ.get("PROJECT_ROOT", default_project_root), "reports", "screening_results.html")
+    from config import PROJECT_ROOT
+    quant_html = os.path.join(PROJECT_ROOT, "reports", "screening_results.html")
     
     import yaml
     default_radar_config = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "industry-radar", "config.yaml")

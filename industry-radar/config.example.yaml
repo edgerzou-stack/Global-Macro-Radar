@@ -44,7 +44,6 @@ rss_feeds:
   - "https://www.wired.com/feed/rss" # Wired 连线杂志
   - "https://www.theverge.com/rss/index.xml" # The Verge (前沿科技与消费电子)
   - "https://www.tomshardware.com/feeds/all" # Tom's Hardware (硬核半导体与硬件)
-  - "https://www.artificialintelligence-news.com/feed/" # AI News (纯AI产业新闻)
   - "https://feed.infoq.com/" # InfoQ (硬核软件开发与架构)
   - "https://siliconangle.com/feed/" # SiliconANGLE (硬核企业级科技/云/芯片)
   - "https://feeds.arstechnica.com/arstechnica/technology-lab" # Ars Technica
@@ -64,7 +63,6 @@ rss_feeds:
   # 中国本土顶级科技商业与AI媒体
   - "https://36kr.com/feed" # 36氪
   - "https://www.huxiu.com/rss/0.xml" # 虎嗅
-  - "https://www.geekpark.net/rss" # 极客公园
   - "https://www.jiqizhixin.com/rss" # 机器之心 (中国最硬核的AI媒体)
   - "https://www.ifanr.com/feed" # 爱范儿 (科技与生活方式)
 

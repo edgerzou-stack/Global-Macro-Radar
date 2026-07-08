@@ -15,7 +15,8 @@ def _load_env(path):
                     os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
     except FileNotFoundError:
         pass
-_load_env(os.environ.get("RADAR_ENV", "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/industry-radar_archived/.env"))
+    env_path = os.environ.get("RADAR_ENV", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "industry-radar", ".env"))
+    _load_env(env_path)
 import yfinance as yf
 from datetime import datetime
 
@@ -24,7 +25,7 @@ from data_provider import fetch_quote_snapshot_cached
 from llm_utils import call_llm
 
 def get_latest_radar_report():
-    radar_reports_dir = os.environ.get("RADAR_REPORTS_DIR", "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/industry-radar_archived/reports")
+    radar_reports_dir = os.environ.get("RADAR_REPORTS_DIR", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "industry-radar", "reports"))
     if not os.path.exists(radar_reports_dir):
         return None
         
@@ -72,20 +73,17 @@ def get_hot_stocks_from_llm(news_list, previous_holdings=None):
     if previous_holdings:
         prompt += f"【注意】：以下是昨日该策略的当前持仓标的：{json.dumps(previous_holdings, ensure_ascii=False)}\n如果这些持仓标的【依然符合今天的新闻热点】，请优先在输出中保留它们以降低换手率。但如果它们已经【完全脱离了当前的热点主线】，请毫不犹豫地将它们剔除！不要为了保留而保留！\n"
     prompt += (
-        "你拥有全球视野，请分别在A股、美股、港股三个市场中，发散挑选出与该热点强相关的核心概念股或行业ETF。\n" +
+        "你拥有全球视野，请分别在A股、美股、港股三个市场中，发散挑选出与该热点强相关的核心概念股。\n" +
         "【极其重要的纪律】：\n" +
-        "1. 针对每个热点，你可以在 A股、美股、港股 分别推荐最强相关的标的。注意：每个市场的个股推荐数量不能超过 20 只，每个市场的 ETF 推荐数量也不能超过 20 只（各个市场和品种的上限是完全独立的，不需要合并计算）。\n" +
+        "1. 针对每个热点，你可以在 A股、美股、港股 分别推荐最强相关的个股标的。注意：每个市场的个股推荐数量不能超过 20 只。\n" +
         "2. 极其重要：如果入选的公司所处行业相同（判断标准：两家公司的核心产品线或主要利润来源高度重合），请务必只选出一只最强龙头！同一个细分行业绝对不要重复推荐多家公司！\n" +
         "3. 宁缺毋滥！如果没有强关联度、或者该市场没有相关产业链，该数组必须为空 []！不要硬凑！\n" +
-        "4. 产业链纵深发散：当新闻热点涉及某项核心硬件（如AI芯片）时，请务必展现专业投资人的推演能力，自动向高度绑定的上下游（如存储/DRAM/HBM、先进封装、核心算力调度等）发散，并寻找对应的细分行业 ETF或个股，不要死板局限于新闻字面！\n" +
-        "5. 必须输出标准 JSON 格式，包含以下6个数组，结构如下：\n" +
+        "4. 产业链纵深发散：当新闻热点涉及某项核心硬件（如AI芯片）时，请务必展现专业投资人的推演能力，自动向高度绑定的上下游（如存储/DRAM/HBM、先进封装、核心算力调度等）发散，并寻找对应的细分行业个股，不要死板局限于新闻字面！\n" +
+        "5. 必须输出标准 JSON 格式，包含以下3个数组，结构如下：\n" +
         "{\n" +
         "  \"A_Stock\": [{\"code\": \"600519\", \"reason\": \"与某热点强相关，预计带来业绩反转\"}],  // code为6位纯数字\n" +
-        "  \"A_ETF\": [{\"code\": \"512480\", \"reason\": \"xxx\"}],    // code为6位纯数字\n" +
         "  \"US_Stock\": [{\"code\": \"AAPL\", \"reason\": \"xxx\"}],   // code为标准美股Ticker\n" +
-        "  \"US_ETF\": [{\"code\": \"SOXX\", \"reason\": \"xxx\"}],     // code为标准美股Ticker\n" +
-        "  \"HK_Stock\": [{\"code\": \"0700.HK\", \"reason\": \"xxx\"}], // 港股请加上 .HK 后缀\n" +
-        "  \"HK_ETF\": [{\"code\": \"2800.HK\", \"reason\": \"xxx\"}]    // 港股请加上 .HK 后缀\n" +
+        "  \"HK_Stock\": [{\"code\": \"0700.HK\", \"reason\": \"xxx\"}] // 港股请加上 .HK 后缀\n" +
         "}\n" +
         "【特别要求】：reason 字段必须用一句话简明扼要地说明为什么选它（结合输入的热点新闻）。除了JSON数据外，不要输出任何其他文本或解释理由。"
     )
@@ -95,11 +93,8 @@ def get_hot_stocks_from_llm(news_list, previous_holdings=None):
     # Filter formats
     out = {
         "A_Stock": [{"code": str(c.get("code", "")), "reason": c.get("reason", "")} for c in res.get("A_Stock", []) if isinstance(c, dict) and re.match(r'^(60\d{4}|00\d{4}|30\d{4}|688\d{3}|689\d{3})$', str(c.get("code", "")))] [:20],
-        "A_ETF": [{"code": str(c.get("code", "")), "reason": c.get("reason", "")} for c in res.get("A_ETF", []) if isinstance(c, dict) and re.match(r'^(51\d{4}|15\d{4})$', str(c.get("code", "")))] [:20],
         "US_Stock": [{"code": str(c.get("code", "")).upper(), "reason": c.get("reason", "")} for c in res.get("US_Stock", []) if isinstance(c, dict)] [:20],
-        "US_ETF": [{"code": str(c.get("code", "")).upper(), "reason": c.get("reason", "")} for c in res.get("US_ETF", []) if isinstance(c, dict)] [:20],
-        "HK_Stock": [{"code": _normalize_hk(str(c.get("code", ""))), "reason": c.get("reason", "")} for c in res.get("HK_Stock", []) if isinstance(c, dict) and str(c.get("code", "")).upper().endswith(".HK")] [:20],
-        "HK_ETF": [{"code": _normalize_hk(str(c.get("code", ""))), "reason": c.get("reason", "")} for c in res.get("HK_ETF", []) if isinstance(c, dict) and str(c.get("code", "")).upper().endswith(".HK")] [:20]
+        "HK_Stock": [{"code": _normalize_hk(str(c.get("code", ""))), "reason": c.get("reason", "")} for c in res.get("HK_Stock", []) if isinstance(c, dict) and str(c.get("code", "")).upper().endswith(".HK")] [:20]
     }
     return out
 
@@ -236,13 +231,14 @@ def main():
     
     # Extract previous holdings to anchor the LLM
     previous_holdings = {}
-    global_screen_path = os.path.join(os.environ.get("PROJECT_ROOT", "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/a_share_factor_flow"), "global_screen.json")
+    from config import PROJECT_ROOT
+    global_screen_path = os.path.join(PROJECT_ROOT, "global_screen.json")
     if os.path.exists(global_screen_path):
         try:
             with open(global_screen_path, "r", encoding="utf-8") as f:
                 gd = json.load(f)
             port = gd.get("portfolio", {})
-            for k in ["hot_spot_a_stock", "hot_spot_a_etf", "hot_spot_us_stock", "hot_spot_us_etf", "hot_spot_hk_stock", "hot_spot_hk_etf"]:
+            for k in ["hot_spot_a_stock", "hot_spot_us_stock", "hot_spot_hk_stock"]:
                 if k in port and port[k]:
                     previous_holdings[k] = list(port[k].keys())
         except Exception:
@@ -255,13 +251,10 @@ def main():
     
     # Process A shares
     final_output["hot_spot_a_stock"] = filter_a_share(llm_pools.get("A_Stock", []))
-    final_output["hot_spot_a_etf"] = filter_a_share(llm_pools.get("A_ETF", []))
     
     # Process Global shares
     final_output["hot_spot_us_stock"] = filter_global(llm_pools.get("US_Stock", []))
-    final_output["hot_spot_us_etf"] = filter_global(llm_pools.get("US_ETF", []))
     final_output["hot_spot_hk_stock"] = filter_global(llm_pools.get("HK_Stock", []))
-    final_output["hot_spot_hk_etf"] = filter_global(llm_pools.get("HK_ETF", []))
     
     def rank_top_10_via_llm(category_name, candidates, hot_news, previous_holdings):
         if len(candidates) <= 10:
@@ -311,10 +304,11 @@ def main():
                     print(f"All {max_retries} attempts failed. Throwing error.")
                     raise RuntimeError(f"Failed to rank {category_name} via LLM after {max_retries} attempts.") from e
             
-    for k in ["hot_spot_a_stock", "hot_spot_a_etf", "hot_spot_us_stock", "hot_spot_us_etf", "hot_spot_hk_stock", "hot_spot_hk_etf"]:
-        final_output[k] = rank_top_10_via_llm(k, final_output[k], hot_news, previous_holdings)
+    for k in ["hot_spot_a_stock", "hot_spot_us_stock", "hot_spot_hk_stock"]:
+        final_output[k] = rank_top_10_via_llm(k, final_output.get(k, []), hot_news, previous_holdings)
         
-    output_path = os.path.join(os.environ.get("PROJECT_ROOT", "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/a_share_factor_flow"), "hot_spot_today.json")
+    from config import PROJECT_ROOT
+    output_path = os.path.join(PROJECT_ROOT, "hot_spot_today.json")
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(final_output, f, ensure_ascii=False, indent=2)
         

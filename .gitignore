@@ -5,3 +5,11 @@ quant-strategy/logs/
 quant-strategy/reports/
 industry-radar/reports/
 industry-radar/heuristics.yaml
+*.db-shm
+*.db-wal
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+

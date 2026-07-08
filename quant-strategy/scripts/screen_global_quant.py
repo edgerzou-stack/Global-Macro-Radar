@@ -95,23 +95,32 @@ def process_a_share_data(args, a_tickers, as_of_date):
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Global Macro Quant Screener V2")
     parser.add_argument("--report-date", type=str)
     parser.add_argument("--valuation-formula-max", type=float, default=10.0)
     parser.add_argument("--dividend-yield-min", type=float, default=3.0)
     parser.add_argument("--market-cap-min-yi", type=float, default=100.0)
     parser.add_argument("--avg-net-profit-margin-min", type=float, default=10.0)
-    parser.add_argument("--require-continuous-growth", action="store_true", default=True)
+    parser.add_argument("--require-continuous-growth", action="store_true", help="Require multiple periods of YoY growth")
+    parser.add_argument("--peg-max", type=float, default=1.0)
     parser.add_argument("--profit-cagr-min", type=float, default=5.0)
     parser.add_argument("--debt-ratio-max", type=float, default=50.0)
     parser.add_argument("--dividend-roe-min", type=float, default=10.0)
     parser.add_argument("--growth-roe-min", type=float, default=10.0)
     parser.add_argument("--growth-yoy-min", type=float, default=30.0)
     parser.add_argument("--max-stocks", type=int, default=10)
-    parser.add_argument("--output-file", type=str, default=os.path.join(os.environ.get("PROJECT_ROOT", "/Users/zouzhengting/Workplace/Global-Macro-Radar-Core/a_share_factor_flow"), "global_screen.json"))
+    from config import PROJECT_ROOT
+    parser.add_argument("--output-file", type=str, default=os.path.join(PROJECT_ROOT, "global_screen.json"))
     
     args = parser.parse_args()
     from core.clock import clock
+    from core.logger import get_quant_logger
+    
+    logger = get_quant_logger("screen_global_quant")
+    logger.info("="*50)
+    logger.info("Starting Global Quant Screening V2 (OOP Engine)")
+    logger.info("="*50)
+    
     snapshot_date = clock.now().strftime("%Y-%m-%d")
     as_of_date = clock.today()
     
@@ -273,9 +282,11 @@ Please return the selected top candidates (maximum 10) as a JSON array of their 
             key = get_key(row, strat)
             ep = portfolio[strat].get(key, {}).get("entry_price", 0.0)
             ed = portfolio[strat].get(key, {}).get("entry_date", snapshot_date)
+            shares = portfolio[strat].get(key, {}).get("shares", 1)
             cp = row.get("最新价", 0.0)
             if cp is None: cp = 0.0
             row["入选价格"] = float(ep)
+            row["仓位份数"] = shares
             row["累计涨跌幅"] = f"{(cp / ep - 1) * 100:.2f}%" if ep > 0 else "0.00%"
             row["入选日期"] = ed
 
@@ -305,7 +316,7 @@ Please return the selected top candidates (maximum 10) as a JSON array of their 
     except Exception as e:
         print(f"Warning: Failed to save to strategy_daily_results table: {e}")
         
-    db_utils.save_meta_data("daily_results", payload)
+    # DB save has been fully migrated to strategy_daily_results table
     
     # Save to JSON for UI / email generation backward compatibility
     payload["portfolio"] = portfolio

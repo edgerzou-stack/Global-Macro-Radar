@@ -5,3 +5,4 @@ google-genai
 pyyaml
 python-dotenv
 openai
+pandas_market_calendars<4.0.0

@@ -3,9 +3,8 @@ import json
 import os
 
 def get_db_path():
-    # P2.13 优化：去除写死的全量绝对路径，改用基于当前文件的相对根目录计算
-    default_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    default_db = os.path.join(os.environ.get("PROJECT_ROOT", default_root), "quant_system.db")
+    # Use path relative to __file__ to always point to quant-strategy/quant_system.db
+    default_db = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "quant_system.db")
     return os.environ.get("SQLITE_DB_PATH", default_db)
 
 def init_db():
@@ -63,6 +62,23 @@ def init_db():
             result_json TEXT
         )
     ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS strategy_accounts (
+            strategy_id TEXT PRIMARY KEY,
+            total_capital REAL,
+            available_cash REAL
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS strategy_nav_history (
+            date TEXT,
+            strategy_id TEXT,
+            nav REAL,
+            cash REAL,
+            holdings_value REAL,
+            PRIMARY KEY(date, strategy_id)
+        )
+    ''')
     # 尝试更新旧表结构，添加缺少的列 (sqlite 允许 ADD COLUMN)
     try:
         c.execute("ALTER TABLE portfolio ADD COLUMN weight REAL DEFAULT 0.0")
@@ -87,13 +103,14 @@ def load_portfolio_and_trades():
     conn = get_connection()
     c = conn.cursor()
     
-    c.execute("SELECT strategy, name_or_code, entry_date, entry_price FROM portfolio")
+    c.execute("SELECT strategy, name_or_code, entry_date, entry_price, shares FROM portfolio")
     portfolio = {}
     for row in c.fetchall():
-        strategy, name_or_code, entry_date, entry_price = row
+        strategy, name_or_code, entry_date, entry_price, shares = row
         if strategy not in portfolio:
             portfolio[strategy] = {}
-        portfolio[strategy][name_or_code] = {"entry_date": entry_date, "entry_price": entry_price}
+        # shares == 0 default in db implies 1 tranche originally
+        portfolio[strategy][name_or_code] = {"entry_date": entry_date, "entry_price": entry_price, "shares": max(1, shares)}
         
     c.execute("SELECT strategy, name_or_code, entry_date, entry_price, exit_date, exit_price, pnl, reason FROM trade_history")
     trade_history = []
@@ -197,3 +214,46 @@ def load_meta_data(key):
     if row:
         return json.loads(row[0])
     return None
+
+def load_latest_daily_results():
+    """
+    Reconstructs the payload format previously stored in meta_data by fetching the latest 
+    results from the strategy_daily_results table.
+    """
+    conn = get_connection()
+    c = conn.cursor()
+    # Find the latest result_date
+    c.execute("SELECT MAX(result_date) FROM strategy_daily_results")
+    latest_date_row = c.fetchone()
+    if not latest_date_row or not latest_date_row[0]:
+        conn.close()
+        return None
+        
+    latest_date = latest_date_row[0]
+    
+    # Fetch all strategies for that date
+    c.execute("SELECT strategy, result_json FROM strategy_daily_results WHERE result_date=?", (latest_date,))
+    rows = c.fetchall()
+    conn.close()
+    
+    if not rows:
+        return None
+        
+    payload = {
+        "mode": "global_12_grid",
+        "snapshot_date": latest_date,
+        "results": {},
+        "diff": {},
+        "stage_counts": {}
+    }
+    
+    for strategy, json_str in rows:
+        try:
+            strat_data = json.loads(json_str)
+            payload["results"][strategy] = strat_data.get("results", [])
+            payload["diff"][strategy] = strat_data.get("diff", {})
+            payload["stage_counts"][strategy] = len(payload["results"][strategy])
+        except Exception as e:
+            print(f"Error parsing json for strategy {strategy}: {e}")
+            
+    return payload
