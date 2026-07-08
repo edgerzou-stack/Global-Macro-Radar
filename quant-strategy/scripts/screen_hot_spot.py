@@ -270,8 +270,8 @@ def main():
         if cat_holdings:
             prompt += f"【注意】：以下是昨日该策略的持仓标的：{json.dumps(cat_holdings, ensure_ascii=False)}\n为了保证策略稳定性，如果新闻热点依然和它们高度相关，请优先保留它们以降低换手率。\n\n"
         prompt += (
-            "请结合它们与新闻的绝对相关度、以及今天的市场活跃度（成交额越大越好、表现强势），精挑细选出最核心的最多 15 只龙头股，并务必【按相关度从高到低排序】。\n"
-            "如果值得买的不足 15 只，宁缺毋滥，只返回值得买的几只即可。\n"
+            "请结合它们与新闻的绝对相关度、以及今天的市场活跃度（成交额越大越好、表现强势），精挑细选出最核心的最多 16 只龙头股，并务必【按相关度从高到低排序】。\n"
+            "如果值得买的不足 16 只，宁缺毋滥，只返回值得买的几只即可。\n"
             "请严格返回一个 JSON 数组，只包含你选出的股票的「股票代码」，并按优先级排序（如 [\"600519\", \"AAPL\", \"0700.HK\"]）。不要输出任何其他文本或解释理由。"
         )
         
@@ -295,12 +295,12 @@ def main():
                     if len(filtered) < 10:
                         filtered.append(cand_map[code])
                     else:
-                        # 出池缓冲机制 (Buffer Zone): 跌出前 10，但在前 15 名内的原持仓予以保留
+                        # 出池缓冲机制 (Buffer Zone): 跌出前 10，但在前 16 名内的原持仓予以保留
                         if code in cat_holdings:
                             print(f"BUFFER ZONE RETAIN: {code} ranked {idx+1}, kept to reduce turnover.")
                             filtered.append(cand_map[code])
                             
-                    if len(filtered) >= 15:
+                    if len(filtered) >= 16:
                         break
                 
                 if not filtered:
