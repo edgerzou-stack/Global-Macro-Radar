@@ -61,11 +61,20 @@ def build_timeseries_pnl(trades: list) -> pd.Series:
     
     return cum_pnl
 
-def plot_strategy(strat_id, name, trades, output_file, color, artifact_dir):
-    ts = build_timeseries_pnl(trades)
-    
+def plot_strategy(strat_id, name, trades, output_file, color, artifact_dir, nav_records=None):
+    # Fallback to trade naive sum if no nav_records (for backward compatibility during transition)
     total = len(trades)
-    cum_pnl_val = sum([t["pnl"] * 100 for t in trades])
+    
+    if nav_records:
+        df = pd.DataFrame(nav_records)
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.sort_values('date')
+        df['nav_pct'] = (df['nav'] / 1000000.0 - 1) * 100
+        ts = df.set_index('date')['nav_pct']
+        cum_pnl_val = df['nav_pct'].iloc[-1] if not df.empty else 0.0
+    else:
+        ts = build_timeseries_pnl(trades)
+        cum_pnl_val = sum([t["pnl"] * 100 for t in trades])
     
     fig, (ax_table, ax_curve) = plt.subplots(1, 2, figsize=(12, 5), gridspec_kw={'width_ratios': [1, 2.5]})
     
@@ -79,7 +88,7 @@ def plot_strategy(strat_id, name, trades, output_file, color, artifact_dir):
                       
     ax_curve.axhline(0, color='gray', linestyle='dashed', linewidth=1)
     ax_curve.set_title(f'{name} - 累计净收益曲线', fontsize=14)
-    ax_curve.set_xlabel('平仓日期', fontsize=12)
+    ax_curve.set_xlabel('日期', fontsize=12)
     ax_curve.set_ylabel('累计净收益率 (%)', fontsize=12)
     ax_curve.tick_params(axis='x', rotation=45)
     ax_curve.legend(loc='upper left')
@@ -261,31 +270,41 @@ def main():
         
     artifact_dir = os.environ.get("ARTIFACT_DIR", "")
     
+    # Fetch true NAV records for each strategy
+    import sqlite3
+    from core.cash_manager import get_db_path
+    
+    all_nav_records = []
+    strategy_navs = defaultdict(list)
+    try:
+        conn = sqlite3.connect(get_db_path())
+        c = conn.cursor()
+        c.execute("SELECT date, strategy_id, nav FROM strategy_nav_history")
+        nav_rows = c.fetchall()
+        for r in nav_rows:
+            rec = {"date": r[0], "strategy_id": r[1], "nav": r[2]}
+            all_nav_records.append(rec)
+            strategy_navs[r[1]].append(rec)
+    except Exception as e:
+        print(f"Failed to fetch NAV records: {e}")
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
     for strat in STRAT_NAMES.keys():
         if strat in strategy_trades and strategy_trades[strat]:
             out_file = os.path.join(reports_dir, f"pnl_chart_{strat}.png")
-            plot_strategy(strat, STRAT_NAMES.get(strat), strategy_trades[strat], out_file, strat_colors[strat], artifact_dir)
+            # Pass the nav records for this specific strategy
+            plot_strategy(strat, STRAT_NAMES.get(strat), strategy_trades[strat], out_file, strat_colors[strat], artifact_dir, nav_records=strategy_navs.get(strat, None))
             
     out_file_all = os.path.join(reports_dir, "pnl_chart_all.png")
     plot_all(strategy_trades, out_file_all, strat_colors, artifact_dir)
     
-    # Also fetch and plot true NAV
-    import sqlite3
-    from core.cash_manager import get_db_path
-    conn = sqlite3.connect(get_db_path())
-    try:
-        c = conn.cursor()
-        c.execute("SELECT date, strategy_id, nav FROM strategy_nav_history")
-        nav_rows = c.fetchall()
-        if nav_rows:
-            nav_records = [{"date": r[0], "strategy_id": r[1], "nav": r[2]} for r in nav_rows]
-            out_nav_file = os.path.join(reports_dir, "nav_chart_all.png")
-            plot_nav_all(nav_records, out_nav_file, strat_colors, artifact_dir)
-            print("NAV chart generated.")
-    except Exception as e:
-        print(f"Failed to plot NAV chart: {e}")
-    finally:
-        conn.close()
+    # Plot combined NAV chart
+    if all_nav_records:
+        out_nav_file = os.path.join(reports_dir, "nav_chart_all.png")
+        plot_nav_all(all_nav_records, out_nav_file, strat_colors, artifact_dir)
+        print("NAV chart generated.")
         
     print("All charts generated (Original Bright Theme with Dense Point Fix).")
 

@@ -104,14 +104,7 @@ def render_history_md(strategy_id, trade_history, code_map=None):
     if not strat_trades:
         return "暂无历史交割记录。\n\n"
         
-    # 修改 P0.5：将 PnL 计算方式从简单累加改为复利计算 (Compounded Returns)
-    total_compounded_return = 1.0
-    for t in strat_trades:
-        total_compounded_return *= (1 + t.get("pnl", 0))
-    total_pnl = (total_compounded_return - 1) * 100
-    total_pnl_str = f"<span style='color:red'>+{total_pnl:.2f}%</span>" if total_pnl > 0 else f"<span style='color:green'>{total_pnl:.2f}%</span>"
-    
-    res = f"**历史总净收益：{total_pnl_str}** (共 {len(strat_trades)} 笔交易)\n\n"
+    res = f"**历史平仓交易明细** (共 {len(strat_trades)} 笔已完成交割)\n\n"
     res += "| 股票代码/简称 | 买入日期 | 均价 | 投入份数 | 卖出日期 | 卖出价格 | 最终盈亏率 | 交割单备注 |\n"
     res += "|---|---|---|---|---|---|---|---|\n"
     for trade in reversed(strat_trades):
@@ -154,14 +147,7 @@ def render_history_html(strategy_id, trade_history, code_map=None):
     if not strat_trades:
         return "<p>暂无历史交割记录。</p>\n"
         
-    # 修改 P0.5：将 PnL 计算方式从简单累加改为复利计算 (Compounded Returns)
-    total_compounded_return = 1.0
-    for t in strat_trades:
-        total_compounded_return *= (1 + t.get("pnl", 0))
-    total_pnl = (total_compounded_return - 1) * 100
-    total_pnl_str = f"<span class='win'>+{total_pnl:.2f}%</span>" if total_pnl > 0 else f"<span class='loss'>{total_pnl:.2f}%</span>"
-    
-    res = f"<p><strong>历史总净收益：{total_pnl_str}</strong> (共 {len(strat_trades)} 笔交易)</p>\n"
+    res = f"<p><strong>历史平仓交易明细</strong> (共 {len(strat_trades)} 笔已完成交割)</p>\n"
     res += "<table>\n  <thead>\n    <tr>\n"
     for h in ["股票代码/简称", "买入日期", "均价", "投入份数", "卖出日期", "卖出价格", "最终盈亏率", "交割单备注"]:
         res += f"      <th class='nowrap'>{h}</th>\n"
