@@ -261,7 +261,7 @@ def send_email(report_path, config):
 
 def main():
     print("Starting Dual-Track Industry Intelligence Gatherer...", flush=True)
-    load_dotenv()
+    load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env'))
     config = load_config()
     
     print("Fetching articles from RSS feeds...", flush=True)

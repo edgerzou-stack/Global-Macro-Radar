@@ -14,7 +14,7 @@ def _load_env(path):
     except FileNotFoundError:
         pass
 
-radar_env_path = os.environ.get("RADAR_ENV", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "industry-radar", ".env"))
+radar_env_path = os.environ.get("RADAR_ENV", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".env"))
 _load_env(radar_env_path)
 
 # Import the systematic LLM router from industry-radar
