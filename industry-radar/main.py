@@ -10,6 +10,16 @@ from email.message import EmailMessage
 import markdown
 
 def load_config(config_path="config.yaml"):
+    # P4.1: Graceful fallback for missing config.yaml
+    if not os.path.exists(config_path):
+        example_path = "config.example.yaml"
+        if os.path.exists(example_path):
+            import shutil
+            shutil.copy2(example_path, config_path)
+            print(f"Warning: {config_path} not found. Auto-created from {example_path}.")
+        else:
+            raise FileNotFoundError(f"Missing both {config_path} and {example_path}!")
+            
     with open(config_path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
 
