@@ -32,7 +32,8 @@ def calc_nav():
                 cp = 0.0
                 try:
                     if '_a_' in strat:
-                        df = _fetch_a_hist(symbol=key, start_date=today.replace('-','')[:8], end_date=today.replace('-','')[:8])
+                        today_str = today.strftime('%Y%m%d')
+                        df = _fetch_a_hist(symbol=key, start_date=today_str, end_date=today_str)
                         if not df.empty:
                             cp = float(df.iloc[-1]['收盘'])
                         else:
