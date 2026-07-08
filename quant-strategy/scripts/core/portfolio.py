@@ -189,11 +189,11 @@ class PortfolioManager:
                     
                 if df is not None and not df.empty:
                     for _, row in df.iterrows():
-                        if str(row['日期']).replace('-', '') >= start_dt:
+                        if str(row['日期']).replace('-', '') > start_dt:
                             return float(row['开盘'])
             else:
                 sym = req['yf_sym']
-                for i in range(7):
+                for i in range(1, 8):
                     test_date = (dt_obj + datetime.timedelta(days=i)).strftime("%Y-%m-%d")
                     if (sym, test_date) in yf_prices:
                         return yf_prices[(sym, test_date)]
