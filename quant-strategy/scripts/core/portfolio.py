@@ -166,35 +166,65 @@ class PortfolioManager:
         name_to_code_map = get_a_share_name_to_code_map() if a_reqs else {}
         a_cache = {}
         
+        import pytz
+        
         def fetch_open_price(req):
             dt_obj = datetime.datetime.strptime(req['date'][:10], "%Y-%m-%d")
+            
+            # Fallback for old records that only have YYYY-MM-DD
+            if len(req['date']) <= 10:
+                dt_full = datetime.datetime.strptime(req['date'] + " 19:00:00", "%Y-%m-%d %H:%M:%S")
+            else:
+                dt_full = datetime.datetime.strptime(req['date'], "%Y-%m-%d %H:%M:%S")
+                
+            bjt = pytz.timezone('Asia/Shanghai')
+            dt_bjt = bjt.localize(dt_full)
+            
             if '_a_' in req['strat']:
                 fetch_key = name_to_code_map.get(req['key'], req['key'])
-                start_dt = dt_obj.strftime("%Y%m%d")
+                start_dt_str = dt_obj.strftime("%Y%m%d")
                 df = None
                 if fetch_key in a_cache:
                     df = a_cache[fetch_key]
                 else:
                     end_dt = (datetime.datetime.now() + datetime.timedelta(days=7)).strftime("%Y%m%d")
                     try:
-                        df = _fetch_a_hist(symbol=fetch_key, start_date=start_dt, end_date=end_dt, adjust="")
+                        df = _fetch_a_hist(symbol=fetch_key, start_date=start_dt_str, end_date=end_dt, adjust="")
                     except Exception:
                         pass
                     if df is None or df.empty:
                         try:
-                            df = _fetch_etf_hist(symbol=fetch_key, start_date=start_dt, end_date=end_dt, adjust="")
+                            df = _fetch_etf_hist(symbol=fetch_key, start_date=start_dt_str, end_date=end_dt, adjust="")
                         except Exception:
                             pass
                     a_cache[fetch_key] = df
                     
                 if df is not None and not df.empty:
+                    # Determine next available trading date based on order time
+                    if dt_bjt.time() < datetime.time(9, 30):
+                        target_dt_str = dt_bjt.strftime("%Y%m%d")
+                    else:
+                        target_dt_str = (dt_bjt + datetime.timedelta(days=1)).strftime("%Y%m%d")
+                        
                     for _, row in df.iterrows():
-                        if str(row['日期']).replace('-', '') > start_dt:
+                        if str(row['日期']).replace('-', '') >= target_dt_str:
                             return float(row['开盘'])
             else:
                 sym = req['yf_sym']
-                for i in range(1, 8):
-                    test_date = (dt_obj + datetime.timedelta(days=i)).strftime("%Y-%m-%d")
+                if '_us_' in req['strat']:
+                    ny = pytz.timezone('America/New_York')
+                    dt_local = dt_bjt.astimezone(ny)
+                else:
+                    hk = pytz.timezone('Asia/Hong_Kong')
+                    dt_local = dt_bjt.astimezone(hk)
+                    
+                if dt_local.time() < datetime.time(9, 30):
+                    start_date = dt_local.date()
+                else:
+                    start_date = dt_local.date() + datetime.timedelta(days=1)
+                    
+                for i in range(0, 8):
+                    test_date = (start_date + datetime.timedelta(days=i)).strftime("%Y-%m-%d")
                     if (sym, test_date) in yf_prices:
                         return yf_prices[(sym, test_date)]
             return 0.0
