@@ -73,8 +73,9 @@ def main():
         try:
             with open(out_path, "r") as f:
                 fallback_data = json.load(f)
-        except Exception:
-            pass
+        except Exception as e:
+            import logging
+            logging.error(f"Failed to load fallback data from {fallback_file}: {e}", exc_info=True)
             
     print("Fetching A-share universes...")
     a_tickers = get_a_tickers()

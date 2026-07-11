@@ -112,8 +112,10 @@ def fetch_yf_data(ticker_symbol, args):
                                                 latest_qoq_dual_growth = True # Fallback if missing rows
                                         else:
                                             latest_qoq_dual_growth = True # Fallback if missing stmt
-                                    except Exception:
-                                        latest_qoq_dual_growth = True # Fallback on error
+                                    except Exception as e:
+                                        import logging
+                                        logging.error(f"Failed to calculate QoQ dual growth for {symbol}: {e}", exc_info=True)
+                                        latest_qoq_dual_growth = False # DO NOT fallback on error! Reject instead.
                                     
                                     if latest_qoq_dual_growth:
                                         pass_gro_precheck = True

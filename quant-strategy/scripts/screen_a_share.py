@@ -38,7 +38,9 @@ def calculate_ttm_dividend_yield_for_code(
 
     try:
         dividend_df = stock_dividend_cninfo_cached(symbol=symbol)
-    except Exception:
+    except Exception as e:
+        import logging
+        logging.error(f"Failed to fetch dividend data for {symbol}: {e}", exc_info=True)
         return None
 
     if dividend_df.empty:

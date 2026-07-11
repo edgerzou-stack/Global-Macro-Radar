@@ -130,7 +130,9 @@ def get_connection():
             _DB_INITIALIZED = True
             return conn
     db_path = get_db_path()
-    return sqlite3.connect(db_path, timeout=30.0)
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    conn.execute('PRAGMA journal_mode=WAL;')
+    return conn
 
 def load_portfolio_and_trades():
     conn = get_connection()

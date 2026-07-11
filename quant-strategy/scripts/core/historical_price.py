@@ -1,6 +1,11 @@
 import yfinance as yf
 import pandas as pd
+import datetime
+import os
+import pickle
 from core.clock import clock
+
+_BULK_CACHE = {}
 
 def get_historical_closes_bulk(symbols: list[str], as_of_date: str) -> dict[str, float]:
     """
@@ -9,31 +14,67 @@ def get_historical_closes_bulk(symbols: list[str], as_of_date: str) -> dict[str,
     as_of_date: YYYY-MM-DD
     Returns: dict mapping symbol -> close_price
     """
-    # Fetch 10 days prior to as_of_date to ensure we catch a trading day
-    import datetime
-    end_dt = datetime.datetime.strptime(as_of_date, "%Y-%m-%d") + datetime.timedelta(days=1)
-    start_dt = end_dt - datetime.timedelta(days=10)
+    global _BULK_CACHE
     
-    try:
-        data = yf.download(symbols, start=start_dt.strftime("%Y-%m-%d"), end=end_dt.strftime("%Y-%m-%d"), progress=False)
-        if data.empty or "Close" not in data:
-            return {}
-            
-        closes = data["Close"].ffill().iloc[-1]
+    # Generate a cache key based on the sorted symbols
+    cache_key = tuple(sorted(symbols))
+    
+    if cache_key not in _BULK_CACHE:
+        # Load from disk if available
+        cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        import hashlib
+        key_hash = hashlib.md5(str(cache_key).encode()).hexdigest()
+        disk_cache_file = os.path.join(cache_dir, f"yf_bulk_{key_hash}.pkl")
         
-        result = {}
-        if isinstance(closes, pd.Series):
-            for sym, price in closes.items():
-                if pd.notna(price):
-                    result[sym] = float(price)
-        else:
-            if pd.notna(closes):
-                result[symbols[0]] = float(closes)
+        if os.path.exists(disk_cache_file):
+            try:
+                with open(disk_cache_file, "rb") as f:
+                    _BULK_CACHE[cache_key] = pickle.load(f)
+            except Exception:
+                pass
                 
-        return result
-    except Exception as e:
-        print(f"Failed to fetch historical prices: {e}")
+        if cache_key not in _BULK_CACHE:
+            print(f"Downloading 2 years of history for {len(symbols)} symbols to build local cache...")
+            today_date = clock.today()
+            end_dt = today_date + datetime.timedelta(days=1)
+            start_dt = end_dt - datetime.timedelta(days=800)
+            
+            try:
+                data = yf.download(symbols, start=start_dt.strftime("%Y-%m-%d"), end=end_dt.strftime("%Y-%m-%d"), progress=False)
+                if data.empty or "Close" not in data:
+                    _BULK_CACHE[cache_key] = pd.DataFrame()
+                else:
+                    _BULK_CACHE[cache_key] = data["Close"]
+                    
+                with open(disk_cache_file, "wb") as f:
+                    pickle.dump(_BULK_CACHE[cache_key], f)
+            except Exception as e:
+                print(f"Failed to fetch historical prices: {e}")
+                return {}
+
+    df = _BULK_CACHE.get(cache_key, pd.DataFrame())
+    if df.empty:
         return {}
+        
+    target_dt = pd.to_datetime(as_of_date)
+    # Filter up to as_of_date
+    df_past = df[df.index <= target_dt]
+    if df_past.empty:
+        return {}
+        
+    closes = df_past.ffill().iloc[-1]
+    
+    result = {}
+    if isinstance(closes, pd.Series):
+        for sym, price in closes.items():
+            if pd.notna(price):
+                result[sym] = float(price)
+    else:
+        if pd.notna(closes):
+            result[symbols[0]] = float(closes)
+            
+    return result
 
 def a_share_to_yf(code: str) -> str:
     code = str(code).zfill(6)

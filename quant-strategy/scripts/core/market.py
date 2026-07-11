@@ -29,6 +29,76 @@ class Market:
         """Determine if it is currently trading hours. Override in subclasses."""
         raise NotImplementedError
 
+    def get_effective_trading_date(self) -> str:
+        """
+        Returns the effective trading session date string (YYYY-MM-DD).
+        If it's before the market open or a non-trading day, returns the previous trading day.
+        If the market is open or already closed for the day, returns today.
+        """
+        now_local = self.get_current_time()
+        start_date = (now_local - datetime.timedelta(days=30)).date()
+        end_date = now_local.date()
+        
+        if not self.calendar:
+            # Fallback
+            current = now_local
+            while current.weekday() >= 5:
+                current -= datetime.timedelta(days=1)
+            return current.strftime('%Y-%m-%d')
+            
+        try:
+            schedule = self.calendar.schedule(start_date=start_date, end_date=end_date)
+            now_utc = now_local.astimezone(pytz.utc)
+            import pandas as pd
+            
+            today_ts = pd.Timestamp(now_local.date())
+            if today_ts in schedule.index:
+                row = schedule.loc[today_ts]
+                if isinstance(row, pd.DataFrame):
+                    row = row.iloc[0]
+                market_open_utc = row['market_open']
+                if now_utc >= market_open_utc:
+                    return today_ts.strftime('%Y-%m-%d')
+                    
+            valid_days = schedule[schedule['market_open'] <= pd.Timestamp(now_utc)]
+            if not valid_days.empty:
+                return valid_days.index[-1].strftime('%Y-%m-%d')
+            return start_date.strftime('%Y-%m-%d')
+        except Exception as e:
+            import logging
+            logging.debug(f"mcal schedule failed: {e}. Falling back to weekday logic.")
+            current = now_local
+            while current.weekday() >= 5:
+                current -= datetime.timedelta(days=1)
+            return current.strftime('%Y-%m-%d')
+            
+    def get_next_trading_date(self, target_date: datetime.date) -> datetime.date:
+        """
+        Returns the exact next available trading day after or on the target_date.
+        """
+        if not self.calendar:
+            # Fallback naive logic
+            d = target_date
+            while d.weekday() >= 5:
+                d += datetime.timedelta(days=1)
+            return d
+            
+        try:
+            import pandas as pd
+            end_date = target_date + datetime.timedelta(days=30)
+            schedule = self.calendar.valid_days(start_date=target_date, end_date=end_date)
+            if len(schedule) > 0:
+                # The valid_days returns a DatetimeIndex
+                return schedule[0].date()
+            return target_date
+        except Exception as e:
+            import logging
+            logging.error(f"Failed to get next trading date from calendar: {e}")
+            d = target_date
+            while d.weekday() >= 5:
+                d += datetime.timedelta(days=1)
+            return d
+
 class AShareMarket(Market):
     def __init__(self):
         super().__init__("A-Share", "Asia/Shanghai", "XSHG")

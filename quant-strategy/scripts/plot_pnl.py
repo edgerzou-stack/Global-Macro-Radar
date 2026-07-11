@@ -41,8 +41,9 @@ def build_timeseries_pnl(trades: list) -> pd.Series:
                 date = pd.to_datetime(t["exit_date"].split()[0])
                 pnl_percent = t["pnl"] * 100
                 records.append({"date": date, "pnl": pnl_percent})
-            except Exception:
-                pass
+            except Exception as e:
+                import logging
+                logging.error(f"Failed to parse pnl record for strat {strat}, line {row}: {e}", exc_info=True)
                 
     if not records:
         return pd.Series(dtype=float)

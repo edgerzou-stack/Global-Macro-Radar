@@ -53,44 +53,11 @@ def main():
         if os.environ.get("FORCE_RUN") == "1":
             logger.info("FORCE_RUN=1 detected. Bypassing trading day check.")
         else:
-            # 修改 P0.4: 分别检查 A股, 美股, 港股 的节假日日历
-            import warnings
+            from core.market import AShareMarket, HKMarket, USMarket
+            is_a_trade = AShareMarket().is_trading_day()
+            is_us_trade = USMarket().is_trading_day()
+            is_hk_trade = HKMarket().is_trading_day()
             
-            is_a_trade = False
-            is_us_trade = False
-            is_hk_trade = False
-            
-            # A-Share Check
-            try:
-                trade_dates = ak.tool_trade_date_hist_sina()
-                trade_dates_list = pd.to_datetime(trade_dates['trade_date']).dt.date.tolist()
-                is_a_trade = today in trade_dates_list
-            except Exception as e:
-                logger.warning(f"Failed to fetch A-share trading calendar via akshare: {e}")
-                is_a_trade = today.weekday() < 5
-                
-            # US/HK Check via pandas_market_calendars (or fallback)
-            try:
-                import pandas_market_calendars as mcal
-                nyse = mcal.get_calendar('NYSE')
-                hkex = mcal.get_calendar('HKEX')
-                
-                # Check if today is in the schedule
-                today_str = today.strftime('%Y-%m-%d')
-                us_sched = nyse.schedule(start_date=today_str, end_date=today_str)
-                is_us_trade = not us_sched.empty
-                
-                hk_sched = hkex.schedule(start_date=today_str, end_date=today_str)
-                is_hk_trade = not hk_sched.empty
-            except ImportError:
-                logger.warning("pandas_market_calendars not installed. Using simple weekday check for US/HK as fallback.")
-                is_us_trade = today.weekday() < 5
-                is_hk_trade = today.weekday() < 5
-            except Exception as e:
-                logger.warning(f"Error checking US/HK calendar: {e}")
-                is_us_trade = today.weekday() < 5
-                is_hk_trade = today.weekday() < 5
-
             if not (is_a_trade or is_us_trade or is_hk_trade):
                 logger.info(f"{today} is a holiday/weekend across all monitored markets (A/US/HK). Exiting.")
                 sys.exit(0)
@@ -115,8 +82,9 @@ def main():
             import json
             with open(checkpoint_file, "r") as f:
                 checkpoint_data = json.load(f)
-        except Exception:
-            pass
+        except Exception as e:
+            import logging
+            logging.error(f"Failed to load checkpoint file {checkpoint_file}: {e}", exc_info=True)
             
     if checkpoint_data.get("date") != str(today):
         checkpoint_data = {"date": str(today), "completed_steps": []}

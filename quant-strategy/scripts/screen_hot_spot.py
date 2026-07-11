@@ -147,7 +147,9 @@ def filter_a_share(items):
             change = float(change) / 100 if change != "-" else 0
             turnover_amount = float(turnover_amount) if turnover_amount != "-" else 0
             float_market_cap = float(float_market_cap) if float_market_cap != "-" else 1
-        except Exception:
+        except Exception as e:
+            import logging
+            logging.error(f"Failed to parse A-share data for {code}: {e}", exc_info=True)
             continue
             
         results.append({
@@ -241,8 +243,9 @@ def main():
             for k in ["hot_spot_a_stock", "hot_spot_us_stock", "hot_spot_hk_stock"]:
                 if k in port and port[k]:
                     previous_holdings[k] = list(port[k].keys())
-        except Exception:
-            pass
+        except Exception as e:
+            import logging
+            logging.error(f"Failed to load previous holdings from global_screen: {e}", exc_info=True)
             
     llm_pools = get_hot_stocks_from_llm(hot_news, previous_holdings)
     print(f"LLM suggested pools: {llm_pools}")

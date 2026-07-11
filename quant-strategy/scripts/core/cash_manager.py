@@ -2,9 +2,7 @@ import sqlite3
 import os
 import threading
 
-def get_db_path():
-    base_dir = os.environ.get("PROJECT_ROOT", os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-    return os.path.join(base_dir, "quant_system.db")
+from db_utils import get_db_path
 
 class CashManager:
     """
@@ -18,12 +16,22 @@ class CashManager:
         with cls._lock:
             if cls._instance is None:
                 cls._instance = super(CashManager, cls).__new__(cls)
-                cls._instance.INITIAL_CAPITAL = 1000000.0  # 1 Million base
-                cls._instance.TRANCHE_RATIO = 0.033        # 3.3% per tranche
+                cls._instance._initialized = False
         return cls._instance
 
+    def __init__(self):
+        if self._initialized:
+            return
+        
+        self.INITIAL_CAPITAL = 1000000.0  # 1 Million base
+        self.TRANCHE_RATIO = 0.033        # 3.3% per tranche
+        self.db_path = get_db_path()
+        self._initialized = True
+
     def get_connection(self):
-        return sqlite3.connect(get_db_path(), timeout=30.0)
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        conn.execute('PRAGMA journal_mode=WAL;')
+        return conn
 
     def initialize_strategy(self, strategy_id: str, cursor=None):
         """Inject 1M initial capital if strategy account does not exist."""

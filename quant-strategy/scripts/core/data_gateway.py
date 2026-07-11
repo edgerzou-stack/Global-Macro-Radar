@@ -26,8 +26,9 @@ class DataGateway:
         self._init_db()
 
     def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
             c = conn.cursor()
+            c.execute('PRAGMA journal_mode=WAL;')
             c.execute("""
                 CREATE TABLE IF NOT EXISTS daily_prices (
                     symbol TEXT,
@@ -66,7 +67,8 @@ class DataGateway:
 
     def _get_from_cache(self, symbol: str, start_date: str, end_date: str, adjust: str) -> pd.DataFrame:
         """Reads historical data from SQLite cache."""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+            conn.execute('PRAGMA journal_mode=WAL;')
             query = """
                 SELECT date as 日期, open as 开盘, close as 收盘, high as 最高, low as 最低, volume as 成交量
                 FROM daily_prices
@@ -109,7 +111,8 @@ class DataGateway:
                 to_insert.append((symbol, date_val, open_val, close_val, high_val, low_val, volume_val, adjust))
                 
         if to_insert:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+                conn.execute('PRAGMA journal_mode=WAL;')
                 c = conn.cursor()
                 c.executemany("""
                     INSERT OR REPLACE INTO daily_prices 
@@ -119,15 +122,16 @@ class DataGateway:
                 conn.commit()
 
     @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=1, max=4))
-    def _fetch_from_yfinance(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+    def _fetch_from_yfinance(self, symbol: str, start_date: str, end_date: str, adjust: str = "") -> pd.DataFrame:
         yf_sym = self._to_yf_symbol(symbol)
         
         start_fmt = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]}"
         end_dt = datetime.datetime.strptime(end_date, "%Y%m%d") + datetime.timedelta(days=1)
         end_fmt = end_dt.strftime("%Y-%m-%d")
         
+        auto_adj = True if adjust == "hfq" else False
         ticker = yf.Ticker(yf_sym)
-        df = ticker.history(start=start_fmt, end=end_fmt, auto_adjust=False)
+        df = ticker.history(start=start_fmt, end=end_fmt, auto_adjust=auto_adj)
         
         if df.empty:
             raise ValueError(f"YFinance returned empty dataframe for {yf_sym}")
@@ -144,6 +148,8 @@ class DataGateway:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     def _fetch_from_akshare(self, symbol: str, start_date: str, end_date: str, adjust: str) -> pd.DataFrame:
+        import time
+        time.sleep(0.3) # Throttle to prevent akshare API connection reset
         if len(symbol) == 6 and symbol.isdigit():
             df = ak.stock_zh_a_hist(symbol=symbol, start_date=start_date, end_date=end_date, adjust=adjust)
             if df.empty:
@@ -179,12 +185,12 @@ class DataGateway:
             except Exception as e:
                 logger.warning(f"DataGateway: akshare failed for {symbol} ({start_date}-{end_date}): {e}. Falling back to yfinance.")
                 try:
-                    df_new = self._fetch_from_yfinance(symbol, start_date, end_date)
+                    df_new = self._fetch_from_yfinance(symbol, start_date, end_date, adjust)
                 except Exception as e2:
                     logger.error(f"DataGateway: yfinance also failed for {symbol}: {e2}.")
         else:
             try:
-                df_new = self._fetch_from_yfinance(symbol, start_date, end_date)
+                df_new = self._fetch_from_yfinance(symbol, start_date, end_date, adjust)
             except Exception as e:
                 logger.error(f"DataGateway: yfinance failed for {symbol}: {e}.")
                 
@@ -209,30 +215,50 @@ class DataGateway:
         """
         Gets the open price for a specific date (or the next available trading day).
         """
-        target_date = str(target_date).replace('-', '')[:8]
-        start_date = target_date
-        end_dt = datetime.datetime.strptime(target_date, "%Y%m%d") + datetime.timedelta(days=7)
-        end_date = end_dt.strftime("%Y%m%d")
+        from core.market import AShareMarket, HKMarket, USMarket
+        if symbol.endswith('.HK'):
+            market = HKMarket()
+        elif len(symbol) == 6 and symbol.isdigit():
+            market = AShareMarket()
+        else:
+            market = USMarket()
+            
+        target_date_str = str(target_date).replace('-', '')[:8]
+        target_dt = datetime.datetime.strptime(target_date_str, "%Y%m%d").date()
         
-        df = self.get_historical_prices(symbol, start_date, end_date, adjust="")
+        # Get exact next trading day
+        exact_trade_date = market.get_next_trading_date(target_dt)
+        exact_date_str = exact_trade_date.strftime("%Y%m%d")
         
-        if not df.empty:
-            for _, row in df.iterrows():
-                dt_str = str(row['日期']).replace('-', '')
-                if dt_str >= target_date:
-                    return float(row['开盘'])
-                    
+        try:
+            # Only fetch the exact date needed
+            df = self.get_historical_prices(symbol, exact_date_str, exact_date_str, adjust="")
+            
+            if not df.empty:
+                for _, row in df.iterrows():
+                    dt_str = str(row['日期']).replace('-', '')
+                    if dt_str == exact_date_str:
+                        return float(row['开盘'])
+        except Exception as e:
+            logger.error(f"Failed to get open price for {symbol} around {target_date}: {e}")
+            
         return 0.0
 
     def get_current_price(self, symbol: str) -> float:
         """
         Gets the latest available snapshot price (close).
         """
-        today_str = datetime.datetime.now().strftime("%Y%m%d")
-        start_dt = datetime.datetime.now() - datetime.timedelta(days=7)
-        start_date = start_dt.strftime("%Y%m%d")
+        from core.market import AShareMarket, HKMarket, USMarket
+        if symbol.endswith('.HK'):
+            market = HKMarket()
+        elif len(symbol) == 6 and symbol.isdigit():
+            market = AShareMarket()
+        else:
+            market = USMarket()
+            
+        effective_date_str = market.get_effective_trading_date().replace('-', '')
         
-        df = self.get_historical_prices(symbol, start_date, today_str, adjust="")
+        df = self.get_historical_prices(symbol, effective_date_str, effective_date_str, adjust="")
         
         if not df.empty:
             return float(df.iloc[-1]['收盘'])

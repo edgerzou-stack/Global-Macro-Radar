@@ -109,6 +109,7 @@ def main():
     parser.add_argument("--growth-roe-min", type=float, default=10.0)
     parser.add_argument("--growth-yoy-min", type=float, default=30.0)
     parser.add_argument("--max-stocks", type=int, default=10)
+    parser.add_argument("--disable-llm", action="store_true", help="Disable LLM secondary filtering")
     from config import PROJECT_ROOT
     parser.add_argument("--output-file", type=str, default=os.path.join(PROJECT_ROOT, "global_screen.json"))
     
@@ -178,7 +179,11 @@ def main():
 
     # LLM Secondary Filtering for Growth Strategies
     try:
-        from llm_utils import call_llm
+        if args.disable_llm:
+            call_llm = None
+            print("LLM filtering disabled via --disable-llm.")
+        else:
+            from llm_utils import call_llm
     except:
         call_llm = None
 
@@ -268,7 +273,7 @@ Please return the selected top candidates (maximum 10) as a JSON array of their 
             m = AShareMarket()
         # Instead of completely skipping the run, we keep targets empty if the market is closed for weekend/holiday.
         # This prevents accidental drops or fake transactions.
-        if not m.is_trading_time() and m.get_current_time().weekday() >= 5:
+        if not m.is_trading_time() and m.get_current_time().weekday() >= 5 and os.environ.get("FORCE_RUN") != "1":
             # If weekend, we do not update this strategy's target (keep it exactly as old_portfolio)
             strategy_targets_market_filtered[strat] = list(old_portfolio.get(strat, {}).keys())
         else:

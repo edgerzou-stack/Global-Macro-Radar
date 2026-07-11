@@ -42,12 +42,51 @@ def calc_nav():
                     cp = ep # Fallback to cost basis if price unavailable
                     
                 # Calculate value
-                # Note: 'shares' is number of tranches. We use (ep * tranche_size * shares) to find invested amount?
-                # Actually, virtual position size is CashManager.TRANCHE_RATIO * INITIAL_CAPITAL.
-                # Total invested capital = Tranche Size * shares
                 cash_mgr_inst = CashManager()
                 invested_capital = cash_mgr_inst.INITIAL_CAPITAL * cash_mgr_inst.TRANCHE_RATIO * shares
-                current_value = (cp / ep) * invested_capital if ep > 0 else invested_capital
+                
+                true_multiplier = 1.0
+                if ep > 0:
+                    try:
+                        from core.market import AShareMarket, HKMarket, USMarket
+                        if "_us_" in strat:
+                            market = USMarket()
+                        elif "_hk_" in strat:
+                            market = HKMarket()
+                        else:
+                            market = AShareMarket()
+
+                        entry_date = pos.get("entry_date", str(today))[:10].replace('-', '')
+                        end_date_str = market.get_effective_trading_date().replace('-', '')
+                        
+                        # Fetch ONLY the precise dates we need instead of massive ranges
+                        df_adj_entry = data_gateway.get_historical_prices(key_fetch, entry_date, entry_date, adjust="hfq")
+                        df_unadj_entry = data_gateway.get_historical_prices(key_fetch, entry_date, entry_date, adjust="")
+                        
+                        df_adj_exit = data_gateway.get_historical_prices(key_fetch, end_date_str, end_date_str, adjust="hfq")
+                        df_unadj_exit = data_gateway.get_historical_prices(key_fetch, end_date_str, end_date_str, adjust="")
+                        
+                        if not df_adj_entry.empty and not df_unadj_entry.empty and not df_adj_exit.empty and not df_unadj_exit.empty:
+                            first_adj = float(df_adj_entry.iloc[0]['收盘'])
+                            first_unadj = float(df_unadj_entry.iloc[0]['收盘'])
+                            last_adj = float(df_adj_exit.iloc[-1]['收盘'])
+                            last_unadj = float(df_unadj_exit.iloc[-1]['收盘'])
+                            
+                            factor_entry = first_adj / first_unadj if first_unadj > 0 else 1.0
+                            factor_exit = last_adj / last_unadj if last_unadj > 0 else 1.0
+                            
+                            true_adj_ep = ep * factor_entry
+                            true_adj_cp = cp * factor_exit
+                            
+                            if true_adj_ep > 0:
+                                true_multiplier = true_adj_cp / true_adj_ep
+                        else:
+                            true_multiplier = cp / ep
+                    except Exception as e:
+                        print(f"Failed to calculate true adjusted multiplier for {key}: {e}")
+                        true_multiplier = cp / ep
+                
+                current_value = invested_capital * true_multiplier
                 holdings_value += current_value
                 
             total_nav = cash + holdings_value

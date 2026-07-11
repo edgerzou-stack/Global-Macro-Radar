@@ -129,20 +129,35 @@ class PortfolioManager:
                 
                 # Determine next available trading date based on order time
                 # If ordered before 9:30 AM local market time, it's today. Otherwise, next day.
+                from core.market import AShareMarket, HKMarket, USMarket
                 if '_us_' in req['strat']:
-                    local_tz = pytz.timezone('America/New_York')
+                    market = USMarket()
                 elif '_hk_' in req['strat']:
-                    local_tz = pytz.timezone('Asia/Hong_Kong')
+                    market = HKMarket()
                 else:
-                    local_tz = bjt
+                    market = AShareMarket()
                     
-                dt_local = dt_bjt.astimezone(local_tz)
+                dt_local = dt_bjt.astimezone(market.tz)
                 
                 if dt_local.time() < datetime.time(9, 30):
                     target_date = dt_local.date()
                 else:
                     target_date = dt_local.date() + datetime.timedelta(days=1)
+                
+                target_date = market.get_next_trading_date(target_date)
                     
+                # Time Guard: Do not fetch if the target date is in the future
+                # or if it's today but before the market opens (9:30 AM local).
+                now_utc = clock.now(pytz.utc)
+                now_local = now_utc.astimezone(market.tz)
+                
+                if target_date > now_local.date():
+                    return 0.0 # Future date, price not available yet
+                    
+                if target_date == now_local.date():
+                    if now_local.time() < datetime.time(9, 30):
+                        return 0.0 # Market not opened yet today
+                        
                 target_dt_str = target_date.strftime("%Y%m%d")
                 
                 key = req['key']
@@ -260,13 +275,12 @@ class PortfolioManager:
                 def _prefetch_data(key, strat, entry_date):
                     try:
                         if '_a_' in strat:
-                            _fetch_a_hist(symbol=key, start_date=entry_date.replace('-','')[:8], end_date=snapshot_date.replace('-','')[:8], adjust="hfq")
-                            _fetch_a_hist(symbol=key, start_date=entry_date.replace('-','')[:8], end_date=snapshot_date.replace('-','')[:8], adjust="")
+                            data_gateway.get_historical_prices(key, start_date=entry_date.replace('-','')[:8], end_date=snapshot_date.replace('-','')[:8], adjust="hfq")
+                            data_gateway.get_historical_prices(key, start_date=entry_date.replace('-','')[:8], end_date=snapshot_date.replace('-','')[:8], adjust="")
                         elif '_hk_' in strat or '_us_' in strat:
                             yf_sym = f"{key}.HK" if '_hk_' in strat and not key.upper().endswith('.HK') else key
-                            end_dt = datetime.datetime.strptime(snapshot_date[:10], "%Y-%m-%d") + datetime.timedelta(days=1)
-                            _fetch_yf_hist(yf_sym, start=entry_date[:10], end=end_dt.strftime("%Y-%m-%d"), auto_adjust=True)
-                            _fetch_yf_hist(yf_sym, start=entry_date[:10], end=end_dt.strftime("%Y-%m-%d"), auto_adjust=False)
+                            data_gateway.get_historical_prices(yf_sym, start_date=entry_date.replace('-','')[:8], end_date=snapshot_date.replace('-','')[:8], adjust="hfq")
+                            data_gateway.get_historical_prices(yf_sym, start_date=entry_date.replace('-','')[:8], end_date=snapshot_date.replace('-','')[:8], adjust="")
                     except Exception as e:
                         import logging
                         logging.warning(f"Prefetch error for {key}: {e}")
@@ -287,11 +301,15 @@ class PortfolioManager:
                     shares = old_pos.get("shares", 1)
                     entry_date = old_pos.get("entry_date", "未知")
 
-                    from core.market_utils import get_effective_today
-                    tz_str = "US/Eastern" if "_us_" in strat else ("Asia/Hong_Kong" if "_hk_" in strat else "Asia/Shanghai")
-                    now_local = clock.now(pytz.timezone(tz_str))
+                    from core.market import AShareMarket, HKMarket, USMarket
+                    if "_us_" in strat:
+                        market = USMarket()
+                    elif "_hk_" in strat:
+                        market = HKMarket()
+                    else:
+                        market = AShareMarket()
 
-                    effective_today = get_effective_today(strat, now_local)
+                    effective_today = market.get_effective_trading_date()
 
                     if entry_date[:10] >= effective_today or ep <= 0:
                         # T+1 rule: ignore trades if the market hasn't opened for a new session since entry
@@ -333,16 +351,25 @@ class PortfolioManager:
                             df_adj = data_gateway.get_historical_prices(key_fetch, start_date, end_date, adjust="hfq")
                             df_unadj = data_gateway.get_historical_prices(key_fetch, start_date, end_date, adjust="")
                             
-                            if not df_adj.empty and not df_unadj.empty and len(df_adj) >= 2 and len(df_unadj) >= 2:
-                                factor_entry = float(df_adj.iloc[0]['收盘']) / float(df_unadj.iloc[0]['收盘'])
-                                factor_exit = float(df_adj.iloc[-1]['收盘']) / float(df_unadj.iloc[-1]['收盘'])
+                            if not df_adj.empty and not df_unadj.empty and len(df_adj) >= 1 and len(df_unadj) >= 1:
+                                first_adj = float(df_adj.iloc[0]['收盘'])
+                                first_unadj = float(df_unadj.iloc[0]['收盘'])
+                                last_adj = float(df_adj.iloc[-1]['收盘'])
+                                last_unadj = float(df_unadj.iloc[-1]['收盘'])
+                                
+                                factor_entry = first_adj / first_unadj if first_unadj > 0 else 1.0
+                                factor_exit = last_adj / last_unadj if last_unadj > 0 else 1.0
+                                
                                 true_adj_ep = ep * factor_entry
                                 true_adj_cp = cp * factor_exit
-                                pnl = (true_adj_cp / true_adj_ep - 1) - fee
+                                if true_adj_ep > 0:
+                                    pnl = (true_adj_cp / true_adj_ep - 1) - fee
                             else:
-                                raise ValueError(f"CRITICAL: Failed to fetch adjusted prices for {key}. Aborting.")
+                                import logging
+                                logging.warning(f"Failed to fetch sufficient adjusted prices for {key}. Using raw PnL.")
                     except Exception as e:
-                        raise ValueError(f"CRITICAL: Data fetching failed for {key}: {e}. Aborting.")
+                        import logging
+                        logging.error(f"Error calculating adjusted PnL for {key}: {e}. Using raw PnL.")
 
                     if key in hard_stop_keys:
                         reason = "[风控熔断] 加仓满3次后仍重度亏损，触发绝对止损线强制清仓"

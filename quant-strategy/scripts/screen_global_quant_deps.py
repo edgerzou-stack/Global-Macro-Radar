@@ -33,7 +33,9 @@ def load_hot_spot_today():
         project_root = PROJECT_ROOT
         with open(os.path.join(project_root, "hot_spot_today.json"), "r") as f:
             return json.load(f)
-    except:
+    except Exception as e:
+        import logging
+        logging.warning(f"Failed to load hot_spot_today.json: {e}. Returning empty hot spot data.")
         return {}
 
 def get_current_prices_for_portfolio(all_portfolio, a_prices):
