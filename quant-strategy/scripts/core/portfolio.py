@@ -4,6 +4,7 @@ import yfinance as yf
 import akshare as ak
 import pandas as pd
 from typing import Dict, List, Any
+from core.clock import clock
 from tenacity import retry, stop_after_attempt, wait_exponential
 from core.ttl_cache import ttl_cache
 
@@ -80,209 +81,214 @@ class PortfolioManager:
         
         conn = self.db.get_connection()
         cursor = conn.cursor()
-        
-        def get_a_share_name_to_code_map():
-            cache_file = os.path.join(os.path.dirname(__file__), "a_share_map_cache.json")
-            if os.path.exists(cache_file):
-                try:
-                    import json
-                    with open(cache_file, "r") as f:
-                        return json.load(f)
-                except Exception as e:
-                    import logging
-                    logging.warning(f"Cache read error: {e}")
-            name_to_code = {}
-            try:
-                df1 = ak.stock_zh_a_spot_em()
-                if not df1.empty:
-                    for _, row in df1.iterrows():
-                        name_to_code[row["名称"]] = row["代码"]
-                df2 = ak.fund_etf_spot_em()
-                if not df2.empty:
-                    for _, row in df2.iterrows():
-                        name_to_code[row["名称"]] = row["代码"]
-                import json
-                with open(cache_file, "w") as f:
-                    json.dump(name_to_code, f, ensure_ascii=False)
-            except Exception as e:
-                print(f"Failed to fetch name to code map: {e}")
-            return name_to_code
-            
-        cursor.execute("SELECT id, strategy, name_or_code, entry_date FROM portfolio WHERE entry_price <= 0.0")
-        portfolio_pending = cursor.fetchall()
-        
-        cursor.execute("SELECT id, strategy, name_or_code, entry_date, entry_price, exit_date, exit_price FROM trade_history WHERE entry_price <= 0.0 OR exit_price <= 0.0")
-        trade_pending = cursor.fetchall()
+        try:
 
-        if not portfolio_pending and not trade_pending:
-            conn.close()
-            return
-            
-        reqs = []
-        for row in portfolio_pending:
-            reqs.append({'type': 'portfolio', 'id': row[0], 'strat': row[1], 'key': row[2], 'date': row[3], 'field': 'ep'})
-        for row in trade_pending:
-            if row[4] <= 0.0:
-                reqs.append({'type': 'trade', 'id': row[0], 'strat': row[1], 'key': row[2], 'date': row[3], 'field': 'ep'})
-            if row[6] <= 0.0:
-                reqs.append({'type': 'trade', 'id': row[0], 'strat': row[1], 'key': row[2], 'date': row[5], 'field': 'xp'})
-
-        yf_tickers = set()
-        min_yf_date = None
-        max_yf_date = None
-        a_reqs = []
-        
-        for req in reqs:
-            dt_obj = datetime.datetime.strptime(req['date'][:10], "%Y-%m-%d")
-            if '_a_' in req['strat']:
-                a_reqs.append(req)
-            else:
-                yf_sym = f"{req['key']}.HK" if '_hk_' in req['strat'] and not req['key'].upper().endswith('.HK') else req['key']
-                yf_tickers.add(yf_sym)
-                req['yf_sym'] = yf_sym
-                if min_yf_date is None or dt_obj < min_yf_date:
-                    min_yf_date = dt_obj
-                if max_yf_date is None or dt_obj > max_yf_date:
-                    max_yf_date = dt_obj
-        
-        yf_prices = {}
-        if yf_tickers:
-            start_str = min_yf_date.strftime("%Y-%m-%d")
-            end_str = (max_yf_date + datetime.timedelta(days=7)).strftime("%Y-%m-%d")
-            tickers_list = list(yf_tickers)
-            print(f"Batch downloading yfinance prices for {len(tickers_list)} tickers from {start_str} to {end_str}...")
-            try:
-                import warnings
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    df_yf = yf.download(tickers_list, start=start_str, end=end_str, group_by="ticker", threads=True, progress=False)
-                
-                if len(tickers_list) == 1:
-                    sym = tickers_list[0]
-                    for idx, row in df_yf.iterrows():
-                        dt_str = idx.strftime("%Y-%m-%d")
-                        if not pd.isna(row.get('Open')):
-                            yf_prices[(sym, dt_str)] = float(row['Open'])
-                else:
-                    for sym in tickers_list:
-                        if sym in df_yf.columns.levels[0]:
-                            df_sym = df_yf[sym]
-                            for idx, row in df_sym.iterrows():
-                                dt_str = idx.strftime("%Y-%m-%d")
-                                if not pd.isna(row.get('Open')):
-                                    yf_prices[(sym, dt_str)] = float(row['Open'])
-            except Exception as e:
-                print(f"Batch yfinance download failed: {e}")
-
-        name_to_code_map = get_a_share_name_to_code_map() if a_reqs else {}
-        a_cache = {}
-        
-        import pytz
-        
-        def fetch_open_price(req):
-            dt_obj = datetime.datetime.strptime(req['date'][:10], "%Y-%m-%d")
-            
-            # Fallback for old records that only have YYYY-MM-DD
-            if len(req['date']) <= 10:
-                dt_full = datetime.datetime.strptime(req['date'] + " 19:00:00", "%Y-%m-%d %H:%M:%S")
-            else:
-                dt_full = datetime.datetime.strptime(req['date'], "%Y-%m-%d %H:%M:%S")
-                
-            bjt = pytz.timezone('Asia/Shanghai')
-            dt_bjt = bjt.localize(dt_full)
-            
-            if '_a_' in req['strat']:
-                fetch_key = name_to_code_map.get(req['key'], req['key'])
-                start_dt_str = dt_obj.strftime("%Y%m%d")
-                df = None
-                if fetch_key in a_cache:
-                    df = a_cache[fetch_key]
-                else:
-                    end_dt = (datetime.datetime.now() + datetime.timedelta(days=7)).strftime("%Y%m%d")
+            def get_a_share_name_to_code_map():
+                cache_file = os.path.join(os.path.dirname(__file__), "a_share_map_cache.json")
+                if os.path.exists(cache_file):
                     try:
-                        df = _fetch_a_hist(symbol=fetch_key, start_date=start_dt_str, end_date=end_dt, adjust="")
-                    except Exception:
-                        pass
-                    if df is None or df.empty:
+                        import json
+                        with open(cache_file, "r") as f:
+                            return json.load(f)
+                    except Exception as e:
+                        import logging
+                        logging.warning(f"Cache read error: {e}")
+                name_to_code = {}
+                try:
+                    df1 = ak.stock_zh_a_spot_em()
+                    if not df1.empty:
+                        for _, row in df1.iterrows():
+                            name_to_code[row["名称"]] = row["代码"]
+                    df2 = ak.fund_etf_spot_em()
+                    if not df2.empty:
+                        for _, row in df2.iterrows():
+                            name_to_code[row["名称"]] = row["代码"]
+                    import json
+                    with open(cache_file, "w") as f:
+                        json.dump(name_to_code, f, ensure_ascii=False)
+                except Exception as e:
+                    print(f"Failed to fetch name to code map: {e}")
+                return name_to_code
+
+            cursor.execute("SELECT id, strategy, name_or_code, entry_date FROM portfolio WHERE entry_price <= 0.0")
+            portfolio_pending = cursor.fetchall()
+
+            cursor.execute("SELECT id, strategy, name_or_code, entry_date, entry_price, exit_date, exit_price FROM trade_history WHERE entry_price <= 0.0 OR exit_price <= 0.0")
+            trade_pending = cursor.fetchall()
+
+            if not portfolio_pending and not trade_pending:
+                return
+
+            reqs = []
+            for row in portfolio_pending:
+                reqs.append({'type': 'portfolio', 'id': row[0], 'strat': row[1], 'key': row[2], 'date': row[3], 'field': 'ep'})
+            for row in trade_pending:
+                if row[4] <= 0.0:
+                    reqs.append({'type': 'trade', 'id': row[0], 'strat': row[1], 'key': row[2], 'date': row[3], 'field': 'ep'})
+                if row[6] <= 0.0:
+                    reqs.append({'type': 'trade', 'id': row[0], 'strat': row[1], 'key': row[2], 'date': row[5], 'field': 'xp'})
+
+            yf_tickers = set()
+            min_yf_date = None
+            max_yf_date = None
+            a_reqs = []
+
+            for req in reqs:
+                dt_obj = datetime.datetime.strptime(req['date'][:10], "%Y-%m-%d")
+                if '_a_' in req['strat']:
+                    a_reqs.append(req)
+                else:
+                    yf_sym = f"{req['key']}.HK" if '_hk_' in req['strat'] and not req['key'].upper().endswith('.HK') else req['key']
+                    yf_tickers.add(yf_sym)
+                    req['yf_sym'] = yf_sym
+                    if min_yf_date is None or dt_obj < min_yf_date:
+                        min_yf_date = dt_obj
+                    if max_yf_date is None or dt_obj > max_yf_date:
+                        max_yf_date = dt_obj
+
+            yf_prices = {}
+            if yf_tickers:
+                start_str = min_yf_date.strftime("%Y-%m-%d")
+                end_str = (max_yf_date + datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+                tickers_list = list(yf_tickers)
+                print(f"Batch downloading yfinance prices for {len(tickers_list)} tickers from {start_str} to {end_str}...")
+                try:
+                    import warnings
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        df_yf = yf.download(tickers_list, start=start_str, end=end_str, group_by="ticker", threads=True, progress=False)
+
+                    if len(tickers_list) == 1:
+                        sym = tickers_list[0]
+                        for idx, row in df_yf.iterrows():
+                            dt_str = idx.strftime("%Y-%m-%d")
+                            if not pd.isna(row.get('Open')):
+                                yf_prices[(sym, dt_str)] = float(row['Open'])
+                    else:
+                        for sym in tickers_list:
+                            if sym in df_yf.columns.levels[0]:
+                                df_sym = df_yf[sym]
+                                for idx, row in df_sym.iterrows():
+                                    dt_str = idx.strftime("%Y-%m-%d")
+                                    if not pd.isna(row.get('Open')):
+                                        yf_prices[(sym, dt_str)] = float(row['Open'])
+                except Exception as e:
+                    print(f"Batch yfinance download failed: {e}")
+
+            name_to_code_map = get_a_share_name_to_code_map() if a_reqs else {}
+            a_cache = {}
+
+            import pytz
+
+            def fetch_open_price(req):
+                dt_obj = datetime.datetime.strptime(req['date'][:10], "%Y-%m-%d")
+
+                # Fallback for old records that only have YYYY-MM-DD
+                if len(req['date']) <= 10:
+                    dt_full = datetime.datetime.strptime(req['date'] + " 19:00:00", "%Y-%m-%d %H:%M:%S")
+                else:
+                    dt_full = datetime.datetime.strptime(req['date'], "%Y-%m-%d %H:%M:%S")
+
+                bjt = pytz.timezone('Asia/Shanghai')
+                dt_bjt = bjt.localize(dt_full)
+
+                if '_a_' in req['strat']:
+                    fetch_key = name_to_code_map.get(req['key'], req['key'])
+                    start_dt_str = dt_obj.strftime("%Y%m%d")
+                    df = None
+                    if fetch_key in a_cache:
+                        df = a_cache[fetch_key]
+                    else:
+                        end_dt = (clock.now() + datetime.timedelta(days=7)).strftime("%Y%m%d")
                         try:
-                            df = _fetch_etf_hist(symbol=fetch_key, start_date=start_dt_str, end_date=end_dt, adjust="")
+                            df = _fetch_a_hist(symbol=fetch_key, start_date=start_dt_str, end_date=end_dt, adjust="")
                         except Exception:
                             pass
-                    a_cache[fetch_key] = df
-                    
-                if df is not None and not df.empty:
-                    # Determine next available trading date based on order time
-                    if dt_bjt.time() < datetime.time(9, 30):
-                        target_dt_str = dt_bjt.strftime("%Y%m%d")
+                        if df is None or df.empty:
+                            try:
+                                df = _fetch_etf_hist(symbol=fetch_key, start_date=start_dt_str, end_date=end_dt, adjust="")
+                            except Exception:
+                                pass
+                        a_cache[fetch_key] = df
+
+                    if df is not None and not df.empty:
+                        # Determine next available trading date based on order time
+                        if dt_bjt.time() < datetime.time(9, 30):
+                            target_dt_str = dt_bjt.strftime("%Y%m%d")
+                        else:
+                            target_dt_str = (dt_bjt + datetime.timedelta(days=1)).strftime("%Y%m%d")
+
+                        for _, row in df.iterrows():
+                            if str(row['日期']).replace('-', '') >= target_dt_str:
+                                return float(row['开盘'])
+                else:
+                    sym = req['yf_sym']
+                    if '_us_' in req['strat']:
+                        ny = pytz.timezone('America/New_York')
+                        dt_local = dt_bjt.astimezone(ny)
                     else:
-                        target_dt_str = (dt_bjt + datetime.timedelta(days=1)).strftime("%Y%m%d")
-                        
-                    for _, row in df.iterrows():
-                        if str(row['日期']).replace('-', '') >= target_dt_str:
-                            return float(row['开盘'])
-            else:
-                sym = req['yf_sym']
-                if '_us_' in req['strat']:
-                    ny = pytz.timezone('America/New_York')
-                    dt_local = dt_bjt.astimezone(ny)
-                else:
-                    hk = pytz.timezone('Asia/Hong_Kong')
-                    dt_local = dt_bjt.astimezone(hk)
-                    
-                if dt_local.time() < datetime.time(9, 30):
-                    start_date = dt_local.date()
-                else:
-                    start_date = dt_local.date() + datetime.timedelta(days=1)
-                    
-                for i in range(0, 8):
-                    test_date = (start_date + datetime.timedelta(days=i)).strftime("%Y-%m-%d")
-                    if (sym, test_date) in yf_prices:
-                        return yf_prices[(sym, test_date)]
-            return 0.0
-            
-        updated = False
-        updates = {'portfolio': {}, 'trade': {}}
-        for req in reqs:
-            price = fetch_open_price(req)
-            if price > 0:
-                if req['id'] not in updates[req['type']]:
-                    updates[req['type']][req['id']] = {}
-                updates[req['type']][req['id']][req['field']] = price
+                        hk = pytz.timezone('Asia/Hong_Kong')
+                        dt_local = dt_bjt.astimezone(hk)
 
-        for pid, data in updates['portfolio'].items():
-            if 'ep' in data:
-                cursor.execute("UPDATE portfolio SET entry_price = ? WHERE id = ?", (data['ep'], pid))
-                updated = True
-                
-        for tid, data in updates['trade'].items():
-            cursor.execute("SELECT strategy, entry_price, exit_price FROM trade_history WHERE id = ?", (tid,))
-            strat, ep, xp = cursor.fetchone()
-            ep = data.get('ep', ep)
-            xp = data.get('xp', xp)
-            
-            if ep > 0 and xp > 0:
-                fee_hk = float(os.getenv("FEE_HK", 0.002))
-                fee_a = float(os.getenv("FEE_A", 0.001))
-                fee_us = float(os.getenv("FEE_US", 0.000))
-                
-                if '_hk_' in strat: fee = fee_hk
-                elif '_a_' in strat: fee = fee_a
-                else: fee = fee_us
-                
-                pnl = (xp / ep - 1) - fee
-                cursor.execute("UPDATE trade_history SET entry_price = ?, exit_price = ?, pnl = ? WHERE id = ?", (ep, xp, pnl, tid))
-                updated = True
-            elif 'ep' in data:
-                cursor.execute("UPDATE trade_history SET entry_price = ? WHERE id = ?", (data['ep'], tid))
-                updated = True
-            elif 'xp' in data:
-                cursor.execute("UPDATE trade_history SET exit_price = ? WHERE id = ?", (data['xp'], tid))
-                updated = True
-                
-        if updated:
-            conn.commit()
-        conn.close()
+                    if dt_local.time() < datetime.time(9, 30):
+                        start_date = dt_local.date()
+                    else:
+                        start_date = dt_local.date() + datetime.timedelta(days=1)
 
+                    for i in range(0, 8):
+                        test_date = (start_date + datetime.timedelta(days=i)).strftime("%Y-%m-%d")
+                        if (sym, test_date) in yf_prices:
+                            return yf_prices[(sym, test_date)]
+                return 0.0
+
+            updated = False
+            updates = {'portfolio': {}, 'trade': {}}
+            for req in reqs:
+                price = fetch_open_price(req)
+                if price > 0:
+                    if req['id'] not in updates[req['type']]:
+                        updates[req['type']][req['id']] = {}
+                    updates[req['type']][req['id']][req['field']] = price
+
+            for pid, data in updates['portfolio'].items():
+                if 'ep' in data:
+                    cursor.execute("UPDATE portfolio SET entry_price = ? WHERE id = ?", (data['ep'], pid))
+                    updated = True
+
+            for tid, data in updates['trade'].items():
+                cursor.execute("SELECT strategy, entry_price, exit_price FROM trade_history WHERE id = ?", (tid,))
+                row = cursor.fetchone()
+                if not row:
+                    continue
+                strat, ep, xp = row
+                ep = data.get('ep', ep)
+                xp = data.get('xp', xp)
+
+                if ep > 0 and xp > 0:
+                    fee_hk = float(os.getenv("FEE_HK", 0.002))
+                    fee_a = float(os.getenv("FEE_A", 0.001))
+                    fee_us = float(os.getenv("FEE_US", 0.000))
+
+                    if '_hk_' in strat: fee = fee_hk
+                    elif '_a_' in strat: fee = fee_a
+                    else: fee = fee_us
+
+                    pnl = (xp / ep - 1) - fee
+                    cursor.execute("UPDATE trade_history SET entry_price = ?, exit_price = ?, pnl = ? WHERE id = ?", (ep, xp, pnl, tid))
+                    updated = True
+                elif 'ep' in data:
+                    cursor.execute("UPDATE trade_history SET entry_price = ? WHERE id = ?", (data['ep'], tid))
+                    updated = True
+                elif 'xp' in data:
+                    cursor.execute("UPDATE trade_history SET exit_price = ? WHERE id = ?", (data['xp'], tid))
+                    updated = True
+
+            if updated:
+                conn.commit()
+
+
+        finally:
+            conn.close()
 
     def diff_and_update(self, strategy_targets: dict, current_prices: dict, snapshot_date: str):
         """
@@ -398,7 +404,7 @@ class PortfolioManager:
                     else:
                         fee = fee_us
 
-                    raw_pnl = (cp / ep - 1) - fee if ep > 0 else 0
+                    raw_pnl = (cp / ep - 1) - fee if (ep is not None and ep > 0) else 0
                     pnl = raw_pnl
 
                     # Fetch adjusted prices for accurate returns while preserving exact execution prices

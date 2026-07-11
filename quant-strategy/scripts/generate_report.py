@@ -533,10 +533,12 @@ def main():
             import sqlite3
             from core.cash_manager import get_db_path
             conn = sqlite3.connect(get_db_path())
-            c = conn.cursor()
-            c.execute("SELECT strategy_id, total_capital, available_cash FROM strategy_accounts ORDER BY strategy_id")
-            rows = c.fetchall()
-            conn.close()
+            try:
+                c = conn.cursor()
+                c.execute("SELECT strategy_id, total_capital, available_cash FROM strategy_accounts ORDER BY strategy_id")
+                rows = c.fetchall()
+            finally:
+                conn.close()
             if not rows: return ""
             
             md = "## 🏦 全球多策略子基金台账概览 (Sandbox Benchmark Engine)\n\n"
@@ -556,10 +558,12 @@ def main():
             import sqlite3
             from core.cash_manager import get_db_path
             conn = sqlite3.connect(get_db_path())
-            c = conn.cursor()
-            c.execute("SELECT strategy_id, total_capital, available_cash FROM strategy_accounts ORDER BY strategy_id")
-            rows = c.fetchall()
-            conn.close()
+            try:
+                c = conn.cursor()
+                c.execute("SELECT strategy_id, total_capital, available_cash FROM strategy_accounts ORDER BY strategy_id")
+                rows = c.fetchall()
+            finally:
+                conn.close()
             if not rows: return ""
             
             html = "<h2>🏦 全球多策略子基金台账概览 (Sandbox Benchmark Engine)</h2>\n"

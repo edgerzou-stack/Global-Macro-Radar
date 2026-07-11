@@ -118,10 +118,18 @@ def init_db():
     conn.commit()
     return conn
 
+import threading
+_DB_INITIALIZED = False
+_db_lock = threading.Lock()
+
 def get_connection():
+    global _DB_INITIALIZED
+    with _db_lock:
+        if not _DB_INITIALIZED:
+            conn = init_db()
+            _DB_INITIALIZED = True
+            return conn
     db_path = get_db_path()
-    if not os.path.exists(db_path):
-        init_db()
     return sqlite3.connect(db_path, timeout=30.0)
 
 def load_portfolio_and_trades():
@@ -156,8 +164,8 @@ def update_portfolio(portfolio_dict):
     c.execute("DELETE FROM portfolio")
     for strat, holdings in portfolio_dict.items():
         for key, info in holdings.items():
-            c.execute("INSERT INTO portfolio (strategy, name_or_code, entry_date, entry_price) VALUES (?, ?, ?, ?)",
-                      (strat, key, info.get("entry_date"), info.get("entry_price", 0)))
+            c.execute("INSERT INTO portfolio (strategy, name_or_code, entry_date, entry_price, shares) VALUES (?, ?, ?, ?, ?)",
+                      (strat, key, info.get("entry_date"), info.get("entry_price", 0), info.get("shares", 1)))
     conn.commit()
     conn.close()
 

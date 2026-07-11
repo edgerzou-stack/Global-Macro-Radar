@@ -5,6 +5,7 @@ import subprocess
 import sys
 import os
 import logging
+from core.clock import clock
 
 # === Path Configuration ===
 HOME = os.path.expanduser("~")
@@ -37,7 +38,7 @@ def main():
         import shutil
         backup_dir = os.path.join(PROJECT_DIR, "backups")
         os.makedirs(backup_dir, exist_ok=True)
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = clock.now().strftime("%Y%m%d_%H%M%S")
         backup_path = os.path.join(backup_dir, f"quant_system_{timestamp}.db")
         try:
             shutil.copy2(db_path, backup_path)
@@ -47,7 +48,7 @@ def main():
             sys.exit(1) # Abort if backup fails
             
     # 1. Check if today is a trading day
-    today = datetime.date.today()
+    today = clock.today().date()
     try:
         if os.environ.get("FORCE_RUN") == "1":
             logger.info("FORCE_RUN=1 detected. Bypassing trading day check.")

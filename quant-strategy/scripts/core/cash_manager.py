@@ -65,8 +65,7 @@ class CashManager:
             conn.close()
 
     def get_tranche_size(self, strategy_id: str, cursor=None) -> float:
-        total, _ = self.get_balance(strategy_id, cursor=cursor)
-        return total * self.TRANCHE_RATIO
+        return self.INITIAL_CAPITAL * self.TRANCHE_RATIO
 
     def allocate(self, strategy_id: str, cursor=None) -> bool:
         """
@@ -75,7 +74,7 @@ class CashManager:
         If 'cursor' is provided, runs inside that external transaction (no auto-commit).
         """
         total, available = self.get_balance(strategy_id, cursor=cursor)
-        tranche = total * self.TRANCHE_RATIO
+        tranche = self.INITIAL_CAPITAL * self.TRANCHE_RATIO
         
         if available >= tranche:
             c = cursor
@@ -106,8 +105,8 @@ class CashManager:
         pnl_pct is e.g. 0.10 for +10% or -0.25 for -25%.
         If cursor is provided, runs inside that external transaction (no auto-commit).
         '''
-        total, _ = self.get_balance(strategy_id, cursor=cursor)
-        tranche = total * self.TRANCHE_RATIO
+        # Fix P0-05: Use fixed INITIAL_CAPITAL for consistent tranche sizing, preventing compounding recursion errors.
+        tranche = self.INITIAL_CAPITAL * self.TRANCHE_RATIO
         invested_capital = tranche * tranches_held
         returned_capital = invested_capital * (1 + pnl_pct)
         

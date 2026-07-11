@@ -2,15 +2,21 @@ import akshare as ak
 import pandas as pd
 import json
 
+import threading
+from core.clock import clock
+
 _SPOT_CACHE = None
+_SPOT_LOCK = threading.Lock()
 
 def get_spot_cache():
     global _SPOT_CACHE
     if _SPOT_CACHE is None:
-        try:
-            _SPOT_CACHE = ak.stock_zh_a_spot_em()
-        except Exception:
-            _SPOT_CACHE = pd.DataFrame()
+        with _SPOT_LOCK:
+            if _SPOT_CACHE is None:
+                try:
+                    _SPOT_CACHE = ak.stock_zh_a_spot_em()
+                except Exception:
+                    _SPOT_CACHE = pd.DataFrame()
     return _SPOT_CACHE
 
 def diagnose_elimination(code: str, strategy: str) -> str:
@@ -57,8 +63,7 @@ def diagnose_elimination(code: str, strategy: str) -> str:
         elif "growth" in strategy:
             try:
                 from screen_a_share import load_dynamic_cagr_table
-                import datetime
-                cagr_table = load_dynamic_cagr_table(datetime.date.today(), [code])
+                cagr_table = load_dynamic_cagr_table(clock.today().date(), [code])
                 if not cagr_table.empty:
                     cagr_row = cagr_table.iloc[0]
                     cagr = pd.to_numeric(cagr_row.get("3年净利润CAGR", 0), errors="coerce")

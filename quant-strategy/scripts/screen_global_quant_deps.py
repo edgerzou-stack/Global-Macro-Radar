@@ -69,7 +69,8 @@ def get_current_prices_for_portfolio(all_portfolio, a_prices):
             import pandas as pd
             import pytz
             from datetime import datetime, timedelta
-            now = datetime.now(pytz.utc)
+            from core.clock import clock
+            now = clock.now().astimezone(pytz.utc)
             start_date = now - timedelta(days=7)
             data = yf.download(us_hk_codes, start=start_date.strftime("%Y-%m-%d"), progress=False)
             if not data.empty and "Close" in data:

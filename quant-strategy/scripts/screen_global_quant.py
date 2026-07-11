@@ -303,16 +303,18 @@ Please return the selected top candidates (maximum 10) as a JSON array of their 
     try:
         conn = db_utils.get_connection()
         c = conn.cursor()
-        for strat in STRATEGIES:
-            if results.get(strat):
-                strat_payload = {
-                    "results": results[strat],
-                    "diff": diff.get(strat, {})
-                }
-                c.execute("INSERT INTO strategy_daily_results (result_date, strategy, result_json) VALUES (?, ?, ?)",
-                          (snapshot_date, strat, json.dumps(strat_payload, ensure_ascii=False)))
-        conn.commit()
-        conn.close()
+        try:
+            for strat in STRATEGIES:
+                if results.get(strat):
+                    strat_payload = {
+                        "results": results[strat],
+                        "diff": diff.get(strat, {})
+                    }
+                    c.execute("INSERT INTO strategy_daily_results (result_date, strategy, result_json) VALUES (?, ?, ?)",
+                              (snapshot_date, strat, json.dumps(strat_payload, ensure_ascii=False)))
+            conn.commit()
+        finally:
+            conn.close()
     except Exception as e:
         print(f"Warning: Failed to save to strategy_daily_results table: {e}")
         
