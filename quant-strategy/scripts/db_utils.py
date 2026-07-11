@@ -115,6 +115,18 @@ def init_db():
         c.execute('PRAGMA user_version = 4;')
         version = 4
         
+    if version < 5:
+        # Add Anti-Delete trigger for trade_history
+        c.execute('''
+            CREATE TRIGGER IF NOT EXISTS prevent_trade_history_delete
+            BEFORE DELETE ON trade_history
+            BEGIN
+                SELECT RAISE(ABORT, 'CRITICAL: Deletion from trade_history is strictly forbidden to prevent data loss!');
+            END;
+        ''')
+        c.execute('PRAGMA user_version = 5;')
+        version = 5
+        
     conn.commit()
     return conn
 
@@ -191,6 +203,13 @@ def append_trades(trades_list):
     conn.close()
 
 def update_portfolio_and_trades(portfolio_dict, trades_list, snapshot_date=None, cursor=None):
+    # Trigger auto-backup before significant changes
+    try:
+        from core.db_manager import DBManager
+        DBManager().backup(prefix="pre_update_snapshot")
+    except Exception as e:
+        print(f"Warning: Auto-backup failed before update: {e}")
+        
     if cursor is not None:
         c = cursor
         _execute_portfolio_updates(c, portfolio_dict, trades_list, snapshot_date)

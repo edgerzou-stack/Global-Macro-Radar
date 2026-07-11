@@ -120,6 +120,7 @@ class DataGateway:
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, to_insert)
                 conn.commit()
+            conn.close()
 
     @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=1, max=4))
     def _fetch_from_yfinance(self, symbol: str, start_date: str, end_date: str, adjust: str = "") -> pd.DataFrame:
