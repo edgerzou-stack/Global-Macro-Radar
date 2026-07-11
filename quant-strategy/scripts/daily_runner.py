@@ -48,7 +48,7 @@ def main():
             sys.exit(1) # Abort if backup fails
             
     # 1. Check if today is a trading day
-    today = clock.today().date()
+    today = clock.today()
     try:
         if os.environ.get("FORCE_RUN") == "1":
             logger.info("FORCE_RUN=1 detected. Bypassing trading day check.")

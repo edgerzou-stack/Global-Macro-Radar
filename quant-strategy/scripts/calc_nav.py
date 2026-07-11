@@ -5,13 +5,15 @@ import yfinance as yf
 import db_utils
 from core.cash_manager import CashManager
 from core.clock import clock
-from core.portfolio import _fetch_a_hist
+from core.data_gateway import DataGateway
 import datetime
+
+data_gateway = DataGateway()
 
 def calc_nav():
     old_portfolio, _ = db_utils.load_portfolio_and_trades()
-    cash_mgr = CashManager()
-    conn = cash_mgr.get_connection()
+    
+    conn = db_utils.get_connection()
     
     today = clock.today()
     
@@ -30,30 +32,9 @@ def calc_nav():
                 
                 # Fetch latest price
                 cp = 0.0
+                key_fetch = f"{key}.HK" if '_hk_' in strat and not key.upper().endswith('.HK') else key
                 try:
-                    if '_a_' in strat:
-                        today_str = today.strftime('%Y%m%d')
-                        df = _fetch_a_hist(symbol=key, start_date=today_str, end_date=today_str, adjust="")
-                        if not df.empty:
-                            cp = float(df.iloc[-1]['收盘'])
-                        else:
-                            # fallback yf
-                            if str(key).startswith('6'):
-                                yf_sym = f"{key}.SS"
-                            elif str(key).startswith('8') or str(key).startswith('4'):
-                                yf_sym = f"{key}.BJ"
-                            else:
-                                yf_sym = f"{key}.SZ"
-                            ticker = yf.Ticker(yf_sym)
-                            df_yf = ticker.history(period="1d")
-                            if not df_yf.empty:
-                                cp = float(df_yf.iloc[-1]['Close'])
-                    else:
-                        yf_sym = f"{key}.HK" if '_hk_' in strat and not key.upper().endswith('.HK') else key
-                        ticker = yf.Ticker(yf_sym)
-                        df_yf = ticker.history(period="1d")
-                        if not df_yf.empty:
-                            cp = float(df_yf.iloc[-1]['Close'])
+                    cp = data_gateway.get_current_price(key_fetch)
                 except Exception as e:
                     print(f"Failed to fetch current price for {key} in {strat} during NAV calculation: {e}")
                 

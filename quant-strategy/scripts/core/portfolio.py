@@ -8,21 +8,8 @@ from core.clock import clock
 from tenacity import retry, stop_after_attempt, wait_exponential
 from core.ttl_cache import ttl_cache
 
-@ttl_cache(ttl_seconds=600)
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def _fetch_a_hist(*args, **kwargs):
-    return ak.stock_zh_a_hist(*args, **kwargs)
-
-@ttl_cache(ttl_seconds=600)
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def _fetch_etf_hist(*args, **kwargs):
-    return ak.fund_etf_hist_em(*args, **kwargs)
-
-@ttl_cache(ttl_seconds=600)
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def _fetch_yf_hist(ticker_str, start, end, auto_adjust):
-    ticker = yf.Ticker(ticker_str)
-    return ticker.history(start=start, end=end, auto_adjust=auto_adjust)
+from core.data_gateway import DataGateway
+data_gateway = DataGateway()
 
 class PortfolioManager:
     def __init__(self, db_utils_module):
@@ -128,61 +115,9 @@ class PortfolioManager:
                 if row[6] <= 0.0:
                     reqs.append({'type': 'trade', 'id': row[0], 'strat': row[1], 'key': row[2], 'date': row[5], 'field': 'xp'})
 
-            yf_tickers = set()
-            min_yf_date = None
-            max_yf_date = None
-            a_reqs = []
-
-            for req in reqs:
-                dt_obj = datetime.datetime.strptime(req['date'][:10], "%Y-%m-%d")
-                if '_a_' in req['strat']:
-                    a_reqs.append(req)
-                else:
-                    yf_sym = f"{req['key']}.HK" if '_hk_' in req['strat'] and not req['key'].upper().endswith('.HK') else req['key']
-                    yf_tickers.add(yf_sym)
-                    req['yf_sym'] = yf_sym
-                    if min_yf_date is None or dt_obj < min_yf_date:
-                        min_yf_date = dt_obj
-                    if max_yf_date is None or dt_obj > max_yf_date:
-                        max_yf_date = dt_obj
-
-            yf_prices = {}
-            if yf_tickers:
-                start_str = min_yf_date.strftime("%Y-%m-%d")
-                end_str = (max_yf_date + datetime.timedelta(days=7)).strftime("%Y-%m-%d")
-                tickers_list = list(yf_tickers)
-                print(f"Batch downloading yfinance prices for {len(tickers_list)} tickers from {start_str} to {end_str}...")
-                try:
-                    import warnings
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        df_yf = yf.download(tickers_list, start=start_str, end=end_str, group_by="ticker", threads=True, progress=False)
-
-                    if len(tickers_list) == 1:
-                        sym = tickers_list[0]
-                        for idx, row in df_yf.iterrows():
-                            dt_str = idx.strftime("%Y-%m-%d")
-                            if not pd.isna(row.get('Open')):
-                                yf_prices[(sym, dt_str)] = float(row['Open'])
-                    else:
-                        for sym in tickers_list:
-                            if sym in df_yf.columns.levels[0]:
-                                df_sym = df_yf[sym]
-                                for idx, row in df_sym.iterrows():
-                                    dt_str = idx.strftime("%Y-%m-%d")
-                                    if not pd.isna(row.get('Open')):
-                                        yf_prices[(sym, dt_str)] = float(row['Open'])
-                except Exception as e:
-                    print(f"Batch yfinance download failed: {e}")
-
-            name_to_code_map = get_a_share_name_to_code_map() if a_reqs else {}
-            a_cache = {}
-
             import pytz
 
             def fetch_open_price(req):
-                dt_obj = datetime.datetime.strptime(req['date'][:10], "%Y-%m-%d")
-
                 # Fallback for old records that only have YYYY-MM-DD
                 if len(req['date']) <= 10:
                     dt_full = datetime.datetime.strptime(req['date'] + " 19:00:00", "%Y-%m-%d %H:%M:%S")
@@ -191,55 +126,35 @@ class PortfolioManager:
 
                 bjt = pytz.timezone('Asia/Shanghai')
                 dt_bjt = bjt.localize(dt_full)
-
-                if '_a_' in req['strat']:
-                    fetch_key = name_to_code_map.get(req['key'], req['key'])
-                    start_dt_str = dt_obj.strftime("%Y%m%d")
-                    df = None
-                    if fetch_key in a_cache:
-                        df = a_cache[fetch_key]
-                    else:
-                        end_dt = (clock.now() + datetime.timedelta(days=7)).strftime("%Y%m%d")
-                        try:
-                            df = _fetch_a_hist(symbol=fetch_key, start_date=start_dt_str, end_date=end_dt, adjust="")
-                        except Exception:
-                            pass
-                        if df is None or df.empty:
-                            try:
-                                df = _fetch_etf_hist(symbol=fetch_key, start_date=start_dt_str, end_date=end_dt, adjust="")
-                            except Exception:
-                                pass
-                        a_cache[fetch_key] = df
-
-                    if df is not None and not df.empty:
-                        # Determine next available trading date based on order time
-                        if dt_bjt.time() < datetime.time(9, 30):
-                            target_dt_str = dt_bjt.strftime("%Y%m%d")
-                        else:
-                            target_dt_str = (dt_bjt + datetime.timedelta(days=1)).strftime("%Y%m%d")
-
-                        for _, row in df.iterrows():
-                            if str(row['日期']).replace('-', '') >= target_dt_str:
-                                return float(row['开盘'])
+                
+                # Determine next available trading date based on order time
+                # If ordered before 9:30 AM local market time, it's today. Otherwise, next day.
+                if '_us_' in req['strat']:
+                    local_tz = pytz.timezone('America/New_York')
+                elif '_hk_' in req['strat']:
+                    local_tz = pytz.timezone('Asia/Hong_Kong')
                 else:
-                    sym = req['yf_sym']
-                    if '_us_' in req['strat']:
-                        ny = pytz.timezone('America/New_York')
-                        dt_local = dt_bjt.astimezone(ny)
-                    else:
-                        hk = pytz.timezone('Asia/Hong_Kong')
-                        dt_local = dt_bjt.astimezone(hk)
-
-                    if dt_local.time() < datetime.time(9, 30):
-                        start_date = dt_local.date()
-                    else:
-                        start_date = dt_local.date() + datetime.timedelta(days=1)
-
-                    for i in range(0, 8):
-                        test_date = (start_date + datetime.timedelta(days=i)).strftime("%Y-%m-%d")
-                        if (sym, test_date) in yf_prices:
-                            return yf_prices[(sym, test_date)]
-                return 0.0
+                    local_tz = bjt
+                    
+                dt_local = dt_bjt.astimezone(local_tz)
+                
+                if dt_local.time() < datetime.time(9, 30):
+                    target_date = dt_local.date()
+                else:
+                    target_date = dt_local.date() + datetime.timedelta(days=1)
+                    
+                target_dt_str = target_date.strftime("%Y%m%d")
+                
+                key = req['key']
+                if '_hk_' in req['strat'] and not key.upper().endswith('.HK'):
+                    key = f"{key}.HK"
+                    
+                try:
+                    return data_gateway.get_open_price(key, target_dt_str)
+                except Exception as e:
+                    import logging
+                    logging.error(f"Failed to resolve pending price for {key}: {e}")
+                    return 0.0
 
             updated = False
             updates = {'portfolio': {}, 'trade': {}}
@@ -409,15 +324,15 @@ class PortfolioManager:
 
                     # Fetch adjusted prices for accurate returns while preserving exact execution prices
                     try:
-                        if '_a_' in strat and ep > 0:
-                            df_adj = pd.DataFrame()
-                            df_unadj = pd.DataFrame()
-                            try:
-                                df_adj = _fetch_a_hist(symbol=key, start_date=entry_date.replace('-','')[:8], end_date=snapshot_date.replace('-','')[:8], adjust="hfq")
-                                df_unadj = _fetch_a_hist(symbol=key, start_date=entry_date.replace('-','')[:8], end_date=snapshot_date.replace('-','')[:8], adjust="")
-                            except Exception as fetch_err:
-                                print(f"akshare fetch failed for {key}: {fetch_err}, trying yfinance fallback.")
-
+                        if ep > 0:
+                            start_date = entry_date.replace('-','')[:8]
+                            end_date = snapshot_date.replace('-','')[:8]
+                            
+                            key_fetch = f"{key}.HK" if '_hk_' in strat and not key.upper().endswith('.HK') else key
+                                
+                            df_adj = data_gateway.get_historical_prices(key_fetch, start_date, end_date, adjust="hfq")
+                            df_unadj = data_gateway.get_historical_prices(key_fetch, start_date, end_date, adjust="")
+                            
                             if not df_adj.empty and not df_unadj.empty and len(df_adj) >= 2 and len(df_unadj) >= 2:
                                 factor_entry = float(df_adj.iloc[0]['收盘']) / float(df_unadj.iloc[0]['收盘'])
                                 factor_exit = float(df_adj.iloc[-1]['收盘']) / float(df_unadj.iloc[-1]['收盘'])
@@ -425,36 +340,7 @@ class PortfolioManager:
                                 true_adj_cp = cp * factor_exit
                                 pnl = (true_adj_cp / true_adj_ep - 1) - fee
                             else:
-                                if str(key).startswith('6'):
-                                    yf_sym = f"{key}.SS"
-                                elif str(key).startswith('8') or str(key).startswith('4'):
-                                    yf_sym = f"{key}.BJ"
-                                else:
-                                    yf_sym = f"{key}.SZ"
-                                end_dt = datetime.datetime.strptime(snapshot_date[:10], "%Y-%m-%d") + datetime.timedelta(days=1)
-                                df_yf_adj = _fetch_yf_hist(yf_sym, start=entry_date[:10], end=end_dt.strftime("%Y-%m-%d"), auto_adjust=True)
-                                df_yf_unadj = _fetch_yf_hist(yf_sym, start=entry_date[:10], end=end_dt.strftime("%Y-%m-%d"), auto_adjust=False)
-                                if not df_yf_adj.empty and not df_yf_unadj.empty and len(df_yf_adj) >= 2 and len(df_yf_unadj) >= 2:
-                                    factor_entry = float(df_yf_adj.iloc[0]['Close']) / float(df_yf_unadj.iloc[0]['Close'])
-                                    factor_exit = float(df_yf_adj.iloc[-1]['Close']) / float(df_yf_unadj.iloc[-1]['Close'])
-                                    true_adj_ep = ep * factor_entry
-                                    true_adj_cp = cp * factor_exit
-                                    pnl = (true_adj_cp / true_adj_ep - 1) - fee
-                                else:
-                                    raise ValueError(f"CRITICAL: Failed to fetch adjusted prices for A-share {key}. Aborting.")
-                        elif ('_hk_' in strat or '_us_' in strat) and ep > 0:
-                            yf_sym = f"{key}.HK" if '_hk_' in strat and not key.upper().endswith('.HK') else key
-                            end_dt = datetime.datetime.strptime(snapshot_date[:10], "%Y-%m-%d") + datetime.timedelta(days=1)
-                            df_yf_adj = _fetch_yf_hist(yf_sym, start=entry_date[:10], end=end_dt.strftime("%Y-%m-%d"), auto_adjust=True)
-                            df_yf_unadj = _fetch_yf_hist(yf_sym, start=entry_date[:10], end=end_dt.strftime("%Y-%m-%d"), auto_adjust=False)
-                            if not df_yf_adj.empty and not df_yf_unadj.empty and len(df_yf_adj) >= 2 and len(df_yf_unadj) >= 2:
-                                factor_entry = float(df_yf_adj.iloc[0]['Close']) / float(df_yf_unadj.iloc[0]['Close'])
-                                factor_exit = float(df_yf_adj.iloc[-1]['Close']) / float(df_yf_unadj.iloc[-1]['Close'])
-                                true_adj_ep = ep * factor_entry
-                                true_adj_cp = cp * factor_exit
-                                pnl = (true_adj_cp / true_adj_ep - 1) - fee
-                            else:
-                                raise ValueError(f"CRITICAL: Failed to fetch adjusted prices for {key} from yfinance. Aborting.")
+                                raise ValueError(f"CRITICAL: Failed to fetch adjusted prices for {key}. Aborting.")
                     except Exception as e:
                         raise ValueError(f"CRITICAL: Data fetching failed for {key}: {e}. Aborting.")
 
