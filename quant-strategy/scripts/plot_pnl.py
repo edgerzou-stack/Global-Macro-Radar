@@ -74,7 +74,8 @@ def plot_strategy(strat_id, name, trades, output_file, color, artifact_dir, nav_
         cum_pnl_val = df['nav_pct'].iloc[-1] if not df.empty else 0.0
     else:
         ts = build_timeseries_pnl(trades)
-        cum_pnl_val = sum([t["pnl"] * 100 for t in trades])
+        from functools import reduce
+        cum_pnl_val = (reduce(lambda acc, t: acc * (1 + t["pnl"]), trades, 1.0) - 1) * 100
     
     fig, (ax_table, ax_curve) = plt.subplots(1, 2, figsize=(12, 5), gridspec_kw={'width_ratios': [1, 2.5]})
     
@@ -101,7 +102,7 @@ def plot_strategy(strat_id, name, trades, output_file, color, artifact_dir, nav_
     
     cell_text = [[f"{total}", f"{cum_pnl_val:+.2f}%"]]
     row_labels = [name]
-    col_labels = ['总交易(笔)', '总净收益(%)']
+    col_labels = ['已平仓总数(笔)', '当前全局净值收益(%)']
     
     table = ax_table.table(cellText=cell_text,
                            rowLabels=row_labels,
@@ -154,7 +155,8 @@ def plot_all(strategy_trades, output_file, strat_colors, artifact_dir, all_nav_r
         for strat, trades in strategy_trades.items():
             if strat not in STRAT_NAMES:
                 continue
-            cum_pnl = sum([t["pnl"] * 100 for t in trades])
+            from functools import reduce
+            cum_pnl = (reduce(lambda acc, t: acc * (1 + t["pnl"]), trades, 1.0) - 1) * 100
             strat_metrics.append({"strat": strat, "cum_pnl": cum_pnl, "total": len(trades), "trades": trades})
             
     strat_metrics.sort(key=lambda x: x["cum_pnl"], reverse=True)
@@ -205,7 +207,7 @@ def plot_all(strategy_trades, output_file, strat_colors, artifact_dir, all_nav_r
     ax_table.set_title('综合指标统计', fontsize=14, pad=20)
     
     if cell_text:
-        col_labels = ['总交易(笔)', '总净收益(%)']
+        col_labels = ['已平仓总数(笔)', '当前全局净值收益(%)']
         table = ax_table.table(cellText=cell_text, rowLabels=row_labels, rowColours=row_colors, colLabels=col_labels, loc='center', cellLoc='center')
         table.auto_set_font_size(False)
         table.set_fontsize(10)
@@ -275,14 +277,13 @@ def main():
     import db_utils
     
     _, trade_history = db_utils.load_portfolio_and_trades()
-    if not trade_history:
-        print("No trade history available to plot.")
-        return
-        
-    valid_trades = [t for t in trade_history if "exit_date" in t and "pnl" in t]
+    
+    valid_trades = []
+    if trade_history:
+        valid_trades = [t for t in trade_history if "exit_date" in t and "pnl" in t]
+    
     if not valid_trades:
-        print("No valid completed trades found.")
-        return
+        print("No valid completed trades found for individual trade plotting.")
         
     strategy_trades = defaultdict(list)
     for t in valid_trades:

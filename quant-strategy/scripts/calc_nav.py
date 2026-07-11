@@ -33,12 +33,17 @@ def calc_nav():
                 try:
                     if '_a_' in strat:
                         today_str = today.strftime('%Y%m%d')
-                        df = _fetch_a_hist(symbol=key, start_date=today_str, end_date=today_str)
+                        df = _fetch_a_hist(symbol=key, start_date=today_str, end_date=today_str, adjust="")
                         if not df.empty:
                             cp = float(df.iloc[-1]['收盘'])
                         else:
                             # fallback yf
-                            yf_sym = f"{key}.SS" if str(key).startswith('6') else f"{key}.SZ"
+                            if str(key).startswith('6'):
+                                yf_sym = f"{key}.SS"
+                            elif str(key).startswith('8') or str(key).startswith('4'):
+                                yf_sym = f"{key}.BJ"
+                            else:
+                                yf_sym = f"{key}.SZ"
                             ticker = yf.Ticker(yf_sym)
                             df_yf = ticker.history(period="1d")
                             if not df_yf.empty:
@@ -57,10 +62,10 @@ def calc_nav():
                     
                 # Calculate value
                 # Note: 'shares' is number of tranches. We use (ep * tranche_size * shares) to find invested amount?
-                # Actually, virtual position size is CashManager.TRANCHE_RATIO * INITIAL_CAPITAL = 33000.
-                # Total invested capital = 33000 * shares
-                # Current value = (cp / ep) * Total invested capital
-                invested_capital = 1000000.0 * 0.033 * shares
+                # Actually, virtual position size is CashManager.TRANCHE_RATIO * INITIAL_CAPITAL.
+                # Total invested capital = Tranche Size * shares
+                cash_mgr_inst = CashManager()
+                invested_capital = cash_mgr_inst.INITIAL_CAPITAL * cash_mgr_inst.TRANCHE_RATIO * shares
                 current_value = (cp / ep) * invested_capital if ep > 0 else invested_capital
                 holdings_value += current_value
                 

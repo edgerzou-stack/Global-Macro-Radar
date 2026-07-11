@@ -360,8 +360,9 @@ def generate_subsection_md(strategy_id, results, headers, diff, trade_history, b
     if strat_trades:
         out += "**历史平仓交割单明细**\n\n"
         out += render_history_md(strategy_id, trade_history, code_map)
-        out += "**资金净值曲线图**\n\n"
-        out += get_chart_md(f"pnl_chart_{strategy_id}.png", base_dir)
+        
+    out += "**资金净值曲线图**\n\n"
+    out += get_chart_md(f"pnl_chart_{strategy_id}.png", base_dir)
     return out
 
 def generate_subsection_html(strategy_id, results, headers, diff, trade_history, base_dir, llm_review="", code_map=None):
@@ -426,8 +427,9 @@ def generate_subsection_html(strategy_id, results, headers, diff, trade_history,
     if strat_trades:
         html += "<h4>历史平仓交割单明细</h4>\n"
         html += render_history_html(strategy_id, trade_history, code_map)
-        html += "<h4>资金净值曲线图</h4>\n"
-        html += get_chart_html(f"pnl_chart_{strategy_id}.png", base_dir)
+        
+    html += "<h4>资金净值曲线图</h4>\n"
+    html += get_chart_html(f"pnl_chart_{strategy_id}.png", base_dir)
     return html
 
 def main():
@@ -442,7 +444,7 @@ def main():
     
     import db_utils
     
-    _, trade_history = db_utils.load_portfolio_and_trades()
+    portfolio, trade_history = db_utils.load_portfolio_and_trades()
     payload = db_utils.load_latest_daily_results()
     if not payload:
         print("No daily_results found in strategy_daily_results table")
@@ -450,6 +452,35 @@ def main():
         
     results = payload.get("results", {})
     diff = payload.get("diff", {})
+    
+    # --- Reconcile JSON payload with true SQLite DB state ---
+    snapshot_date = payload.get("snapshot_date", "1970-01-01")[:10]
+    
+    for strat, items in diff.items():
+        if "added" in items:
+            for item in items["added"]:
+                if isinstance(item, dict):
+                    code = str(item.get("name"))
+                    if strat in portfolio and code in portfolio[strat]:
+                        item["entry_price"] = portfolio[strat][code].get("entry_price", 0)
+        if "removed" in items:
+            for item in items["removed"]:
+                if isinstance(item, dict):
+                    code = str(item.get("name"))
+                    for t in reversed(trade_history):
+                        if t["strategy"] == strat and str(t["name"]) == code and str(t["exit_date"]).startswith(snapshot_date):
+                            item["entry_price"] = t["entry_price"]
+                            item["exit_price"] = t["exit_price"]
+                            item["pnl"] = t["pnl"]
+                            break
+                            
+    for strat, items in results.items():
+        if not items: continue
+        for item in items:
+            code = str(item.get("股票代码"))
+            if strat in portfolio and code in portfolio[strat]:
+                item["入选价格"] = portfolio[strat][code].get("entry_price", 0)
+    # --- End Reconciliation ---
 
     for strat, items in results.items():
         if not items:

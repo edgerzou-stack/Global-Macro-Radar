@@ -11,85 +11,110 @@ def init_db():
     conn = sqlite3.connect(get_db_path(), timeout=30.0)
     c = conn.cursor()
     c.execute('PRAGMA journal_mode=WAL;')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS portfolio (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            strategy TEXT NOT NULL,
-            name_or_code TEXT NOT NULL,
-            entry_date TEXT,
-            entry_price REAL,
-            weight REAL DEFAULT 0.0,
-            shares INTEGER DEFAULT 0,
-            UNIQUE(strategy, name_or_code)
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS trade_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            strategy TEXT NOT NULL,
-            name_or_code TEXT NOT NULL,
-            entry_date TEXT,
-            entry_price REAL,
-            exit_date TEXT,
-            exit_price REAL,
-            pnl REAL,
-            reason TEXT,
-            weight REAL DEFAULT 0.0,
-            shares INTEGER DEFAULT 0
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS meta_data (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    ''')
-    # P2.17 & P3.24: 新增 portfolio_snapshots 和 daily_results 拆分表
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS portfolio_snapshots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            snapshot_date TEXT NOT NULL,
-            strategy TEXT NOT NULL,
-            name_or_code TEXT NOT NULL,
-            weight REAL DEFAULT 0.0
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS strategy_daily_results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            result_date TEXT NOT NULL,
-            strategy TEXT NOT NULL,
-            result_json TEXT
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS strategy_accounts (
-            strategy_id TEXT PRIMARY KEY,
-            total_capital REAL,
-            available_cash REAL
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS strategy_nav_history (
-            date TEXT,
-            strategy_id TEXT,
-            nav REAL,
-            cash REAL,
-            holdings_value REAL,
-            PRIMARY KEY(date, strategy_id)
-        )
-    ''')
-    # 尝试更新旧表结构，添加缺少的列 (sqlite 允许 ADD COLUMN)
-    try:
-        c.execute("ALTER TABLE portfolio ADD COLUMN weight REAL DEFAULT 0.0")
-        c.execute("ALTER TABLE portfolio ADD COLUMN shares INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass # Column exists
-    try:
-        c.execute("ALTER TABLE trade_history ADD COLUMN weight REAL DEFAULT 0.0")
-        c.execute("ALTER TABLE trade_history ADD COLUMN shares INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass # Column exists
+    
+    # Get current schema version
+    c.execute('PRAGMA user_version;')
+    version = c.fetchone()[0]
+    
+    if version < 1:
+        # Base schemas
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS portfolio (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                strategy TEXT NOT NULL,
+                name_or_code TEXT NOT NULL,
+                entry_date TEXT,
+                entry_price REAL,
+                UNIQUE(strategy, name_or_code)
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS trade_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                strategy TEXT NOT NULL,
+                name_or_code TEXT NOT NULL,
+                entry_date TEXT,
+                entry_price REAL,
+                exit_date TEXT,
+                exit_price REAL,
+                pnl REAL,
+                reason TEXT
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS meta_data (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        ''')
+        c.execute('PRAGMA user_version = 1;')
+        version = 1
+        
+    if version < 2:
+        # Add tracking tables
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_date TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                name_or_code TEXT NOT NULL,
+                weight REAL DEFAULT 0.0
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS strategy_daily_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                result_date TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                result_json TEXT
+            )
+        ''')
+        c.execute('PRAGMA user_version = 2;')
+        version = 2
+        
+    if version < 3:
+        # Add accounting tables
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS strategy_accounts (
+                strategy_id TEXT PRIMARY KEY,
+                total_capital REAL,
+                available_cash REAL
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS strategy_nav_history (
+                date TEXT,
+                strategy_id TEXT,
+                nav REAL,
+                cash REAL,
+                holdings_value REAL,
+                PRIMARY KEY(date, strategy_id)
+            )
+        ''')
+        c.execute('PRAGMA user_version = 3;')
+        version = 3
+        
+    if version < 4:
+        # Add weight and shares columns
+        try:
+            c.execute("ALTER TABLE portfolio ADD COLUMN weight REAL DEFAULT 0.0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            c.execute("ALTER TABLE portfolio ADD COLUMN shares INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            c.execute("ALTER TABLE trade_history ADD COLUMN weight REAL DEFAULT 0.0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            c.execute("ALTER TABLE trade_history ADD COLUMN shares INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        c.execute('PRAGMA user_version = 4;')
+        version = 4
+        
     conn.commit()
     return conn
 
@@ -155,48 +180,64 @@ def append_trades(trades_list):
     conn.commit()
     conn.close()
 
-def update_portfolio_and_trades(portfolio_dict, trades_list, snapshot_date=None):
-    conn = get_connection()
-    c = conn.cursor()
-    try:
-        c.execute("BEGIN TRANSACTION")
+def update_portfolio_and_trades(portfolio_dict, trades_list, snapshot_date=None, cursor=None):
+    if cursor is not None:
+        c = cursor
+        _execute_portfolio_updates(c, portfolio_dict, trades_list, snapshot_date)
+    else:
+        conn = get_connection()
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN TRANSACTION")
+            _execute_portfolio_updates(c, portfolio_dict, trades_list, snapshot_date)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            print(f"Transaction failed, rolling back: {e}")
+            raise e
+        finally:
+            conn.close()
+
+def _execute_portfolio_updates(c, portfolio_dict, trades_list, snapshot_date):
+    # --- State Machine Sanity Guards ---
+    c.execute("SELECT COUNT(*) FROM portfolio")
+    old_total = c.fetchone()[0]
+    new_total = sum(len(holdings) for holdings in portfolio_dict.values())
+    
+    # Mass Liquidation Guard: If dropping more than 50% of a non-trivial portfolio, block it.
+    if old_total >= 10 and new_total < old_total * 0.5:
+        raise ValueError(f"SanityCheckError: Portfolio dropping from {old_total} to {new_total} (>{50}% drop). Potential data loss detected. Aborting transaction.")
         
-        c.execute("DELETE FROM portfolio")
-        for strat, holdings in portfolio_dict.items():
-            for key, info in holdings.items():
-                # P2.18: Save weights and shares
-                weight = info.get("weight", 0.0)
-                shares = info.get("shares", 0)
-                c.execute("INSERT INTO portfolio (strategy, name_or_code, entry_date, entry_price, weight, shares) VALUES (?, ?, ?, ?, ?, ?)",
-                          (strat, key, info.get("entry_date"), info.get("entry_price", 0), weight, shares))
-                
-                # P2.17: Insert portfolio snapshot if date provided
-                if snapshot_date:
-                    c.execute("INSERT INTO portfolio_snapshots (snapshot_date, strategy, name_or_code, weight) VALUES (?, ?, ?, ?)",
-                              (snapshot_date, strat, key, weight))
-                          
-        if trades_list:
-            for t in trades_list:
-                weight = t.get("weight", 0.0)
-                shares = t.get("shares", 0)
-                # Dedup guard: skip if an identical trade already exists
-                c.execute("""SELECT COUNT(*) FROM trade_history 
-                             WHERE strategy=? AND name_or_code=? AND entry_date=? AND exit_date=? 
-                             AND entry_price=? AND exit_price=?""",
-                          (t.get("strategy"), t.get("name"), t.get("entry_date"), t.get("exit_date"), 
-                           t.get("entry_price", 0), t.get("exit_price", 0)))
-                if c.fetchone()[0] > 0:
-                    continue
-                c.execute("INSERT INTO trade_history (strategy, name_or_code, entry_date, entry_price, exit_date, exit_price, pnl, reason, weight, shares) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                          (t.get("strategy"), t.get("name"), t.get("entry_date"), t.get("entry_price", 0), t.get("exit_date"), t.get("exit_price", 0), t.get("pnl", 0), t.get("reason", ""), weight, shares))
-                          
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        print(f"Transaction failed, rolling back: {e}")
-        raise e
-    finally:
-        conn.close()
+    for strat, holdings in portfolio_dict.items():
+        # Granular CRUD: Only delete the portfolio for the specific strategy being updated.
+        c.execute("DELETE FROM portfolio WHERE strategy = ?", (strat,))
+        
+        for key, info in holdings.items():
+            # P2.18: Save weights and shares
+            weight = info.get("weight", 0.0)
+            shares = info.get("shares", 0)
+            c.execute("INSERT INTO portfolio (strategy, name_or_code, entry_date, entry_price, weight, shares) VALUES (?, ?, ?, ?, ?, ?)",
+                      (strat, key, info.get("entry_date"), info.get("entry_price", 0), weight, shares))
+            
+            # P2.17: Insert portfolio snapshot if date provided
+            if snapshot_date:
+                c.execute("INSERT INTO portfolio_snapshots (snapshot_date, strategy, name_or_code, weight) VALUES (?, ?, ?, ?)",
+                          (snapshot_date, strat, key, weight))
+                      
+    if trades_list:
+        for t in trades_list:
+            weight = t.get("weight", 0.0)
+            shares = t.get("shares", 0)
+            # Dedup guard: skip if an identical trade already exists
+            c.execute("""SELECT COUNT(*) FROM trade_history 
+                         WHERE strategy=? AND name_or_code=? AND entry_date=? AND exit_date=? 
+                         AND entry_price=? AND exit_price=?""",
+                      (t.get("strategy"), t.get("name"), t.get("entry_date"), t.get("exit_date"), 
+                       t.get("entry_price", 0), t.get("exit_price", 0)))
+            if c.fetchone()[0] > 0:
+                continue
+            c.execute("INSERT INTO trade_history (strategy, name_or_code, entry_date, entry_price, exit_date, exit_price, pnl, reason, weight, shares) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                      (t.get("strategy"), t.get("name"), t.get("entry_date"), t.get("entry_price", 0), t.get("exit_date"), t.get("exit_price", 0), t.get("pnl", 0), t.get("reason", ""), weight, shares))
 
 def save_meta_data(key, value_dict):
     conn = get_connection()

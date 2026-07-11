@@ -20,22 +20,7 @@ def _load_env():
     except:
         pass
 
-@disk_cache(expire_hours=24)
-def fetch_fmp_income_statement(ticker_symbol):
-    _load_env()
-    api_key = os.environ.get("FMP_API_KEY")
-    if not api_key:
-        return None
-    url = f"https://financialmodelingprep.com/stable/income-statement?symbol={ticker_symbol}&period=quarter&limit=2&apikey={api_key}"
-    try:
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            if isinstance(data, list) and len(data) >= 2:
-                return data
-    except Exception as e:
-        print(f"FMP fetch failed for {ticker_symbol}: {e}")
-    return None
+
 # Cached wrappers for yfinance to avoid redundant network calls
 @disk_cache(expire_hours=12)
 def fetch_yf_info_cached(ticker_symbol):
@@ -112,39 +97,21 @@ def fetch_yf_data(ticker_symbol, args):
                                 if earnings_growth is not None and earnings_growth > 0:
                                     # YoY passed. Now check QoQ
                                     try:
-                                        if not ticker_symbol.endswith('.HK'):
-                                            # US Stock: Use highly reliable FMP API to check QoQ growth
-                                            fmp_data = fetch_fmp_income_statement(ticker_symbol)
-                                            if fmp_data:
-                                                curr = fmp_data[0]
-                                                prev = fmp_data[1]
-                                                rev_curr = curr.get("revenue")
-                                                rev_prev = prev.get("revenue")
-                                                net_curr = curr.get("netIncome")
-                                                net_prev = prev.get("netIncome")
-                                                
-                                                if rev_curr is not None and rev_prev is not None and net_curr is not None and net_prev is not None:
-                                                    if rev_curr > rev_prev and net_curr > net_prev:
-                                                        latest_qoq_dual_growth = True
+                                        # Use yfinance for both US and HK stocks for QoQ check to avoid FMP Free Plan limits
+                                        stmt = fetch_yf_quarterly_income_stmt_cached(ticker_symbol)
+                                        if stmt is not None and not stmt.empty and stmt.shape[1] >= 2:
+                                            if 'Total Revenue' in stmt.index and 'Net Income' in stmt.index:
+                                                rev = stmt.loc['Total Revenue'].values
+                                                net = stmt.loc['Net Income'].values
+                                                if len(rev) >= 2 and len(net) >= 2:
+                                                    import math
+                                                    if not math.isnan(rev[0]) and not math.isnan(rev[1]) and not math.isnan(net[0]) and not math.isnan(net[1]):
+                                                        if rev[0] > rev[1] and net[0] > net[1]:
+                                                            latest_qoq_dual_growth = True
                                             else:
-                                                latest_qoq_dual_growth = True # Fallback if FMP limit reached or no key
+                                                latest_qoq_dual_growth = True # Fallback if missing rows
                                         else:
-                                            # HK Stock / Fallback: Use yfinance
-                                            import yfinance as yf
-                                            stmt = yf.Ticker(ticker_symbol).quarterly_income_stmt
-                                            if stmt is not None and not stmt.empty and stmt.shape[1] >= 2:
-                                                if 'Total Revenue' in stmt.index and 'Net Income' in stmt.index:
-                                                    rev = stmt.loc['Total Revenue'].values
-                                                    net = stmt.loc['Net Income'].values
-                                                    if len(rev) >= 2 and len(net) >= 2:
-                                                        import math
-                                                        if not math.isnan(rev[0]) and not math.isnan(rev[1]) and not math.isnan(net[0]) and not math.isnan(net[1]):
-                                                            if rev[0] > rev[1] and net[0] > net[1]:
-                                                                latest_qoq_dual_growth = True
-                                                else:
-                                                    latest_qoq_dual_growth = True # Fallback if missing rows
-                                            else:
-                                                latest_qoq_dual_growth = True # Fallback if missing stmt
+                                            latest_qoq_dual_growth = True # Fallback if missing stmt
                                     except Exception:
                                         latest_qoq_dual_growth = True # Fallback on error
                                     

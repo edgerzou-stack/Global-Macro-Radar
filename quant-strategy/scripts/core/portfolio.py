@@ -5,14 +5,23 @@ import akshare as ak
 import pandas as pd
 from typing import Dict, List, Any
 from tenacity import retry, stop_after_attempt, wait_exponential
+from core.ttl_cache import ttl_cache
 
+@ttl_cache(ttl_seconds=600)
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def _fetch_a_hist(*args, **kwargs):
     return ak.stock_zh_a_hist(*args, **kwargs)
 
+@ttl_cache(ttl_seconds=600)
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def _fetch_etf_hist(*args, **kwargs):
     return ak.fund_etf_hist_em(*args, **kwargs)
+
+@ttl_cache(ttl_seconds=600)
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def _fetch_yf_hist(ticker_str, start, end, auto_adjust):
+    ticker = yf.Ticker(ticker_str)
+    return ticker.history(start=start, end=end, auto_adjust=auto_adjust)
 
 class PortfolioManager:
     def __init__(self, db_utils_module):
@@ -52,6 +61,7 @@ class PortfolioManager:
                 
         # If market is closed (pre-market or post-market), we cannot execute immediately.
         # Return 0.0 to mark the trade as "Pending" until the next Open.
+        print(f"DEBUG get_simulated_trade_price: time_val={time_val}, latest={latest}, close_time={close_time}")
         if time_val < 9.5 or time_val >= close_time:
             return 0.0
         else:
@@ -78,8 +88,9 @@ class PortfolioManager:
                     import json
                     with open(cache_file, "r") as f:
                         return json.load(f)
-                except Exception:
-                    pass
+                except Exception as e:
+                    import logging
+                    logging.warning(f"Cache read error: {e}")
             name_to_code = {}
             try:
                 df1 = ak.stock_zh_a_spot_em()
@@ -272,14 +283,7 @@ class PortfolioManager:
             conn.commit()
         conn.close()
 
-    def diff_and_update(self, strategy_targets: Dict[str, List[str]], current_prices: Dict[str, Any], snapshot_date: str):
-        """
-        Compares the new target positions with the old portfolio to calculate trades.
-        Then atomically updates the database.
-        
-        strategy_targets: { strat_id: [stock_code1, stock_code2, ...] }
-        current_prices: { stock_code: {"最新价": 100, "今开": 99, ...} }
-        """
+
     def diff_and_update(self, strategy_targets: dict, current_prices: dict, snapshot_date: str):
         """
         Calculates diff between current targets and old portfolio, updates DB, generates trades.
@@ -299,170 +303,213 @@ class PortfolioManager:
         import os
         
         cash_mgr = CashManager()
-        
-        for strat, target_keys in strategy_targets.items():
-            cash_mgr.initialize_strategy(strat)
-            target_keys_set = set(target_keys)
-            old_keys = set(old_portfolio.get(strat, {}).keys())
+        conn = self.db.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("BEGIN TRANSACTION")
             
-            # --- Pre-process Hard Stop-Loss (Overrides LLM recommendations) ---
-            hard_stop_keys = set()
-            for key in old_keys:
-                old_pos = old_portfolio[strat][key]
-                ep = old_pos.get("entry_price", 0)
-                shares = old_pos.get("shares", 1)
-                cp = self.get_simulated_trade_price(current_prices.get(key, {}), strat)
-                
-                # Hard stop loss: drops -25% AND has max tranches (3)
-                if ep > 0 and shares >= 3 and cp > 0 and cp <= ep * 0.75:
-                    print(f"HARD STOP-LOSS: {key} in {strat} dropped -25% from cost {ep:.2f}. Forcing liquidation.")
-                    hard_stop_keys.add(key)
-                    if key in target_keys_set:
-                        target_keys_set.remove(key)
-                        
-            added = target_keys_set - old_keys
-            removed = (old_keys - target_keys_set) | hard_stop_keys
-            
-            # Track stocks sold today to enforce T+0 re-entry guard
-            sold_today_keys = set()
-            
-            # --- Process REMOVED first (so we know what was sold today and release cash) ---
-            for key in removed:
-                old_pos = old_portfolio[strat][key]
-                ep = old_pos.get("entry_price", 0)
-                shares = old_pos.get("shares", 1)
-                entry_date = old_pos.get("entry_date", "未知")
-                
-                tz_str = "US/Eastern" if "_us_" in strat else ("Asia/Hong_Kong" if "_hk_" in strat else "Asia/Shanghai")
-                now_local = clock.now(pytz.timezone(tz_str))
-                
-                is_pre_market = now_local.hour < 9 or (now_local.hour == 9 and now_local.minute < 30)
-                
-                if is_pre_market:
-                    effective_today_dt = now_local - datetime.timedelta(days=1)
-                    while effective_today_dt.weekday() >= 5: # 5=Sat, 6=Sun
-                        effective_today_dt -= datetime.timedelta(days=1)
-                    effective_today = effective_today_dt.strftime("%Y-%m-%d")
-                else:
-                    effective_today = now_local.strftime("%Y-%m-%d")
-                    
-                if entry_date[:10] >= effective_today or ep <= 0:
-                    # T+1 rule: ignore trades if the market hasn't opened for a new session since entry
-                    # OR if entry_price <= 0 (meaning the buy order hasn't been confirmed/resolved yet)
-                    new_portfolio[strat][key] = old_pos
-                    if key in hard_stop_keys:
-                        print(f"T+1 BLOCK: Cannot hard stop-loss {key} today as it was bought today or is still pending execution.")
-                    continue
-                    
-                cp = self.get_simulated_trade_price(current_prices.get(key, {}), strat)
-                if cp <= 0:
-                    print(f"WARNING: Could not fetch exit price for {key}, using entry price as fallback")
-                    cp = ep
-                    
-                fee_hk = float(os.getenv("FEE_HK", 0.002))
-                fee_a = float(os.getenv("FEE_A", 0.001))
-                fee_us = float(os.getenv("FEE_US", 0.000))
-                
-                if '_hk_' in strat:
-                    fee = fee_hk
-                elif '_a_' in strat:
-                    fee = fee_a
-                else:
-                    fee = fee_us
-                    
-                raw_pnl = (cp / ep - 1) - fee if ep > 0 else 0
-                pnl = raw_pnl
-                
-                # Fetch adjusted prices for accurate returns
-                try:
-                    if '_a_' in strat and ep > 0:
-                        df = pd.DataFrame()
-                        try:
-                            df = _fetch_a_hist(symbol=key, start_date=entry_date.replace('-','')[:8], end_date=snapshot_date.replace('-','')[:8], adjust="hfq")
-                        except Exception as fetch_err:
-                            print(f"akshare fetch failed for {key}: {fetch_err}, trying yfinance fallback.")
-                            
-                        if not df.empty and len(df) >= 2:
-                            adj_ep = float(df.iloc[0]['收盘'])
-                            adj_cp = float(df.iloc[-1]['收盘'])
-                            pnl = (adj_cp / adj_ep - 1) - fee
-                        else:
-                            yf_sym = f"{key}.SS" if str(key).startswith('6') else f"{key}.SZ"
-                            ticker = yf.Ticker(yf_sym)
-                            end_dt = datetime.datetime.strptime(snapshot_date[:10], "%Y-%m-%d") + datetime.timedelta(days=1)
-                            df_yf = ticker.history(start=entry_date[:10], end=end_dt.strftime("%Y-%m-%d"))
-                            if not df_yf.empty and len(df_yf) >= 2:
-                                adj_ep = float(df_yf.iloc[0]['Close'])
-                                adj_cp = float(df_yf.iloc[-1]['Close'])
-                                pnl = (adj_cp / adj_ep - 1) - fee
-                            else:
-                                raise ValueError(f"CRITICAL: Failed to fetch adjusted prices for A-share {key}. Aborting.")
-                    elif ('_hk_' in strat or '_us_' in strat) and ep > 0:
-                        yf_sym = f"{key}.HK" if '_hk_' in strat and not key.upper().endswith('.HK') else key
-                        ticker = yf.Ticker(yf_sym)
-                        end_dt = datetime.datetime.strptime(snapshot_date[:10], "%Y-%m-%d") + datetime.timedelta(days=1)
-                        df = ticker.history(start=entry_date[:10], end=end_dt.strftime("%Y-%m-%d"))
-                        if not df.empty and len(df) >= 2:
-                            adj_ep = float(df.iloc[0]['Close'])
-                            adj_cp = float(df.iloc[-1]['Close'])
-                            pnl = (adj_cp / adj_ep - 1) - fee
-                        else:
-                            raise ValueError(f"CRITICAL: Failed to fetch adjusted prices for {key} from yfinance. Aborting.")
-                except Exception as e:
-                    raise ValueError(f"CRITICAL: Data fetching failed for {key}: {e}. Aborting.")
-                    
-                if key in hard_stop_keys:
-                    reason = "[风控熔断] 加仓满3次后仍重度亏损，触发绝对止损线强制清仓"
-                else:
-                    try:
-                        from core.diagnose import diagnose_elimination
-                        reason = diagnose_elimination(key, strat)
-                    except Exception as e:
-                        print(f"Failed to diagnose elimination for {key}: {e}")
-                        reason = ""
-                    
-                diff[strat]["removed"].append({"name": key, "entry_price": ep, "exit_price": cp, "pnl": pnl, "reason": reason})
-                t = {"strategy": strat, "name": key, "entry_date": entry_date, "entry_price": ep, "exit_date": snapshot_date, "exit_price": cp, "pnl": pnl, "reason": reason, "shares": shares}
-                new_trades.append(t)
-                sold_today_keys.add(key)
-                
-                # IMPORTANT: Release cash!
-                cash_mgr.release(strat, shares, pnl)
-            
-            # --- Process RETAINED (Average Down) ---
-            retained = target_keys_set & old_keys
-            for key in retained:
-                old_pos = old_portfolio[strat][key]
-                ep = old_pos.get("entry_price", 0)
-                shares = old_pos.get("shares", 1)
-                new_portfolio[strat][key] = old_pos
-                
-                if ep > 0 and shares < 3:
+            for strat, target_keys in strategy_targets.items():
+                cash_mgr.initialize_strategy(strat, cursor=cursor)
+                target_keys_set = set(target_keys)
+                old_keys = set(old_portfolio.get(strat, {}).keys())
+
+                # --- Pre-process Hard Stop-Loss (Overrides LLM recommendations) ---
+                hard_stop_keys = set()
+                for key in old_keys:
+                    old_pos = old_portfolio[strat][key]
+                    ep = old_pos.get("entry_price", 0)
+                    shares = old_pos.get("shares", 1)
                     cp = self.get_simulated_trade_price(current_prices.get(key, {}), strat)
-                    if cp > 0 and cp <= ep * 0.90:  # -10% threshold
-                        if cash_mgr.allocate(strat): # Try to lock funds!
-                            print(f"POSITION AVERAGING: {key} in {strat} dropped -10% from cost {ep:.2f} to {cp:.2f}. Adding tranche {shares + 1}/3.")
-                            new_ep = (shares + 1) / ((shares / ep) + (1 / cp))
-                            new_portfolio[strat][key]["entry_price"] = new_ep
-                            new_portfolio[strat][key]["shares"] = shares + 1
-                            diff[strat]["added"].append({"name": key, "entry_price": cp, "reason": f"网格加仓(当前第{shares+1}份)"})
-                        else:
-                            print(f"POSITION AVERAGING DENIED: {key} in {strat} dropped, but insufficient cash for tranche {shares + 1}.")
+
+                    # Hard stop loss: drops -25% AND has max tranches (3)
+                    if ep > 0 and shares >= 3 and cp > 0 and cp <= ep * 0.75:
+                        print(f"HARD STOP-LOSS: {key} in {strat} dropped -25% from cost {ep:.2f}. Forcing liquidation.")
+                        hard_stop_keys.add(key)
+                        if key in target_keys_set:
+                            target_keys_set.remove(key)
+
+                added = target_keys_set - old_keys
+                removed = (old_keys - target_keys_set) | hard_stop_keys
+
+                # Track stocks sold today to enforce T+0 re-entry guard
+                sold_today_keys = set()
+
+                # --- Pre-fetch prices concurrently to populate cache ---
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                def _prefetch_data(key, strat, entry_date):
+                    try:
+                        if '_a_' in strat:
+                            _fetch_a_hist(symbol=key, start_date=entry_date.replace('-','')[:8], end_date=snapshot_date.replace('-','')[:8], adjust="hfq")
+                            _fetch_a_hist(symbol=key, start_date=entry_date.replace('-','')[:8], end_date=snapshot_date.replace('-','')[:8], adjust="")
+                        elif '_hk_' in strat or '_us_' in strat:
+                            yf_sym = f"{key}.HK" if '_hk_' in strat and not key.upper().endswith('.HK') else key
+                            end_dt = datetime.datetime.strptime(snapshot_date[:10], "%Y-%m-%d") + datetime.timedelta(days=1)
+                            _fetch_yf_hist(yf_sym, start=entry_date[:10], end=end_dt.strftime("%Y-%m-%d"), auto_adjust=True)
+                            _fetch_yf_hist(yf_sym, start=entry_date[:10], end=end_dt.strftime("%Y-%m-%d"), auto_adjust=False)
+                    except Exception as e:
+                        import logging
+                        logging.warning(f"Prefetch error for {key}: {e}")
+
+                if removed:
+                    with ThreadPoolExecutor(max_workers=10) as executor:
+                        futures = [
+                            executor.submit(_prefetch_data, k, strat, old_portfolio[strat][k].get("entry_date", "未知"))
+                            for k in removed
+                        ]
+                        for _ in as_completed(futures):
+                            pass
+
+                # --- Process REMOVED first (so we know what was sold today and release cash) ---
+                for key in removed:
+                    old_pos = old_portfolio[strat][key]
+                    ep = old_pos.get("entry_price", 0)
+                    shares = old_pos.get("shares", 1)
+                    entry_date = old_pos.get("entry_date", "未知")
+
+                    from core.market_utils import get_effective_today
+                    tz_str = "US/Eastern" if "_us_" in strat else ("Asia/Hong_Kong" if "_hk_" in strat else "Asia/Shanghai")
+                    now_local = clock.now(pytz.timezone(tz_str))
+
+                    effective_today = get_effective_today(strat, now_local)
+
+                    if entry_date[:10] >= effective_today or ep <= 0:
+                        # T+1 rule: ignore trades if the market hasn't opened for a new session since entry
+                        # OR if entry_price <= 0 (meaning the buy order hasn't been confirmed/resolved yet)
+                        new_portfolio[strat][key] = old_pos
+                        if key in hard_stop_keys:
+                            print(f"T+1 BLOCK: Cannot hard stop-loss {key} today as it was bought today or is still pending execution.")
+                        continue
+
+                    cp = self.get_simulated_trade_price(current_prices.get(key, {}), strat)
+                    if cp <= 0:
+                        import logging
+                        logging.warning(f"WARNING: Could not fetch exit price for {key}. Keeping position open (PENDING_EXIT).")
+                        new_portfolio[strat][key] = old_pos
+                        continue
+
+                    fee_hk = float(os.getenv("FEE_HK", 0.002))
+                    fee_a = float(os.getenv("FEE_A", 0.001))
+                    fee_us = float(os.getenv("FEE_US", 0.000))
+
+                    if '_hk_' in strat:
+                        fee = fee_hk
+                    elif '_a_' in strat:
+                        fee = fee_a
+                    else:
+                        fee = fee_us
+
+                    raw_pnl = (cp / ep - 1) - fee if ep > 0 else 0
+                    pnl = raw_pnl
+
+                    # Fetch adjusted prices for accurate returns while preserving exact execution prices
+                    try:
+                        if '_a_' in strat and ep > 0:
+                            df_adj = pd.DataFrame()
+                            df_unadj = pd.DataFrame()
+                            try:
+                                df_adj = _fetch_a_hist(symbol=key, start_date=entry_date.replace('-','')[:8], end_date=snapshot_date.replace('-','')[:8], adjust="hfq")
+                                df_unadj = _fetch_a_hist(symbol=key, start_date=entry_date.replace('-','')[:8], end_date=snapshot_date.replace('-','')[:8], adjust="")
+                            except Exception as fetch_err:
+                                print(f"akshare fetch failed for {key}: {fetch_err}, trying yfinance fallback.")
+
+                            if not df_adj.empty and not df_unadj.empty and len(df_adj) >= 2 and len(df_unadj) >= 2:
+                                factor_entry = float(df_adj.iloc[0]['收盘']) / float(df_unadj.iloc[0]['收盘'])
+                                factor_exit = float(df_adj.iloc[-1]['收盘']) / float(df_unadj.iloc[-1]['收盘'])
+                                true_adj_ep = ep * factor_entry
+                                true_adj_cp = cp * factor_exit
+                                pnl = (true_adj_cp / true_adj_ep - 1) - fee
+                            else:
+                                if str(key).startswith('6'):
+                                    yf_sym = f"{key}.SS"
+                                elif str(key).startswith('8') or str(key).startswith('4'):
+                                    yf_sym = f"{key}.BJ"
+                                else:
+                                    yf_sym = f"{key}.SZ"
+                                end_dt = datetime.datetime.strptime(snapshot_date[:10], "%Y-%m-%d") + datetime.timedelta(days=1)
+                                df_yf_adj = _fetch_yf_hist(yf_sym, start=entry_date[:10], end=end_dt.strftime("%Y-%m-%d"), auto_adjust=True)
+                                df_yf_unadj = _fetch_yf_hist(yf_sym, start=entry_date[:10], end=end_dt.strftime("%Y-%m-%d"), auto_adjust=False)
+                                if not df_yf_adj.empty and not df_yf_unadj.empty and len(df_yf_adj) >= 2 and len(df_yf_unadj) >= 2:
+                                    factor_entry = float(df_yf_adj.iloc[0]['Close']) / float(df_yf_unadj.iloc[0]['Close'])
+                                    factor_exit = float(df_yf_adj.iloc[-1]['Close']) / float(df_yf_unadj.iloc[-1]['Close'])
+                                    true_adj_ep = ep * factor_entry
+                                    true_adj_cp = cp * factor_exit
+                                    pnl = (true_adj_cp / true_adj_ep - 1) - fee
+                                else:
+                                    raise ValueError(f"CRITICAL: Failed to fetch adjusted prices for A-share {key}. Aborting.")
+                        elif ('_hk_' in strat or '_us_' in strat) and ep > 0:
+                            yf_sym = f"{key}.HK" if '_hk_' in strat and not key.upper().endswith('.HK') else key
+                            end_dt = datetime.datetime.strptime(snapshot_date[:10], "%Y-%m-%d") + datetime.timedelta(days=1)
+                            df_yf_adj = _fetch_yf_hist(yf_sym, start=entry_date[:10], end=end_dt.strftime("%Y-%m-%d"), auto_adjust=True)
+                            df_yf_unadj = _fetch_yf_hist(yf_sym, start=entry_date[:10], end=end_dt.strftime("%Y-%m-%d"), auto_adjust=False)
+                            if not df_yf_adj.empty and not df_yf_unadj.empty and len(df_yf_adj) >= 2 and len(df_yf_unadj) >= 2:
+                                factor_entry = float(df_yf_adj.iloc[0]['Close']) / float(df_yf_unadj.iloc[0]['Close'])
+                                factor_exit = float(df_yf_adj.iloc[-1]['Close']) / float(df_yf_unadj.iloc[-1]['Close'])
+                                true_adj_ep = ep * factor_entry
+                                true_adj_cp = cp * factor_exit
+                                pnl = (true_adj_cp / true_adj_ep - 1) - fee
+                            else:
+                                raise ValueError(f"CRITICAL: Failed to fetch adjusted prices for {key} from yfinance. Aborting.")
+                    except Exception as e:
+                        raise ValueError(f"CRITICAL: Data fetching failed for {key}: {e}. Aborting.")
+
+                    if key in hard_stop_keys:
+                        reason = "[风控熔断] 加仓满3次后仍重度亏损，触发绝对止损线强制清仓"
+                    else:
+                        try:
+                            from core.diagnose import diagnose_elimination
+                            reason = diagnose_elimination(key, strat)
+                        except Exception as e:
+                            print(f"Failed to diagnose elimination for {key}: {e}")
+                            reason = ""
+
+                    diff[strat]["removed"].append({"name": key, "entry_price": ep, "exit_price": cp, "pnl": pnl, "reason": reason})
+                    t = {"strategy": strat, "name": key, "entry_date": entry_date, "entry_price": ep, "exit_date": snapshot_date, "exit_price": cp, "pnl": pnl, "reason": reason, "shares": shares}
+                    new_trades.append(t)
+                    sold_today_keys.add(key)
+
+                    # IMPORTANT: Release cash!
+                    cash_mgr.release(strat, shares, pnl, cursor=cursor)
+
+                # --- Process RETAINED (Average Down) ---
+                retained = target_keys_set & old_keys
+                for key in retained:
+                    old_pos = old_portfolio[strat][key]
+                    ep = old_pos.get("entry_price", 0)
+                    shares = old_pos.get("shares", 1)
+                    new_portfolio[strat][key] = old_pos
+
+                    if ep > 0 and shares < 3:
+                        cp = self.get_simulated_trade_price(current_prices.get(key, {}), strat)
+                        if cp > 0 and cp <= ep * 0.90:  # -10% threshold
+                            if cash_mgr.allocate(strat, cursor=cursor): # Try to lock funds!
+                                print(f"POSITION AVERAGING: {key} in {strat} dropped -10% from cost {ep:.2f} to {cp:.2f}. Adding tranche {shares + 1}/3.")
+                                new_ep = (shares + 1) / ((shares / ep) + (1 / cp))
+                                new_portfolio[strat][key]["entry_price"] = new_ep
+                                new_portfolio[strat][key]["shares"] = shares + 1
+                                diff[strat]["added"].append({"name": key, "entry_price": cp, "reason": f"网格加仓(当前第{shares+1}份)"})
+                            else:
+                                print(f"POSITION AVERAGING DENIED: {key} in {strat} dropped, but insufficient cash for tranche {shares + 1}.")
+
+                # --- Process ADDED (with T+0 re-entry guard) ---
+                for key in added:
+                    if key in sold_today_keys and '_a_' in strat:
+                        print(f"T+0 GUARD: Skipping re-entry of {key} in {strat} (sold today)")
+                        continue
+
+                    price = self.get_simulated_trade_price(current_prices.get(key, {}), strat)
+                    if cash_mgr.allocate(strat, cursor=cursor):
+                        diff[strat]["added"].append({"name": key, "entry_price": price})
+                        new_portfolio[strat][key] = {"entry_date": snapshot_date, "entry_price": price, "shares": 1}
+                    else:
+                        print(f"NEW ENTRY DENIED: {key} in {strat} skipped due to insufficient cash.")
+
+            # Persist transactions safely
+            self.db.update_portfolio_and_trades(new_portfolio, new_trades, snapshot_date=snapshot_date, cursor=cursor)
+            conn.commit()
             
-            # --- Process ADDED (with T+0 re-entry guard) ---
-            for key in added:
-                if key in sold_today_keys and '_a_' in strat:
-                    print(f"T+0 GUARD: Skipping re-entry of {key} in {strat} (sold today)")
-                    continue
-                    
-                price = self.get_simulated_trade_price(current_prices.get(key, {}), strat)
-                if cash_mgr.allocate(strat):
-                    diff[strat]["added"].append({"name": key, "entry_price": price})
-                    new_portfolio[strat][key] = {"entry_date": snapshot_date, "entry_price": price, "shares": 1}
-                else:
-                    print(f"NEW ENTRY DENIED: {key} in {strat} skipped due to insufficient cash.")
-                        
-        # Persist transactions safely
-        self.db.update_portfolio_and_trades(new_portfolio, new_trades, snapshot_date=snapshot_date)
-        
-        return new_portfolio, new_trades, diff
+            return new_portfolio, new_trades, diff
+        except Exception as e:
+            conn.rollback()
+            raise e
+        finally:
+            conn.close()

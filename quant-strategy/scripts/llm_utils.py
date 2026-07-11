@@ -44,7 +44,26 @@ def call_llm(prompt, require_json=False):
             title_context="Quant Strategy Call"
         )
         if not require_json:
-            return json.dumps(res, ensure_ascii=False)
+            return json.dumps(res, ensure_ascii=False) if isinstance(res, (dict, list)) else res
+            
+        if isinstance(res, (dict, list)):
+            return res
+            
+        # Fallback regex parser for hallucinated JSON
+        if isinstance(res, str):
+            try:
+                import re
+                # Try to extract JSON from markdown code block or curly braces
+                json_match = re.search(r'```json\s*(\{.*\}|\[.*\])\s*```', res, re.DOTALL)
+                if json_match:
+                    return json.loads(json_match.group(1))
+                    
+                json_match = re.search(r'(\{.*\})', res, re.DOTALL)
+                if json_match:
+                    return json.loads(json_match.group(1))
+            except Exception as e:
+                print(f"Fallback Regex JSON parsing failed: {e}")
+                
         return res
     except Exception as e:
         print(f"LLM Error in call_llm: {e}")

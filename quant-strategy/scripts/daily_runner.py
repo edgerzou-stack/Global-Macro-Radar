@@ -31,6 +31,21 @@ logger = logging.getLogger(__name__)
 def main():
     logger.info(f"--- Starting daily run at {datetime.datetime.now()} ---")
     
+    # --- P0.0 Backup DB before processing ---
+    db_path = os.path.join(PROJECT_DIR, "quant_system.db")
+    if os.path.exists(db_path):
+        import shutil
+        backup_dir = os.path.join(PROJECT_DIR, "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = os.path.join(backup_dir, f"quant_system_{timestamp}.db")
+        try:
+            shutil.copy2(db_path, backup_path)
+            logger.info(f"Successfully backed up DB to {backup_path}")
+        except Exception as e:
+            logger.error(f"Failed to backup DB: {e}")
+            sys.exit(1) # Abort if backup fails
+            
     # 1. Check if today is a trading day
     today = datetime.date.today()
     try:
