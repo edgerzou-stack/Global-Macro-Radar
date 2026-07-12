@@ -161,34 +161,36 @@ class DataGateway:
         if df is None or df.empty:
             return
             
-        to_insert = []
-        for idx, row in df.iterrows():
-            date_val = ""
-            open_val = 0.0
-            close_val = 0.0
-            high_val = 0.0
-            low_val = 0.0
-            volume_val = 0.0
-            
-            if '日期' in row:
-                date_val = str(row['日期']).replace('-', '')[:8]
-                open_val = float(row.get('开盘', 0.0))
-                close_val = float(row.get('收盘', 0.0))
-                high_val = float(row.get('最高', 0.0))
-                low_val = float(row.get('最低', 0.0))
-                volume_val = float(row.get('成交量', 0.0))
-            elif isinstance(idx, (pd.Timestamp, datetime.datetime, datetime.date)):
-                date_val = idx.strftime('%Y%m%d')
-                open_val = float(row.get('Open', 0.0))
-                close_val = float(row.get('Close', 0.0))
-                high_val = float(row.get('High', 0.0))
-                low_val = float(row.get('Low', 0.0))
-                volume_val = float(row.get('Volume', 0.0))
-            
-            if date_val and open_val > 0 and close_val > 0:
-                to_insert.append((symbol, date_val, open_val, close_val, high_val, low_val, volume_val, adjust))
-                
-        if to_insert:
+        if '日期' in df.columns:
+            date_series = df['日期'].astype(str).str.replace('-', '').str.slice(0, 8)
+            open_series = pd.to_numeric(df.get('开盘', 0.0), errors='coerce').fillna(0.0)
+            close_series = pd.to_numeric(df.get('收盘', 0.0), errors='coerce').fillna(0.0)
+            high_series = pd.to_numeric(df.get('最高', 0.0), errors='coerce').fillna(0.0)
+            low_series = pd.to_numeric(df.get('最低', 0.0), errors='coerce').fillna(0.0)
+            vol_series = pd.to_numeric(df.get('成交量', 0.0), errors='coerce').fillna(0.0)
+        else:
+            date_series = pd.to_datetime(df.index).strftime('%Y%m%d')
+            open_series = pd.to_numeric(df.get('Open', 0.0), errors='coerce').fillna(0.0)
+            close_series = pd.to_numeric(df.get('Close', 0.0), errors='coerce').fillna(0.0)
+            high_series = pd.to_numeric(df.get('High', 0.0), errors='coerce').fillna(0.0)
+            low_series = pd.to_numeric(df.get('Low', 0.0), errors='coerce').fillna(0.0)
+            vol_series = pd.to_numeric(df.get('Volume', 0.0), errors='coerce').fillna(0.0)
+
+        df_db = pd.DataFrame({
+            'symbol': symbol,
+            'date': date_series,
+            'open': open_series,
+            'close': close_series,
+            'high': high_series,
+            'low': low_series,
+            'volume': vol_series,
+            'adjust': adjust
+        })
+        
+        df_db = df_db[(df_db['date'] != '') & (df_db['open'] > 0) & (df_db['close'] > 0)]
+        
+        if not df_db.empty:
+            to_insert = list(df_db.itertuples(index=False, name=None))
             with sqlite3.connect(self.db_path, timeout=30.0) as conn:
                 conn.execute('PRAGMA journal_mode=WAL;')
                 c = conn.cursor()
@@ -393,11 +395,11 @@ class DataGateway:
         
         try:
             df = self.get_historical_prices(symbol, exact_date_str, exact_date_str, adjust="")
-            if not df.empty:
-                for _, row in df.iterrows():
-                    dt_str = str(row['日期']).replace('-', '')
-                    if dt_str == exact_date_str:
-                        return float(row['开盘'])
+            if not df.empty and '日期' in df.columns:
+                dt_series = df['日期'].astype(str).str.replace('-', '')
+                match = df[dt_series == exact_date_str]
+                if not match.empty:
+                    return float(match.iloc[0]['开盘'])
         except FatalSystemError:
             raise
         except Exception as e:

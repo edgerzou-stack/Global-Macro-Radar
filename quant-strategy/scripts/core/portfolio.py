@@ -84,12 +84,10 @@ class PortfolioManager:
                 try:
                     df1 = ak.stock_zh_a_spot_em()
                     if not df1.empty:
-                        for _, row in df1.iterrows():
-                            name_to_code[row["名称"]] = row["代码"]
+                        name_to_code.update(dict(zip(df1["名称"], df1["代码"])))
                     df2 = ak.fund_etf_spot_em()
                     if not df2.empty:
-                        for _, row in df2.iterrows():
-                            name_to_code[row["名称"]] = row["代码"]
+                        name_to_code.update(dict(zip(df2["名称"], df2["代码"])))
                     import json
                     with open(cache_file, "w") as f:
                         json.dump(name_to_code, f, ensure_ascii=False)
