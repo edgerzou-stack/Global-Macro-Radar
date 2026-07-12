@@ -19,10 +19,10 @@ def calc_nav():
     
     try:
         c = conn.cursor()
-        c.execute("SELECT strategy_id, available_cash FROM strategy_accounts")
+        c.execute("SELECT strategy_id, available_cash, total_capital FROM strategy_accounts")
         accounts = c.fetchall()
         
-        for strat, cash in accounts:
+        for strat, cash, total_capital in accounts:
             holdings_value = 0.0
             positions = old_portfolio.get(strat, {})
             
@@ -43,7 +43,7 @@ def calc_nav():
                     
                 # Calculate value
                 cash_mgr_inst = CashManager()
-                invested_capital = cash_mgr_inst.INITIAL_CAPITAL * cash_mgr_inst.TRANCHE_RATIO * shares
+                invested_capital = total_capital * cash_mgr_inst.TRANCHE_RATIO * shares
                 
                 true_multiplier = 1.0
                 if ep > 0:
