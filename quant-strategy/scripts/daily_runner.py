@@ -136,6 +136,10 @@ def main():
     for cmd in cmds:
         run_cmd(cmd, PROJECT_DIR)
             
+    if os.path.exists(checkpoint_file):
+        os.remove(checkpoint_file)
+        logger.info("Cleared daily checkpoint file for future intraday runs.")
+        
     logger.info("Daily global strategy run completed successfully.")
 
 if __name__ == "__main__":

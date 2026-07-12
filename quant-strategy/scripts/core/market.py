@@ -93,11 +93,30 @@ class Market:
             return target_date
         except Exception as e:
             import logging
-            logging.error(f"Failed to get next trading date from calendar: {e}")
+            logging.error(f"Failed to calculate next trading date for {target_date}: {e}")
+            return target_date
+
+    def get_previous_trading_date(self, target_date: datetime.date) -> datetime.date:
+        """
+        Returns the exact previous or current trading day for the target_date.
+        """
+        if not self.calendar:
             d = target_date
             while d.weekday() >= 5:
-                d += datetime.timedelta(days=1)
+                d -= datetime.timedelta(days=1)
             return d
+            
+        try:
+            import pandas as pd
+            start_date = target_date - datetime.timedelta(days=30)
+            schedule = self.calendar.valid_days(start_date=start_date, end_date=target_date)
+            if len(schedule) > 0:
+                return schedule[-1].date()
+            return target_date
+        except Exception as e:
+            import logging
+            logging.error(f"Failed to calculate previous trading date for {target_date}: {e}")
+            return target_date
 
 class AShareMarket(Market):
     def __init__(self):

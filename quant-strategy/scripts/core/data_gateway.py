@@ -390,7 +390,7 @@ class DataGateway:
         target_date_str = str(target_date).replace('-', '')[:8]
         target_dt = datetime.datetime.strptime(target_date_str, "%Y%m%d").date()
         
-        exact_trade_date = market.get_next_trading_date(target_dt)
+        exact_trade_date = market.get_previous_trading_date(target_dt)
         exact_date_str = exact_trade_date.strftime("%Y%m%d")
         
         try:
