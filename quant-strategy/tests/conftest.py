@@ -15,8 +15,8 @@ def offline_data_gateway(monkeypatch):
     # We shouldn't modify the real config, so we monkeypatch DataGateway.__init__ to use it
     original_init = DataGateway.__init__
     
-    def mock_init(self, cache_db=frozen_db_path, disable_api=True):
-        original_init(self, cache_db=cache_db)
+    def mock_init(self, db_path=frozen_db_path, disable_api=True):
+        original_init(self, db_path=db_path)
         # 2. Hard-block all API fetches so if cache misses, it fails loudly
         self._fetch_from_baostock = lambda *args, **kwargs: (_ for _ in ()).throw(Exception("OFFLINE MODE: API Call to Baostock blocked!"))
         self._fetch_from_sina = lambda *args, **kwargs: (_ for _ in ()).throw(Exception("OFFLINE MODE: API Call to Sina blocked!"))
