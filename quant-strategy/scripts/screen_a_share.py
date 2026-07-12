@@ -164,8 +164,10 @@ def load_financial_tables(report_date: str) -> tuple[pd.DataFrame, pd.DataFrame]
             "股票简称",
             "营业总收入-营业总收入",
             "营业总收入-同比增长",
+            "营业总收入-季度环比增长",
             "净利润-净利润",
             "净利润-同比增长",
+            "净利润-季度环比增长",
             "所处行业",
             "最新公告日期",
         ]
@@ -410,8 +412,10 @@ def load_financial_table_as_of(
                 "财务报告期",
                 "营业总收入-营业总收入",
                 "营业总收入-同比增长",
+                "营业总收入-季度环比增长",
                 "净利润-净利润",
                 "净利润-同比增长",
+                "净利润-季度环比增长",
                 "资产负债率",
                 "所处行业",
                 "最新公告日期",
@@ -455,7 +459,7 @@ def load_financial_table_as_of(
         return empty, candidate_report_dates, mode
 
     financial = pd.concat(frames, ignore_index=True)
-    for col in ["营业总收入-营业总收入", "营业总收入-同比增长", "净利润-净利润", "净利润-同比增长", "资产负债率"]:
+    for col in ["营业总收入-营业总收入", "营业总收入-同比增长", "营业总收入-季度环比增长", "净利润-净利润", "净利润-同比增长", "净利润-季度环比增长", "资产负债率"]:
         financial[col] = pd.to_numeric(financial[col], errors="coerce")
 
     financial["财务报告期_dt"] = pd.to_datetime(
@@ -466,20 +470,20 @@ def load_financial_table_as_of(
         ascending=[True, False, False, False],
     )
     
-    # Add 4-quarter YoY positive growth flag
+    # Add 3-quarter QoQ positive growth flag (Losses narrowing or profits rising)
     def check_acceleration(grp):
         import numpy as np
         if len(grp) < 3:
             return False
             
         grp_asc = grp.sort_values("财务报告期_dt", ascending=True)
-        prof_yoy = pd.to_numeric(grp_asc["净利润-同比增长"].values[-3:], errors="coerce")
-        rev_yoy = pd.to_numeric(grp_asc["营业总收入-同比增长"].values[-3:], errors="coerce")
+        prof_qoq = pd.to_numeric(grp_asc["净利润-季度环比增长"].values[-3:], errors="coerce")
+        rev_qoq = pd.to_numeric(grp_asc["营业总收入-季度环比增长"].values[-3:], errors="coerce")
         
-        if np.isnan(prof_yoy).any() or np.isnan(rev_yoy).any():
+        if np.isnan(prof_qoq).any() or np.isnan(rev_qoq).any():
             return False
             
-        return (prof_yoy > 0).all() and (rev_yoy > 0).all()
+        return (prof_qoq > 0).all() and (rev_qoq > 0).all()
 
     accel_flags = financial.groupby("股票代码").apply(check_acceleration).reset_index(name="3个季度连续加速增长")
     financial = financial.merge(accel_flags, on="股票代码", how="left")
@@ -508,8 +512,10 @@ def attach_latest_financial_fields(
             "财务报告期",
             "营业总收入-营业总收入",
             "营业总收入-同比增长",
+            "营业总收入-季度环比增长",
             "净利润-净利润",
             "净利润-同比增长",
+            "净利润-季度环比增长",
             "资产负债率",
             "最新公告日期",
             "公告日期",
@@ -529,8 +535,10 @@ def attach_latest_financial_fields(
                 "财务报告期",
                 "营业总收入-营业总收入",
                 "营业总收入-同比增长",
+                "营业总收入-季度环比增长",
                 "净利润-净利润",
                 "净利润-同比增长",
+                "净利润-季度环比增长",
                 "资产负债率",
                 "3个季度连续加速增长",
                 "所处行业",
@@ -693,11 +701,11 @@ GROWTH_INDUSTRIES = [
 
 def filter_growth_strategy(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
     """
-    4-Quarter Continuous Improvement Strategy (连续4个季度业绩改善/减亏):
+    3-Quarter Continuous Improvement Strategy (连续3个季度业绩环比改善/减亏):
     1. Industry in GROWTH_INDUSTRIES
     2. Market Cap > args.market_cap_min_yi * 100 million
     3. Debt Ratio < args.debt_ratio_max
-    4. Past 4 quarters YoY Profit & Revenue Growth must be > 0 (supports loss-reduction)
+    4. Past 3 quarters QoQ Profit & Revenue Growth must be > 0 (supports loss-reduction)
     5. PEG constraint: PE < min(Profit YoY, Revenue YoY)
     """
     if df.empty:
