@@ -253,7 +253,25 @@ def main():
     final_output = {}
     
     # Process A shares
-    final_output["hot_spot_a_stock"] = filter_a_share(llm_pools.get("A_Stock", []))
+    a_share_results = filter_a_share(llm_pools.get("A_Stock", []))
+    
+    # Apply shareholder filter
+    try:
+        from data_provider import stock_gdhs_cached
+        import pandas as pd
+        gdhs = stock_gdhs_cached()
+        if not gdhs.empty:
+            gdhs['股东户数-本次'] = pd.to_numeric(gdhs['股东户数-本次'], errors='coerce')
+            valid_gdhs = gdhs[gdhs['股东户数-本次'] < 100000]
+            valid_codes = set(valid_gdhs['代码'].astype(str))
+            
+            original_len = len(a_share_results)
+            a_share_results = [r for r in a_share_results if str(r.get("股票代码", "")) in valid_codes]
+            print(f"Shareholder filter: filtered {original_len} A-shares down to {len(a_share_results)}")
+    except Exception as e:
+        print(f"Failed to apply shareholder filter in hot spot: {e}")
+        
+    final_output["hot_spot_a_stock"] = a_share_results
     
     # Process Global shares
     final_output["hot_spot_us_stock"] = filter_global(llm_pools.get("US_Stock", []))

@@ -14,6 +14,7 @@ from data_provider import (
     stock_zcfz_em_cached,
     stock_dividend_cninfo_cached,
     stock_info_a_code_name_cached,
+    stock_gdhs_cached,
     clear_cache,
 )
 import pandas as pd
@@ -1088,6 +1089,25 @@ def main() -> int:
             final_dividend = final_dividend[final_dividend["TTM股息率"].notna() & (final_dividend["TTM股息率"] > args.dividend_yield_min)].copy()
             
         final_growth = with_dividend[with_dividend["股票代码"].isin(growth_candidates["股票代码"])].copy()
+        
+        # Apply shareholder constraint (< 100000)
+        def filter_by_shareholder_count(df: pd.DataFrame, max_count: int = 100000) -> pd.DataFrame:
+            if df.empty:
+                return df
+            try:
+                gdhs = stock_gdhs_cached()
+                if not gdhs.empty:
+                    gdhs['股东户数-本次'] = pd.to_numeric(gdhs['股东户数-本次'], errors='coerce')
+                    valid_gdhs = gdhs[gdhs['股东户数-本次'] < max_count]
+                    valid_codes = set(valid_gdhs['代码'].astype(str))
+                    return df[df['股票代码'].isin(valid_codes)].copy()
+            except Exception as e:
+                import logging
+                logging.error(f"Failed to filter by shareholder count: {e}")
+            return df
+            
+        final_dividend = filter_by_shareholder_count(final_dividend)
+        final_growth = filter_by_shareholder_count(final_growth)
         
         div_result = output_columns(final_dividend)
         gro_result = output_columns(final_growth)

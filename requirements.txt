@@ -13,3 +13,4 @@ yfinance==1.2.0
 Markdown==3.9
 schedule==1.2.2
 matplotlib==3.9.4
+baostock==0.9.3

@@ -217,7 +217,8 @@ async def _fetch_em_report_async(date, report_name):
                     pages = data["result"]["pages"]
                     first_page = data["result"]["data"]
                     break
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Fetch failed on attempt {attempt} for {url}: {e}")
                 if attempt == 2: raise
                 await asyncio.sleep(2 ** attempt)
         
@@ -289,3 +290,9 @@ def stock_dividend_cninfo_cached(symbol: str) -> pd.DataFrame:
 @with_retry(max_retries=3, delay=2)
 def stock_info_a_code_name_cached() -> pd.DataFrame:
     return ak.stock_info_a_code_name()
+
+@disk_cache(expire_hours=24)
+@with_retry(max_retries=3, delay=2)
+def stock_gdhs_cached() -> pd.DataFrame:
+    """Fetch shareholder counts for all A-shares."""
+    return ak.stock_zh_a_gdhs(symbol="最新")

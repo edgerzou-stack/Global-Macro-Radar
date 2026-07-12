@@ -4,6 +4,7 @@ import pandas as pd
 import datetime
 import yfinance as yf
 import akshare as ak
+import baostock as bs
 import logging
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -13,10 +14,41 @@ class DataIntegrityError(Exception):
     """Raised when fetched data fails integrity checks (e.g., price <= 0)."""
     pass
 
+class CircuitBreakerError(Exception):
+    """Raised when a data source triggers a circuit breaker."""
+    pass
+
+class FatalSystemError(Exception):
+    """Raised when all data sources are broken (double circuit breaker)."""
+    pass
+
+class CircuitBreaker:
+    def __init__(self, name: str, threshold: int = 2):
+        self.name = name
+        self.threshold = threshold
+        self.failures = 0
+        self.tripped = False
+        
+    def record_failure(self):
+        self.failures += 1
+        if self.failures >= self.threshold:
+            if not self.tripped:
+                logger.error(f"[CIRCUIT BREAKER TRIPPED] Data source '{self.name}' has failed {self.failures} times sequentially. Bypassing it entirely for this run.")
+            self.tripped = True
+            
+    def record_success(self):
+        # Only reset if not tripped. Once tripped, it stays tripped for the run.
+        if not self.tripped:
+            self.failures = 0
+
 class DataGateway:
+    # Class level circuit breakers (persist across requests in a single run)
+    CB_BAOSTOCK = CircuitBreaker("baostock", threshold=2)
+    CB_SINA = CircuitBreaker("sina_akshare", threshold=2)
+    CB_YFINANCE = CircuitBreaker("yfinance", threshold=2)
+
     def __init__(self, db_path=None):
         if db_path is None:
-            # Default to scripts/.cache/market_data_cache.db
             scripts_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             cache_dir = os.path.join(scripts_dir, ".cache")
             os.makedirs(cache_dir, exist_ok=True)
@@ -45,28 +77,43 @@ class DataGateway:
             conn.commit()
 
     def _to_yf_symbol(self, symbol: str) -> str:
-        """Converts internal symbol (like 600519, 000001) to yfinance symbol."""
-        # Check if already a yfinance symbol (contains dot)
         if '.' in symbol and symbol.upper().endswith(('HK', 'US', 'SS', 'SZ', 'BJ')):
             return symbol
-            
         symbol_str = str(symbol)
-        
-        # A-share detection based on length and prefix
         if len(symbol_str) == 6 and symbol_str.isdigit():
             if symbol_str.startswith('6'):
                 return f"{symbol_str}.SS"
-            elif symbol_str.startswith(('8', '4', '9')): # Beijing exchange / NEEQ
+            elif symbol_str.startswith(('8', '4', '9')):
                 return f"{symbol_str}.BJ"
             else:
                 return f"{symbol_str}.SZ"
-                
-        # Assume Hong Kong if not specified but part of HK strategy, or US.
-        # But this function only translates raw symbols.
+        return symbol
+
+    def _to_bs_symbol(self, symbol: str) -> str:
+        """Converts internal symbol (like 600519) to baostock symbol (sh.600519)."""
+        symbol_str = str(symbol)
+        if len(symbol_str) == 6 and symbol_str.isdigit():
+            if symbol_str.startswith('6'):
+                return f"sh.{symbol_str}"
+            elif symbol_str.startswith(('8', '4', '9')):
+                return f"bj.{symbol_str}"
+            else:
+                return f"sz.{symbol_str}"
+        return symbol
+
+    def _to_sina_symbol(self, symbol: str) -> str:
+        """Converts internal symbol (like 600519) to sina symbol (sh600519)."""
+        symbol_str = str(symbol)
+        if len(symbol_str) == 6 and symbol_str.isdigit():
+            if symbol_str.startswith('6'):
+                return f"sh{symbol_str}"
+            elif symbol_str.startswith(('8', '4', '9')):
+                return f"bj{symbol_str}"
+            else:
+                return f"sz{symbol_str}"
         return symbol
 
     def _get_from_cache(self, symbol: str, start_date: str, end_date: str, adjust: str) -> pd.DataFrame:
-        """Reads historical data from SQLite cache."""
         with sqlite3.connect(self.db_path, timeout=30.0) as conn:
             conn.execute('PRAGMA journal_mode=WAL;')
             query = """
@@ -79,7 +126,6 @@ class DataGateway:
         return df
 
     def _save_to_cache(self, symbol: str, df: pd.DataFrame, adjust: str):
-        """Saves historical data to SQLite cache."""
         if df is None or df.empty:
             return
             
@@ -99,7 +145,7 @@ class DataGateway:
                 high_val = float(row.get('最高', 0.0))
                 low_val = float(row.get('最低', 0.0))
                 volume_val = float(row.get('成交量', 0.0))
-            elif isinstance(idx, pd.Timestamp) or isinstance(idx, datetime.datetime) or isinstance(idx, datetime.date):
+            elif isinstance(idx, (pd.Timestamp, datetime.datetime, datetime.date)):
                 date_val = idx.strftime('%Y%m%d')
                 open_val = float(row.get('Open', 0.0))
                 close_val = float(row.get('Close', 0.0))
@@ -120,53 +166,118 @@ class DataGateway:
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, to_insert)
                 conn.commit()
-            conn.close()
 
-    @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=1, max=4))
-    def _fetch_from_yfinance(self, symbol: str, start_date: str, end_date: str, adjust: str = "") -> pd.DataFrame:
-        yf_sym = self._to_yf_symbol(symbol)
+    @retry(stop=stop_after_attempt(1))
+    def _fetch_from_baostock(self, symbol: str, start_date: str, end_date: str, adjust: str) -> pd.DataFrame:
+        if DataGateway.CB_BAOSTOCK.tripped:
+            raise CircuitBreakerError("BaoStock circuit breaker is tripped.")
+            
+        bs_sym = self._to_bs_symbol(symbol)
+        start_fmt = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]}"
+        end_fmt = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:]}"
         
+        # adjustflag: '1': hfq (post-adjust), '2': qfq (pre-adjust), '3': non-adjust
+        flag = "2" if adjust == "qfq" else ("1" if adjust == "hfq" else "3")
+        
+        try:
+            bs.login()
+            rs = bs.query_history_k_data_plus(
+                bs_sym, "date,open,high,low,close,volume",
+                start_date=start_fmt, end_date=end_fmt, frequency="d", adjustflag=flag
+            )
+            
+            if rs.error_code != '0':
+                raise ValueError(f"BaoStock query error: {rs.error_msg}")
+                
+            data_list = []
+            while (rs.error_code == '0') & rs.next():
+                data_list.append(rs.get_row_data())
+            
+            if not data_list:
+                raise ValueError(f"BaoStock returned empty dataframe for {bs_sym}")
+                
+            df = pd.DataFrame(data_list, columns=rs.fields)
+            df = df.rename(columns={
+                'date': '日期', 'open': '开盘', 'close': '收盘',
+                'high': '最高', 'low': '最低', 'volume': '成交量'
+            })
+            df['日期'] = df['日期'].str.replace('-', '')
+            
+            # Numeric conversion
+            for col in ['开盘', '收盘', '最高', '最低', '成交量']:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            DataGateway.CB_BAOSTOCK.record_success()
+            return df
+        except Exception as e:
+            DataGateway.CB_BAOSTOCK.record_failure()
+            raise e
+        finally:
+            bs.logout()
+
+    @retry(stop=stop_after_attempt(1))
+    def _fetch_from_sina(self, symbol: str, start_date: str, end_date: str, adjust: str) -> pd.DataFrame:
+        if DataGateway.CB_SINA.tripped:
+            raise CircuitBreakerError("Sina circuit breaker is tripped.")
+            
+        sina_sym = self._to_sina_symbol(symbol)
+        try:
+            df = ak.stock_zh_a_daily(symbol=sina_sym, start_date=start_date, end_date=end_date, adjust=adjust)
+            if df.empty:
+                raise ValueError(f"Sina returned empty dataframe for {sina_sym}")
+            
+            df = df.reset_index()
+            if 'date' in df.columns:
+                df = df.rename(columns={
+                    'date': '日期', 'open': '开盘', 'close': '收盘',
+                    'high': '最高', 'low': '最低', 'volume': '成交量'
+                })
+                # Check if it's datetime or str
+                if pd.api.types.is_datetime64_any_dtype(df['日期']):
+                    df['日期'] = df['日期'].dt.strftime('%Y%m%d')
+                else:
+                    df['日期'] = df['日期'].astype(str).str.replace('-', '')
+            
+            DataGateway.CB_SINA.record_success()
+            return df
+        except Exception as e:
+            DataGateway.CB_SINA.record_failure()
+            raise e
+
+    @retry(stop=stop_after_attempt(1))
+    def _fetch_from_yfinance(self, symbol: str, start_date: str, end_date: str, adjust: str = "") -> pd.DataFrame:
+        if DataGateway.CB_YFINANCE.tripped:
+            raise CircuitBreakerError("YFinance circuit breaker is tripped.")
+            
+        yf_sym = self._to_yf_symbol(symbol)
         start_fmt = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]}"
         end_dt = datetime.datetime.strptime(end_date, "%Y%m%d") + datetime.timedelta(days=1)
         end_fmt = end_dt.strftime("%Y-%m-%d")
         
         auto_adj = True if adjust == "hfq" else False
-        ticker = yf.Ticker(yf_sym)
-        df = ticker.history(start=start_fmt, end=end_fmt, auto_adjust=auto_adj)
-        
-        if df.empty:
-            raise ValueError(f"YFinance returned empty dataframe for {yf_sym}")
+        try:
+            ticker = yf.Ticker(yf_sym)
+            df = ticker.history(start=start_fmt, end=end_fmt, auto_adjust=auto_adj)
             
-        df = df.reset_index()
-        if 'Date' in df.columns:
-            df = df.rename(columns={
-                'Date': '日期', 'Open': '开盘', 'Close': '收盘',
-                'High': '最高', 'Low': '最低', 'Volume': '成交量'
-            })
-            df['日期'] = df['日期'].dt.strftime('%Y%m%d')
-            
-        return df
-
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    def _fetch_from_akshare(self, symbol: str, start_date: str, end_date: str, adjust: str) -> pd.DataFrame:
-        import time
-        time.sleep(0.3) # Throttle to prevent akshare API connection reset
-        if len(symbol) == 6 and symbol.isdigit():
-            df = ak.stock_zh_a_hist(symbol=symbol, start_date=start_date, end_date=end_date, adjust=adjust)
             if df.empty:
-                df = ak.fund_etf_hist_em(symbol=symbol, start_date=start_date, end_date=end_date, adjust=adjust)
-        else:
-            raise ValueError("Akshare fallback only implemented for A-shares/ETFs.")
-            
-        if df.empty:
-            raise ValueError(f"Akshare returned empty dataframe for {symbol}")
-            
-        return df
+                raise ValueError(f"YFinance returned empty dataframe for {yf_sym}")
+                
+            df = df.reset_index()
+            if 'Date' in df.columns:
+                df = df.rename(columns={
+                    'Date': '日期', 'Open': '开盘', 'Close': '收盘',
+                    'High': '最高', 'Low': '最低', 'Volume': '成交量'
+                })
+                df['日期'] = df['日期'].dt.strftime('%Y%m%d')
+                
+            DataGateway.CB_YFINANCE.record_success()
+            return df
+        except Exception as e:
+            DataGateway.CB_YFINANCE.record_failure()
+            raise e
 
     def get_historical_prices(self, symbol: str, start_date: str, end_date: str, adjust: str = "") -> pd.DataFrame:
-        """
-        Standardized method to get historical daily prices.
-        """
         start_date = str(start_date).replace('-', '')
         end_date = str(end_date).replace('-', '')
         
@@ -181,19 +292,35 @@ class DataGateway:
         is_a_share = len(symbol) == 6 and symbol.isdigit()
         
         if is_a_share:
+            # Multi-level Failover Strategy for A-Shares
             try:
-                df_new = self._fetch_from_akshare(symbol, start_date, end_date, adjust)
-            except Exception as e:
-                logger.warning(f"DataGateway: akshare failed for {symbol} ({start_date}-{end_date}): {e}. Falling back to yfinance.")
+                df_new = self._fetch_from_baostock(symbol, start_date, end_date, adjust)
+            except Exception as e_bs:
+                logger.warning(f"DataGateway: baostock failed for {symbol}: {e_bs}. Falling back to Sina.")
                 try:
-                    df_new = self._fetch_from_yfinance(symbol, start_date, end_date, adjust)
-                except Exception as e2:
-                    logger.error(f"DataGateway: yfinance also failed for {symbol}: {e2}.")
+                    df_new = self._fetch_from_sina(symbol, start_date, end_date, adjust)
+                except Exception as e_sina:
+                    logger.warning(f"DataGateway: Sina failed for {symbol}: {e_sina}. Falling back to YFinance.")
+                    try:
+                        df_new = self._fetch_from_yfinance(symbol, start_date, end_date, adjust)
+                    except Exception as e_yf:
+                        logger.error(f"DataGateway: All A-share sources failed for {symbol}.")
+                        
+                        # Check global double (or triple) circuit breaker logic
+                        if DataGateway.CB_BAOSTOCK.tripped and DataGateway.CB_SINA.tripped and DataGateway.CB_YFINANCE.tripped:
+                            err_msg = "FATAL ERROR: All three data sources (BaoStock, Sina, YFinance) have tripped their circuit breakers. Aborting pipeline to prevent dirty data."
+                            logger.critical(err_msg)
+                            raise FatalSystemError(err_msg)
         else:
+            # Non-A shares (US/HK)
             try:
                 df_new = self._fetch_from_yfinance(symbol, start_date, end_date, adjust)
             except Exception as e:
-                logger.error(f"DataGateway: yfinance failed for {symbol}: {e}.")
+                logger.error(f"DataGateway: YFinance failed for {symbol}: {e}.")
+                if DataGateway.CB_YFINANCE.tripped:
+                    err_msg = "FATAL ERROR: YFinance circuit breaker tripped for non-A-share asset. Aborting pipeline."
+                    logger.critical(err_msg)
+                    raise FatalSystemError(err_msg)
                 
         if not df_new.empty:
             if (df_new['收盘'] <= 0).any():
@@ -205,7 +332,6 @@ class DataGateway:
             if not df_cache.empty:
                 df_new = pd.concat([df_cache, df_new]).drop_duplicates(subset=['日期']).sort_values('日期')
                 
-            # Final filter to return only the requested range
             df_new['日期'] = df_new['日期'].astype(str).str.replace('-', '').str[:8]
             df_new = df_new[(df_new['日期'] >= start_date) & (df_new['日期'] <= end_date)]
             return df_new
@@ -213,9 +339,6 @@ class DataGateway:
         return df_cache
 
     def get_open_price(self, symbol: str, target_date: str) -> float:
-        """
-        Gets the open price for a specific date (or the next available trading day).
-        """
         from core.market import AShareMarket, HKMarket, USMarket
         if symbol.endswith('.HK'):
             market = HKMarket()
@@ -227,28 +350,24 @@ class DataGateway:
         target_date_str = str(target_date).replace('-', '')[:8]
         target_dt = datetime.datetime.strptime(target_date_str, "%Y%m%d").date()
         
-        # Get exact next trading day
         exact_trade_date = market.get_next_trading_date(target_dt)
         exact_date_str = exact_trade_date.strftime("%Y%m%d")
         
         try:
-            # Only fetch the exact date needed
             df = self.get_historical_prices(symbol, exact_date_str, exact_date_str, adjust="")
-            
             if not df.empty:
                 for _, row in df.iterrows():
                     dt_str = str(row['日期']).replace('-', '')
                     if dt_str == exact_date_str:
                         return float(row['开盘'])
+        except FatalSystemError:
+            raise
         except Exception as e:
             logger.error(f"Failed to get open price for {symbol} around {target_date}: {e}")
             
         return 0.0
 
     def get_current_price(self, symbol: str) -> float:
-        """
-        Gets the latest available snapshot price (close).
-        """
         from core.market import AShareMarket, HKMarket, USMarket
         if symbol.endswith('.HK'):
             market = HKMarket()
@@ -259,9 +378,13 @@ class DataGateway:
             
         effective_date_str = market.get_effective_trading_date().replace('-', '')
         
-        df = self.get_historical_prices(symbol, effective_date_str, effective_date_str, adjust="")
-        
-        if not df.empty:
-            return float(df.iloc[-1]['收盘'])
+        try:
+            df = self.get_historical_prices(symbol, effective_date_str, effective_date_str, adjust="")
+            if not df.empty:
+                return float(df.iloc[-1]['收盘'])
+        except FatalSystemError:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to get current price for {symbol}: {e}")
             
         return 0.0
