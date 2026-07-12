@@ -49,3 +49,8 @@ Format it strictly as follows:
 # Project Specific Rule: Database Protection and State Isolation
 - **No Destructive Database Operations**: You MUST NEVER execute scripts (e.g. `db_reset.py`, `scratch_test.py`) that drop tables, delete records, or otherwise clear the production database (`quant_system.db`). You MUST NEVER write or execute bare SQL queries containing `DELETE` or `DROP` against the production tables (`trade_history`, `portfolio`) without explicit, unambiguous approval from the User.
 - **Respect Database Triggers**: The database is physically protected by SQLite triggers that block `DELETE` operations on `trade_history`. Do not attempt to bypass these triggers or drop them unless specifically ordered to perform a safe wipe by the user.
+
+# Universal Rule: Plan Archiving
+- Whenever you create an `implementation_plan.md` artifact in your isolated brain directory, you MUST also save a persistent copy of it to the local workspace in the `.agents/plans/` directory.
+- Name the file descriptively with a timestamp, e.g., `.agents/plans/YYYYMMDD_feature_name_plan.md`.
+- This ensures that all historical implementation plans are version-controlled and easily accessible to the user in their IDE.
