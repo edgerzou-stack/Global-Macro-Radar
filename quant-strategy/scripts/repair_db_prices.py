@@ -7,6 +7,8 @@ import datetime
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(ROOT, "scripts"))
 from core.data_gateway import DataGateway
+from core.data_anomaly import DataAnomalyError
+
 
 db_path = os.path.join(ROOT, "quant_system.db")
 
@@ -49,6 +51,13 @@ def repair():
             true_exit = float(df_exit.iloc[-1]['收盘'])
             fee = 0.001 if '_a_' in strat else (0.002 if '_hk_' in strat else 0.000)
             true_pnl = (true_exit / true_entry - 1) - fee
+            
+            duration = (exit_dt - entry_dt).days or 1
+            try:
+                gateway.verify_extreme_move(code, duration, true_entry, true_exit)
+            except DataAnomalyError as e:
+                print(f"  [ERROR] {e} Skipping fix for {yf_code}.")
+                continue
             
             with sqlite3.connect(db_path, timeout=30.0) as conn_upd:
                 conn_upd.execute('PRAGMA journal_mode=WAL;')

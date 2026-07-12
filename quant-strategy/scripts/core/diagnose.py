@@ -7,7 +7,9 @@ from core.clock import clock
 
 _SPOT_CACHE = None
 _SPOT_LOCK = threading.Lock()
+import logging
 
+logger = logging.getLogger(__name__)
 def get_spot_cache():
     global _SPOT_CACHE
     if _SPOT_CACHE is None:
@@ -15,7 +17,8 @@ def get_spot_cache():
             if _SPOT_CACHE is None:
                 try:
                     _SPOT_CACHE = ak.stock_zh_a_spot_em()
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"Failed to fetch spot cache: {e}")
                     _SPOT_CACHE = pd.DataFrame()
     return _SPOT_CACHE
 
@@ -57,8 +60,8 @@ def diagnose_elimination(code: str, strategy: str) -> str:
                 ttm = calculate_ttm_dividend_yield_for_code(code)
                 if ttm and ttm < 3.0:
                     return f"TTM股息率({ttm:.2f}%) 跌破 3.0% 阈值"
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"TTM check failed for {code}: {e}")
                 
         elif "growth" in strategy:
             try:
@@ -69,8 +72,8 @@ def diagnose_elimination(code: str, strategy: str) -> str:
                     cagr = pd.to_numeric(cagr_row.get("3年净利润CAGR", 0), errors="coerce")
                     if pd.notna(cagr) and cagr < 5.0:
                         return f"净利润三年复合增速({cagr:.1f}%) 跌破 5% 要求"
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"CAGR check failed for {code}: {e}")
                 
         return "满足基础硬约束，但相对动能衰退被其他更优标的挤出前 10 名"
         

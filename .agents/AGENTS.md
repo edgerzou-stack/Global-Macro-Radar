@@ -45,3 +45,7 @@ Format it strictly as follows:
   1. **Public Repository (main branch)**: Commit and push all core system logic, pipelines, UI, and configuration (excluding sensitive keys and the `tests/` directory) to the `public` remote's `main` branch.
   2. **Private Repository (private-main branch)**: Switch to the `private-main` branch, merge `main`, add the `tests/` directory (which contains proprietary regression testing logic), commit, and push to the `private` remote (`git push private private-main:main`).
   3. **Cleanup**: Always switch back to the `main` branch after syncing to leave the workspace in a clean state.
+
+# Project Specific Rule: Database Protection and State Isolation
+- **No Destructive Database Operations**: You MUST NEVER execute scripts (e.g. `db_reset.py`, `scratch_test.py`) that drop tables, delete records, or otherwise clear the production database (`quant_system.db`). You MUST NEVER write or execute bare SQL queries containing `DELETE` or `DROP` against the production tables (`trade_history`, `portfolio`) without explicit, unambiguous approval from the User.
+- **Respect Database Triggers**: The database is physically protected by SQLite triggers that block `DELETE` operations on `trade_history`. Do not attempt to bypass these triggers or drop them unless specifically ordered to perform a safe wipe by the user.

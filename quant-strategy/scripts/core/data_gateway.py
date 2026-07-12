@@ -1,6 +1,8 @@
 import os
 import sqlite3
 import pandas as pd
+from core.data_anomaly import DataAnomalyError
+
 import datetime
 import yfinance as yf
 import akshare as ak
@@ -113,6 +115,36 @@ class DataGateway:
                 return f"sz{symbol_str}"
         return symbol
 
+    
+    def verify_extreme_move(self, symbol: str, duration_days: int, entry_price: float, exit_price: float) -> bool:
+        """
+        Verifies if a price move is mathematically possible given the duration and market limits.
+        Raises DataAnomalyError if the move is impossible (indicating mixed adjusted/unadjusted data).
+        """
+        if entry_price <= 0: return True
+        
+        ret = (exit_price / entry_price) - 1
+        
+        is_a_share = len(symbol) == 6 and symbol.isdigit()
+        if is_a_share:
+            # A-shares have a daily limit of 10% or 20% (STAR/ChiNext).
+            # We allow a maximum of 25% per trading day (to account for edge cases / new IPOs / resumptions).
+            # Over multiple days, the max return compounds.
+            # If duration is very short (e.g. 1-3 days) and return is absurdly high/low, block it.
+            max_daily_return = 0.25
+            min_daily_return = -0.25
+            
+            # Simple linear approximation for bounds check to prevent extreme silent corruption
+            max_allowed = (1 + max_daily_return) ** duration_days - 1
+            min_allowed = (1 + min_daily_return) ** duration_days - 1
+            
+            # Allow slightly more leniency for compounding, but block obvious anomalies like -92% or +80% in 1 day
+            if duration_days <= 5:
+                if ret < -0.50 or ret > 0.80:
+                    raise DataAnomalyError(f"Impossible A-share return of {ret:.2%} over {duration_days} days for {symbol}. Suspect unadjusted ex-dividend data.")
+                    
+        return True
+
     def _get_from_cache(self, symbol: str, start_date: str, end_date: str, adjust: str) -> pd.DataFrame:
         with sqlite3.connect(self.db_path, timeout=30.0) as conn:
             conn.execute('PRAGMA journal_mode=WAL;')
@@ -210,6 +242,8 @@ class DataGateway:
             
             DataGateway.CB_BAOSTOCK.record_success()
             return df
+        except ValueError as e:
+            raise e
         except Exception as e:
             DataGateway.CB_BAOSTOCK.record_failure()
             raise e
@@ -241,6 +275,8 @@ class DataGateway:
             
             DataGateway.CB_SINA.record_success()
             return df
+        except ValueError as e:
+            raise e
         except Exception as e:
             DataGateway.CB_SINA.record_failure()
             raise e
@@ -273,6 +309,8 @@ class DataGateway:
                 
             DataGateway.CB_YFINANCE.record_success()
             return df
+        except ValueError as e:
+            raise e
         except Exception as e:
             DataGateway.CB_YFINANCE.record_failure()
             raise e

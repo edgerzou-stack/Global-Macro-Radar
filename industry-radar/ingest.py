@@ -1,6 +1,9 @@
 import feedparser
 import requests
+import logging
 import concurrent.futures
+
+logger = logging.getLogger(__name__)
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 
@@ -27,7 +30,8 @@ def fetch_rss_feeds(feeds, hours_back=168):
                         try:
                             from dateutil import parser as date_parser
                             pub_date = date_parser.parse(raw_date).replace(tzinfo=None)
-                        except Exception:
+                        except Exception as e:
+                            logger.warning(f"Date parse error for {raw_date}: {e}")
                             pub_date = datetime.now()
                     else:
                         pub_date = datetime.now()

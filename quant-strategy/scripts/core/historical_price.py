@@ -1,6 +1,9 @@
 import yfinance as yf
 import pandas as pd
 import datetime
+import logging
+
+logger = logging.getLogger(__name__)
 import os
 import pickle
 from core.clock import clock
@@ -31,8 +34,8 @@ def get_historical_closes_bulk(symbols: list[str], as_of_date: str) -> dict[str,
             try:
                 with open(disk_cache_file, "rb") as f:
                     _BULK_CACHE[cache_key] = pickle.load(f)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to load bulk cache {disk_cache_file}: {e}")
                 
         if cache_key not in _BULK_CACHE:
             print(f"Downloading 2 years of history for {len(symbols)} symbols to build local cache...")

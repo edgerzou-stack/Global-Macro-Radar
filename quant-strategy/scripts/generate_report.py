@@ -357,9 +357,8 @@ def generate_subsection_md(strategy_id, results, headers, diff, trade_history, b
     if llm_review:
         out += llm_review
 
-    if strat_trades:
-        out += "**历史平仓交割单明细**\n\n"
-        out += render_history_md(strategy_id, trade_history, code_map)
+    out += "**历史平仓交割单明细**\n\n"
+    out += render_history_md(strategy_id, trade_history, code_map)
         
     out += "**资金净值曲线图**\n\n"
     out += get_chart_md(f"pnl_chart_{strategy_id}.png", base_dir)
@@ -424,10 +423,8 @@ def generate_subsection_html(strategy_id, results, headers, diff, trade_history,
         
     if llm_review:
         html += f"<div style='margin-top:20px; padding:15px; background-color:#eef2ff; border-radius:8px;'>{llm_review}</div>\n"
-    if strat_trades:
-        html += "<h4>历史平仓交割单明细</h4>\n"
-        html += render_history_html(strategy_id, trade_history, code_map)
-        
+    html += "<h4>历史平仓交割单明细</h4>\n"
+    html += render_history_html(strategy_id, trade_history, code_map)
     html += "<h4>资金净值曲线图</h4>\n"
     html += get_chart_html(f"pnl_chart_{strategy_id}.png", base_dir)
     return html
