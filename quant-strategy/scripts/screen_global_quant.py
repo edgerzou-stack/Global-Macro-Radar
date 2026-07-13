@@ -93,6 +93,41 @@ def process_a_share_data(args, a_tickers, as_of_date):
     
     return div_df, gro_df, a_prices
 
+def inject_portfolio_metrics(results, portfolio, snapshot_date, gateway_instance=None):
+    from core.data_gateway import DataGateway
+    import logging
+    
+    gateway = gateway_instance if gateway_instance else DataGateway()
+    
+    for strat in STRATEGIES:
+        for row in results.get(strat, []):
+            key = get_key(row, strat)
+            ep = portfolio[strat].get(key, {}).get("entry_price", 0.0)
+            ed = portfolio[strat].get(key, {}).get("entry_date", snapshot_date)
+            shares = portfolio[strat].get(key, {}).get("shares", 1)
+            cp = row.get("最新价", 0.0)
+            if cp is None: cp = 0.0
+            
+            # Fetch QFQ price for entry_date to calculate accurate floating return
+            adj_ep = ep
+            if ep > 0 and ed != snapshot_date:
+                try:
+                    yf_code = key
+                    if '_hk_' in strat and not key.upper().endswith('.HK'):
+                        yf_code = f"{key}.HK"
+                    ed_str = ed[:10].replace('-', '')
+                    dt = datetime.strptime(ed_str, '%Y%m%d')
+                    start_str = (dt - timedelta(days=7)).strftime('%Y%m%d')
+                    df_qfq = gateway.get_historical_prices(yf_code, start_date=start_str, end_date=ed_str, adjust="qfq")
+                    if not df_qfq.empty:
+                        adj_ep = float(df_qfq.iloc[-1]['收盘'])
+                except Exception as e:
+                    logging.warning(f"Failed to fetch qfq price for {key} on {ed}: {e}")
+            
+            row["入选价格"] = float(ep)
+            row["仓位份数"] = shares
+            row["累计涨跌幅"] = f"{(cp / adj_ep - 1) * 100:.2f}%" if adj_ep > 0 else "0.00%"
+            row["入选日期"] = ed
 
 def main():
     parser = argparse.ArgumentParser(description="Global Macro Quant Screener V2")
@@ -282,18 +317,7 @@ Please return the selected top candidates (maximum 10) as a JSON array of their 
     portfolio, new_trades, diff = pm.diff_and_update(strategy_targets_market_filtered, current_prices, snapshot_date)
         
     # Inject entry_price and ROI back into results for display
-    for strat in STRATEGIES:
-        for row in results[strat]:
-            key = get_key(row, strat)
-            ep = portfolio[strat].get(key, {}).get("entry_price", 0.0)
-            ed = portfolio[strat].get(key, {}).get("entry_date", snapshot_date)
-            shares = portfolio[strat].get(key, {}).get("shares", 1)
-            cp = row.get("最新价", 0.0)
-            if cp is None: cp = 0.0
-            row["入选价格"] = float(ep)
-            row["仓位份数"] = shares
-            row["累计涨跌幅"] = f"{(cp / ep - 1) * 100:.2f}%" if ep > 0 else "0.00%"
-            row["入选日期"] = ed
+    inject_portfolio_metrics(results, portfolio, snapshot_date)
 
     payload = {
         "mode": "global_12_grid",

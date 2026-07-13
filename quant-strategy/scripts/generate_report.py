@@ -314,7 +314,8 @@ def generate_subsection_md(strategy_id, results, headers, diff, trade_history, b
     if strat_diff.get("added") or strat_diff.get("removed"):
         out += f"> **今日调仓提示**：\n"
         if strat_diff.get("added"):
-            added_strs = []
+            new_pool = []
+            grid_adds = []
             for item in strat_diff["added"]:
                 if isinstance(item, dict):
                     ep = item.get('entry_price', 0)
@@ -324,11 +325,19 @@ def generate_subsection_md(strategy_id, results, headers, diff, trade_history, b
                     if name == code:
                         name = get_stock_name(code)
                     display_name = f"{code} ({name})" if name != code else code
-                    strat_reason = STRAT_REASONS.get(strategy_id, "策略量化指标")
-                    added_strs.append(f"{display_name} (入选价: {ep_str}, 原因: 满足【{strat_reason}】入选标准)")
+                    
+                    item_reason = item.get("reason", "")
+                    if "网格加仓" in str(item_reason):
+                        grid_adds.append(f"{display_name} (加仓价: {ep_str}, 原因: {item_reason})")
+                    else:
+                        strat_reason = STRAT_REASONS.get(strategy_id, "策略量化指标")
+                        new_pool.append(f"{display_name} (入选价: {ep_str}, 原因: 满足【{strat_reason}】入选标准)")
                 else:
-                    added_strs.append(str(item))
-            out += f"> 🟢 **新增入池**：{', '.join(added_strs)}\n"
+                    new_pool.append(str(item))
+            if new_pool:
+                out += f"> 🟢 **新增入池**：{', '.join(new_pool)}\n"
+            if grid_adds:
+                out += f"> 🔵 **网格加仓**：{', '.join(grid_adds)}\n"
         if strat_diff.get("removed"):
             removed_strs = []
             for item in strat_diff["removed"]:
@@ -379,7 +388,8 @@ def generate_subsection_html(strategy_id, results, headers, diff, trade_history,
     if strat_diff.get("added") or strat_diff.get("removed"):
         html += f"<div class='alert'>\n  <p><strong>今日调仓提示：</strong></p>\n"
         if strat_diff.get("added"):
-            added_strs = []
+            new_pool = []
+            grid_adds = []
             for item in strat_diff["added"]:
                 if isinstance(item, dict):
                     ep = item.get('entry_price', 0)
@@ -389,11 +399,19 @@ def generate_subsection_html(strategy_id, results, headers, diff, trade_history,
                     if name == code:
                         name = get_stock_name(code)
                     display_name = f"{code} ({name})" if name != code else code
-                    strat_reason = STRAT_REASONS.get(strategy_id, "策略量化指标")
-                    added_strs.append(f"{display_name} (入选价: {ep_str}, 原因: 满足【{strat_reason}】入选标准)")
+                    
+                    item_reason = item.get("reason", "")
+                    if "网格加仓" in str(item_reason):
+                        grid_adds.append(f"{display_name} (加仓价: {ep_str}, 原因: {item_reason})")
+                    else:
+                        strat_reason = STRAT_REASONS.get(strategy_id, "策略量化指标")
+                        new_pool.append(f"{display_name} (入选价: {ep_str}, 原因: 满足【{strat_reason}】入选标准)")
                 else:
-                    added_strs.append(str(item))
-            html += f"  <p>🟢 <strong>新增入池</strong>：{', '.join(added_strs)}</p>\n"
+                    new_pool.append(str(item))
+            if new_pool:
+                html += f"  <p>🟢 <strong>新增入池</strong>：{', '.join(new_pool)}</p>\n"
+            if grid_adds:
+                html += f"  <p>🔵 <strong>网格加仓</strong>：{', '.join(grid_adds)}</p>\n"
         if strat_diff.get("removed"):
             removed_strs = []
             for item in strat_diff["removed"]:
