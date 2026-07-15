@@ -1,36 +1,28 @@
 import sqlite3
 import os
-import threading
 
-from db_utils import get_db_path
+from db_utils import get_db_path, normalize_db_path
 
 class CashManager:
     """
     Manages isolated cash accounts for each strategy.
     Implements the Sandbox Benchmark Engine.
     """
+    # Retained only for compatibility with older callers that reset this
+    # attribute in tests. Cash managers are intentionally not singletons:
+    # each instance is bound to one explicit database path.
     _instance = None
-    _lock = threading.Lock()
-    
-    def __new__(cls):
-        with cls._lock:
-            if cls._instance is None:
-                cls._instance = super(CashManager, cls).__new__(cls)
-                cls._instance._initialized = False
-        return cls._instance
 
-    def __init__(self):
-        if self._initialized:
-            return
-        
+    def __init__(self, db_path=None):
         self.INITIAL_CAPITAL = 1000000.0  # 1 Million base
         self.TRANCHE_RATIO = 0.033        # 3.3% per tranche
-        self.db_path = get_db_path()
-        self._initialized = True
+        self.db_path = normalize_db_path(db_path or get_db_path())
 
     def get_connection(self):
         conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.execute('PRAGMA journal_mode=WAL;')
+        conn.execute('PRAGMA foreign_keys=ON;')
+        conn.execute('PRAGMA busy_timeout=30000;')
         return conn
 
     def initialize_strategy(self, strategy_id: str, cursor=None):

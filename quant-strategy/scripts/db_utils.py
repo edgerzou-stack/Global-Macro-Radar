@@ -1,16 +1,58 @@
 import sqlite3
 import json
 import os
+import threading
+
+from core.quarantine import quarantine_exclusion
+
+
+DATABASE_ENV_KEY = "database_environment"
+ALLOWED_DATABASE_ENVIRONMENTS = {"production", "test", "backtest"}
+
+
+def normalize_db_path(path):
+    if not path:
+        raise ValueError("A database path is required")
+    return os.path.realpath(os.path.abspath(os.path.expanduser(os.fspath(path))))
+
+
+def get_production_db_path():
+    return normalize_db_path(
+        os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "quant_system.db",
+        )
+    )
 
 def get_db_path():
     # Use path relative to __file__ to always point to quant-strategy/quant_system.db
-    default_db = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "quant_system.db")
-    return os.environ.get("SQLITE_DB_PATH", default_db)
+    return normalize_db_path(os.environ.get("SQLITE_DB_PATH", get_production_db_path()))
 
-def init_db():
-    conn = sqlite3.connect(get_db_path(), timeout=30.0)
+def init_db(db_path=None, environment=None):
+    path = normalize_db_path(db_path or get_db_path())
+    requested_environment = environment or os.environ.get("QUANT_DB_ENV")
+    if requested_environment is None and path == get_production_db_path():
+        requested_environment = "production"
+    if (
+        path == get_production_db_path()
+        and requested_environment != "production"
+    ):
+        raise ValueError(
+            "The production database path cannot be initialized as test/backtest"
+        )
+    if (
+        requested_environment is not None
+        and requested_environment not in ALLOWED_DATABASE_ENVIRONMENTS
+    ):
+        raise ValueError(
+            f"Unsupported database environment: {requested_environment!r}"
+        )
+
+    conn = sqlite3.connect(path, timeout=30.0)
     c = conn.cursor()
     c.execute('PRAGMA journal_mode=WAL;')
+    c.execute('PRAGMA foreign_keys=ON;')
+    c.execute('PRAGMA busy_timeout=30000;')
     
     # Get current schema version
     c.execute('PRAGMA user_version;')
@@ -126,43 +168,91 @@ def init_db():
         ''')
         c.execute('PRAGMA user_version = 5;')
         version = 5
+
+    if requested_environment is not None:
+        c.execute("SELECT value FROM meta_data WHERE key = ?", (DATABASE_ENV_KEY,))
+        existing_environment = c.fetchone()
+        if (
+            existing_environment
+            and existing_environment[0] != requested_environment
+        ):
+            conn.rollback()
+            conn.close()
+            raise ValueError(
+                f"Database environment mismatch for {path}: "
+                f"stored={existing_environment[0]!r}, "
+                f"requested={requested_environment!r}"
+            )
+        c.execute(
+            "INSERT OR IGNORE INTO meta_data (key, value) VALUES (?, ?)",
+            (DATABASE_ENV_KEY, requested_environment),
+        )
         
     conn.commit()
+    _INITIALIZED_DB_PATHS.add(path)
     return conn
 
-import threading
+_INITIALIZED_DB_PATHS = set()
+# Kept as a compatibility attribute for older tests and integrations. Connection
+# initialization is deliberately keyed by absolute path instead of this boolean.
 _DB_INITIALIZED = False
 _db_lock = threading.Lock()
+_BACKED_UP_DB_PATHS = set()
 
-def get_connection():
-    global _DB_INITIALIZED
+def forget_initialized_path(db_path):
+    path = normalize_db_path(db_path)
     with _db_lock:
-        if not _DB_INITIALIZED:
-            conn = init_db()
-            _DB_INITIALIZED = True
+        _INITIALIZED_DB_PATHS.discard(path)
+
+
+def get_connection(db_path=None, environment=None):
+    path = normalize_db_path(db_path or get_db_path())
+    with _db_lock:
+        if path not in _INITIALIZED_DB_PATHS:
+            conn = init_db(path, environment=environment)
             return conn
-    db_path = get_db_path()
-    conn = sqlite3.connect(db_path, timeout=30.0)
+    conn = sqlite3.connect(path, timeout=30.0)
     conn.execute('PRAGMA journal_mode=WAL;')
+    conn.execute('PRAGMA foreign_keys=ON;')
+    conn.execute('PRAGMA busy_timeout=30000;')
     return conn
 
 def load_portfolio_and_trades():
     conn = get_connection()
     c = conn.cursor()
-    
-    c.execute("SELECT strategy, name_or_code, entry_date, entry_price, shares FROM portfolio")
+
+    portfolio_exclusion, _ = quarantine_exclusion(conn, "portfolio")
+    c.execute(
+        "SELECT id, strategy, name_or_code, entry_date, entry_price, shares "
+        f"FROM portfolio WHERE 1=1{portfolio_exclusion}"
+    )
     portfolio = {}
     for row in c.fetchall():
-        strategy, name_or_code, entry_date, entry_price, shares = row
+        _row_id, strategy, name_or_code, entry_date, entry_price, shares = row
         if strategy not in portfolio:
             portfolio[strategy] = {}
         # shares == 0 default in db implies 1 tranche originally
         portfolio[strategy][name_or_code] = {"entry_date": entry_date, "entry_price": entry_price, "shares": max(1, shares)}
-        
-    c.execute("SELECT strategy, name_or_code, entry_date, entry_price, exit_date, exit_price, pnl, reason FROM trade_history")
+
+    trade_exclusion, _ = quarantine_exclusion(conn, "trade_history")
+    c.execute(
+        "SELECT id, strategy, name_or_code, entry_date, entry_price, "
+        "exit_date, exit_price, pnl, reason "
+        f"FROM trade_history WHERE 1=1{trade_exclusion}"
+    )
     trade_history = []
     for row in c.fetchall():
-        strategy, name_or_code, entry_date, entry_price, exit_date, exit_price, pnl, reason = row
+        (
+            _row_id,
+            strategy,
+            name_or_code,
+            entry_date,
+            entry_price,
+            exit_date,
+            exit_price,
+            pnl,
+            reason,
+        ) = row
         trade_history.append({
             "strategy": strategy, "name": name_or_code, "entry_date": entry_date, 
             "entry_price": entry_price, "exit_date": exit_date, "exit_price": exit_price, "pnl": pnl,
@@ -203,12 +293,17 @@ def append_trades(trades_list):
     conn.close()
 
 def update_portfolio_and_trades(portfolio_dict, trades_list, snapshot_date=None, cursor=None):
-    # Trigger auto-backup before significant changes
-    try:
+    # Standalone callers get one verified pre-write backup per process/database.
+    # The daily coordinator sets QUANT_RUN_BACKUP_COMPLETED after its run-level
+    # backup so repeated portfolio updates do not duplicate the same snapshot.
+    db_path = get_db_path()
+    if (
+        os.environ.get("QUANT_RUN_BACKUP_COMPLETED") != "1"
+        and db_path not in _BACKED_UP_DB_PATHS
+    ):
         from core.db_manager import DBManager
-        DBManager().backup(prefix="pre_update_snapshot")
-    except Exception as e:
-        print(f"Warning: Auto-backup failed before update: {e}")
+        DBManager(db_path=db_path).backup(prefix="pre_update_snapshot")
+        _BACKED_UP_DB_PATHS.add(db_path)
         
     if cursor is not None:
         c = cursor

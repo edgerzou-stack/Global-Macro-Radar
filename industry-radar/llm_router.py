@@ -1,120 +1,227 @@
-import os
 import json
-import time
+import os
 import threading
+import time
+
 from google import genai
 from openai import OpenAI
 
-# P1.7: 增加并发控制和重试退避机制
-# Gemini free tier limit is 15 RPM, we set semaphore to 10 to be safe
+
 llm_semaphore = threading.Semaphore(10)
 
-def get_gemini_client():
-    return None
-    # api_key = os.getenv("GEMINI_API_KEY")
-    # if not api_key:
-    #     return None
-    # return genai.Client(api_key=api_key)
 
-def get_openai_client():
-    return None
-    # api_key = os.getenv("OPENAI_API_KEY")
-    # base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-    # if not api_key:
-    #     return None
-    # return OpenAI(api_key=api_key, base_url=base_url, timeout=120.0)
+def _provider_config(config, provider):
+    return (
+        (config or {})
+        .get("llm", {})
+        .get("providers", {})
+        .get(provider, {})
+    )
 
-def get_deepseek_client():
-    api_key = os.getenv("DEEPSEEK_API_KEY")
-    base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-    if not api_key:
+
+def _provider_enabled(config, provider, api_key):
+    provider_cfg = _provider_config(config, provider)
+    if "enabled" in provider_cfg:
+        return bool(provider_cfg["enabled"]) and bool(api_key)
+    return bool(api_key)
+
+
+def get_gemini_client(config=None):
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not _provider_enabled(config, "gemini", api_key):
         return None
-    return OpenAI(api_key=api_key, base_url=base_url, timeout=120.0)
+    return genai.Client(api_key=api_key)
 
-def _call_llm_with_fallback(prompt, config, system_prompt="You are a helpful assistant designed to output JSON.", title_context=""):
+
+def get_openai_client(config=None):
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not _provider_enabled(config, "openai", api_key):
+        return None
+    provider_cfg = _provider_config(config, "openai")
+    base_url = provider_cfg.get(
+        "base_url", os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    )
+    timeout = float(provider_cfg.get("timeout", 120.0))
+    return OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+
+
+def get_deepseek_client(config=None):
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not _provider_enabled(config, "deepseek", api_key):
+        return None
+    provider_cfg = _provider_config(config, "deepseek")
+    base_url = provider_cfg.get(
+        "base_url", os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    )
+    timeout = float(provider_cfg.get("timeout", 120.0))
+    return OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+
+
+def _model_for(config, provider, is_heavy):
+    provider_cfg = _provider_config(config, provider)
+    if is_heavy and provider_cfg.get("heavy_model"):
+        return provider_cfg["heavy_model"]
+    if provider_cfg.get("model"):
+        return provider_cfg["model"]
+
+    defaults = {
+        "gemini": "gemini-2.5-flash",
+        "openai": "gpt-4.1-mini",
+        "deepseek": (config or {}).get("output", {}).get("model", "deepseek-chat"),
+    }
+    return defaults[provider]
+
+
+def _is_transient_error(exc):
+    text = str(exc).lower()
+    return any(
+        token in text
+        for token in (
+            "408",
+            "429",
+            "500",
+            "502",
+            "503",
+            "504",
+            "timeout",
+            "timed out",
+            "connection",
+            "quota",
+            "exhausted",
+            "unavailable",
+            "overload",
+        )
+    )
+
+
+def _retry_settings(config, provider):
+    provider_cfg = _provider_config(config, provider)
+    return int(provider_cfg.get("max_retries", 3)), float(
+        provider_cfg.get("base_retry_delay", 2.0)
+    )
+
+
+def _call_openai_compatible(
+    client, model, prompt, system_prompt, config, provider, title_context
+):
+    max_retries, base_delay = _retry_settings(config, provider)
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1,
+            )
+            return json.loads(response.choices[0].message.content)
+        except Exception as exc:
+            if attempt + 1 >= max_retries or not _is_transient_error(exc):
+                raise
+            delay = base_delay * (2 ** attempt)
+            print(
+                f"{provider} transient error for '{title_context}'. "
+                f"Retrying in {delay:g}s...",
+                flush=True,
+            )
+            time.sleep(delay)
+
+
+def _call_gemini(client, model, prompt, system_prompt, config, title_context):
+    max_retries, base_delay = _retry_settings(config, "gemini")
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=genai.types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1,
+                    system_instruction=system_prompt,
+                ),
+            )
+            return json.loads(response.text)
+        except Exception as exc:
+            if attempt + 1 >= max_retries or not _is_transient_error(exc):
+                raise
+            delay = base_delay * (2 ** attempt)
+            print(
+                f"gemini transient error for '{title_context}'. "
+                f"Retrying in {delay:g}s...",
+                flush=True,
+            )
+            time.sleep(delay)
+
+
+def _call_llm_with_fallback(
+    prompt,
+    config,
+    system_prompt="You are a helpful assistant designed to output JSON.",
+    title_context="",
+):
+    """Call enabled providers in configured order and return validated JSON.
+
+    Providers are no longer hard-disabled. A provider participates only when it
+    is enabled (explicitly or by the presence of its API key) and has a key.
     """
-    Executes the Triple-Tier Cascade Router:
-    1. Google Gemini (gemini-2.5-flash)
-    2. OpenAI (gpt-5.4-mini for scoring, gpt-5.5 for heavy lifting)
-    3. DeepSeek (deepseek-v4-flash for scoring, deepseek-v4-pro for heavy lifting)
-    """
-    
-    is_heavy = "VC Analyst" in system_prompt
-    openai_model = "gpt-5.5" if is_heavy else "gpt-5.4-mini"
-    deepseek_model = "deepseek-v4-pro" if is_heavy else "deepseek-v4-flash"
-    
-    gemini_client = get_gemini_client()
-    openai_client = get_openai_client()
-    deepseek_client = get_deepseek_client()
-    
-    gemini_fallback = "OpenAI" if openai_client else ("DeepSeek" if deepseek_client else "failure")
-    
-    # 1. Gemini
-    if gemini_client:
-        with llm_semaphore:
-            # P1.7: 增加指数退避重试
-            max_retries = 3
-            base_delay = 5
-            for attempt in range(max_retries):
-                try:
-                    # P3.23: Gemini 不传 system_prompt 问题修复
-                    response = gemini_client.models.generate_content(
-                        model='gemini-2.5-flash', 
-                        contents=prompt,
-                        config=genai.types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            temperature=0.1,
-                            system_instruction=system_prompt
-                        )
+    is_heavy = "vc analyst" in system_prompt.lower()
+    clients = {
+        "gemini": get_gemini_client(config),
+        "openai": get_openai_client(config),
+        "deepseek": get_deepseek_client(config),
+    }
+    order = (config or {}).get("llm", {}).get(
+        "order", ["gemini", "openai", "deepseek"]
+    )
+    enabled_order = [provider for provider in order if clients.get(provider)]
+    if not enabled_order:
+        raise RuntimeError(
+            f"All LLM APIs are disabled or unconfigured for '{title_context}'"
+        )
+
+    last_error = None
+    for index, provider in enumerate(enabled_order):
+        client = clients[provider]
+        model = _model_for(config, provider, is_heavy)
+        try:
+            with llm_semaphore:
+                if provider == "gemini":
+                    result = _call_gemini(
+                        client, model, prompt, system_prompt, config, title_context
                     )
-                    return json.loads(response.text)
-                except Exception as e:
-                    err_str = str(e).lower()
-                    if "429" in err_str or "exhausted" in err_str or "quota" in err_str or "503" in err_str or "unavailable" in err_str:
-                        if attempt < max_retries - 1:
-                            sleep_time = base_delay * (2 ** attempt)
-                            print(f"Gemini limit/overload for '{title_context}'. Retrying in {sleep_time}s...", flush=True)
-                            time.sleep(sleep_time)
-                            continue
-                        print(f"Gemini limit/overload for '{title_context}' after {max_retries} retries. Falling back to {gemini_fallback}...", flush=True)
-                    else:
-                        print(f"Gemini error for '{title_context}': {e}. Falling back to {gemini_fallback}...", flush=True)
-                    break # Break out of retry loop to fallback
+                else:
+                    result = _call_openai_compatible(
+                        client,
+                        model,
+                        prompt,
+                        system_prompt,
+                        config,
+                        provider,
+                        title_context,
+                    )
+                if not isinstance(result, dict):
+                    raise ValueError(f"{provider} returned a non-object JSON payload")
+                result["_llm"] = {
+                    "provider": provider,
+                    "model": model,
+                    "degraded": index > 0 or len(enabled_order) == 1,
+                }
+                return result
+        except Exception as exc:
+            last_error = exc
+            next_provider = (
+                enabled_order[index + 1]
+                if index + 1 < len(enabled_order)
+                else "failure"
+            )
+            print(
+                f"{provider} error for '{title_context}': {exc}. "
+                f"Falling back to {next_provider}...",
+                flush=True,
+            )
 
-    # 2. OpenAI
-    if openai_client:
-        with llm_semaphore:
-            try:
-                response = openai_client.chat.completions.create(
-                    model=openai_model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt}
-                    ],
-                    response_format={"type": "json_object"},
-                    temperature=0.1,
-                )
-                return json.loads(response.choices[0].message.content)
-            except Exception as e:
-                openai_fallback = "DeepSeek" if deepseek_client else "failure"
-                print(f"OpenAI error/limit for '{title_context}': {e}. Falling back to {openai_fallback}...", flush=True)
-
-    # 3. DeepSeek
-    if deepseek_client:
-        with llm_semaphore:
-            try:
-                response = deepseek_client.chat.completions.create(
-                    model=deepseek_model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt}
-                    ],
-                    response_format={"type": "json_object"},
-                    temperature=0.1,
-                )
-                return json.loads(response.choices[0].message.content)
-            except Exception as e:
-                print(f"DeepSeek error for '{title_context}': {e}. Halting execution!", flush=True)
-                raise e
-            
-    raise Exception(f"All LLM APIs failed or are unconfigured for '{title_context}'")
+    raise RuntimeError(
+        f"All enabled LLM APIs failed for '{title_context}'"
+    ) from last_error
