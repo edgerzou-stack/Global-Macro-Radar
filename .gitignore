@@ -12,4 +12,10 @@ industry-radar/heuristics.yaml
 !.env.example
 __pycache__/
 *.pyc
-
+.DS_Store
+*.png
+.coverage
+.coverage.*
+coverage.xml
+test-results/
+.pytest_cache/

@@ -26,24 +26,18 @@ def _load_env():
 def fetch_yf_info_cached(ticker_symbol):
     """Fetch and cache yfinance Ticker.info for 12 hours."""
     time.sleep(random.uniform(0.1, 0.3))  # Rate-limit protection
-    def _fetch(): return yf.Ticker(ticker_symbol).info
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        return ex.submit(_fetch).result(timeout=20)
+    return yf.Ticker(ticker_symbol).info
 
 @disk_cache(expire_hours=24*30)
 def fetch_yf_financials_cached(ticker_symbol):
     """Fetch and cache yfinance Ticker.financials for 30 days."""
     time.sleep(random.uniform(0.1, 0.3))  # Rate-limit protection
-    def _fetch(): return yf.Ticker(ticker_symbol).financials
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        return ex.submit(_fetch).result(timeout=20)
+    return yf.Ticker(ticker_symbol).financials
 
 @disk_cache(expire_hours=24*30)
 def fetch_yf_quarterly_income_stmt_cached(ticker_symbol):
     time.sleep(random.uniform(0.1, 0.3))
-    def _fetch(): return yf.Ticker(ticker_symbol).quarterly_income_stmt
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        return ex.submit(_fetch).result(timeout=20)
+    return yf.Ticker(ticker_symbol).quarterly_income_stmt
 
 def fetch_yf_data(ticker_symbol, args):
     max_retries = 3
@@ -83,8 +77,7 @@ def fetch_yf_data(ticker_symbol, args):
                 if valuation_val is not None and valuation_val < args.valuation_formula_max:
                     if div_yield is not None and div_yield > args.dividend_yield_min:
                         if net_margin is not None and net_margin > args.avg_net_profit_margin_min:
-                            if debt_to_asset is None or debt_to_asset < args.debt_ratio_max:
-                                pass_div_precheck = True
+                            pass_div_precheck = True
                         
             # 2. Growth Pre-check
             pass_gro_precheck = False
@@ -92,8 +85,7 @@ def fetch_yf_data(ticker_symbol, args):
             if market_cap is not None and market_cap / 1e8 > args.market_cap_min_yi:
                 if roe is not None and roe > args.growth_roe_min:
                     if net_margin is not None and net_margin > args.avg_net_profit_margin_min:
-                        if debt_to_asset is None or debt_to_asset < args.debt_ratio_max:
-                            if revenue_growth is not None and revenue_growth > 0:
+                        if revenue_growth is not None and revenue_growth > 0:
                                 if earnings_growth is not None and earnings_growth > 0:
                                     # YoY passed. Now check QoQ
                                     try:
@@ -109,12 +101,12 @@ def fetch_yf_data(ticker_symbol, args):
                                                         if rev[0] > rev[1] and net[0] > net[1]:
                                                             latest_qoq_dual_growth = True
                                             else:
-                                                latest_qoq_dual_growth = True # Fallback if missing rows
+                                                latest_qoq_dual_growth = False
                                         else:
-                                            latest_qoq_dual_growth = True # Fallback if missing stmt
+                                            latest_qoq_dual_growth = False
                                     except Exception as e:
                                         import logging
-                                        logging.error(f"Failed to calculate QoQ dual growth for {symbol}: {e}", exc_info=True)
+                                        logging.error(f"Failed to calculate QoQ dual growth for {ticker_symbol}: {e}", exc_info=True)
                                         latest_qoq_dual_growth = False # DO NOT fallback on error! Reject instead.
                                     
                                     if latest_qoq_dual_growth:
@@ -181,7 +173,6 @@ def screen_us_hk(tickers, args, market_type="US"):
         & df["营业总收入同比增长率"].notna() 
         & (df["最新单季环比双增"] == True)
         & (df["PE"].isna() | ((df["PE"] < df["净利润同比增长率"]) & (df["PE"] < df["营业总收入同比增长率"])))
-        & (df["资产负债率"].isna() | (df["资产负债率"] < args.debt_ratio_max))
     )
     
     df_growth = df[mask_gro].copy()

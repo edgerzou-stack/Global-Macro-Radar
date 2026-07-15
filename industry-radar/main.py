@@ -1,13 +1,155 @@
 import yaml
 import os
+import json
+import tempfile
 from datetime import datetime, timedelta
 from ingest import fetch_rss_feeds
 from score import score_article
 from dotenv import load_dotenv
-from cache_manager import load_cache, save_cache
+from cache_manager import (
+    build_cache_key,
+    get_cached_score,
+    load_cache,
+    make_cache_entry,
+    save_cache,
+)
 import smtplib
 from email.message import EmailMessage
 import markdown
+
+
+def scoring_cache_config(config):
+    """Return only configuration that can change score semantics."""
+    return {
+        "industries": config.get("industries", []),
+        "importance_criteria": config.get("importance_criteria", ""),
+        "scoring_weights": config.get("scoring_weights", {}),
+        "trusted_sources": config.get("trusted_sources", []),
+        "language": config.get("output", {}).get("language", "Chinese"),
+    }
+
+
+def configured_scoring_identities(config):
+    provider_keys = {
+        "gemini": "GEMINI_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "deepseek": "DEEPSEEK_API_KEY",
+    }
+    defaults = {
+        "gemini": "gemini-2.5-flash",
+        "openai": "gpt-4.1-mini",
+        "deepseek": config.get("output", {}).get("model", "deepseek-chat"),
+    }
+    llm_config = config.get("llm", {})
+    provider_config = llm_config.get("providers", {})
+    identities = []
+    for provider in llm_config.get("order", ["gemini", "openai", "deepseek"]):
+        settings = provider_config.get(provider, {})
+        enabled = settings.get("enabled", True)
+        if enabled and os.getenv(provider_keys.get(provider, "")):
+            identities.append((provider, settings.get("model", defaults.get(provider, "unknown"))))
+    return identities
+
+
+def find_cached_article(cache_data, article, config):
+    from score import SCORING_PROMPT_VERSION
+
+    for provider, model in configured_scoring_identities(config):
+        cache_key = build_cache_key(
+            article,
+            scoring_cache_config(config),
+            SCORING_PROMPT_VERSION,
+            provider,
+            model,
+        )
+        score_data = get_cached_score(cache_data.get(cache_key), cache_key)
+        if score_data is not None:
+            return score_data, cache_key
+    return None, None
+
+
+def store_article_score(cache_data, article, score_data, config, **extra):
+    from score import SCORING_PROMPT_VERSION
+
+    identities = configured_scoring_identities(config)
+    provider = score_data.get("llm_provider") if isinstance(score_data, dict) else None
+    model = score_data.get("llm_model") if isinstance(score_data, dict) else None
+    if not provider or not model:
+        if not identities:
+            raise RuntimeError("Cannot cache a score without a configured LLM identity")
+        provider, model = identities[0]
+    cache_key = build_cache_key(
+        article,
+        scoring_cache_config(config),
+        SCORING_PROMPT_VERSION,
+        provider,
+        model,
+    )
+    cache_data[cache_key] = make_cache_entry(
+        cache_key,
+        score_data,
+        raw_title=article.get("title", ""),
+        raw_summary=article.get("summary", ""),
+        provider=provider,
+        model=model,
+        **extra,
+    )
+    article["_cache_key"] = cache_key
+    return cache_key
+
+
+def run_validated_batch(batch, config, scorer, attempts=2):
+    if attempts < 1:
+        raise ValueError("attempts must be at least one")
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            payload = scorer(batch, config)
+            results = payload.get("results") if isinstance(payload, dict) else None
+            if not isinstance(results, list) or len(results) != len(batch):
+                raise ValueError(
+                    f"batch result count {len(results) if isinstance(results, list) else 'invalid'} "
+                    f"does not match input count {len(batch)}"
+                )
+            return results
+        except Exception as error:
+            last_error = error
+            print(
+                f"Validated batch attempt {attempt}/{attempts} failed: {error}",
+                flush=True,
+            )
+    raise RuntimeError(f"Validated batch failed after {attempts} attempts") from last_error
+
+
+def save_json_atomic(path, payload):
+    path = os.path.abspath(path)
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=directory, delete=False, suffix=".tmp"
+        ) as handle:
+            temporary_path = handle.name
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
+def validate_rss_health(health, max_failure_ratio=0.5):
+    if not health:
+        raise RuntimeError("RSS health check failed: no sources were configured")
+    failed = [item for item in health if item.get("status") == "failed"]
+    failure_ratio = len(failed) / len(health)
+    if failure_ratio > max_failure_ratio:
+        raise RuntimeError(
+            f"RSS health check failed: {len(failed)}/{len(health)} sources unavailable"
+        )
 
 def load_config(config_path="config.yaml"):
     # P4.1: Graceful fallback for missing config.yaml
@@ -29,8 +171,9 @@ def generate_markdown_report(scored_articles, config, output_dir="reports"):
     report_path = os.path.join(output_dir, f"industry_report_{date_str}.md")
     
     min_score = config.get("output", {}).get("min_score_to_keep", 6)
+    lookback_days = config.get("output", {}).get("report_days_lookback", 2)
     
-    cutoff_date_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    cutoff_date_str = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     
     high_scoring = []
     for a in scored_articles:
@@ -276,7 +419,16 @@ def main():
     
     print("Fetching articles from RSS feeds...", flush=True)
     hours_back = config.get("output", {}).get("hours_back", 48)
-    articles = fetch_rss_feeds(config.get("rss_feeds", []), hours_back=hours_back)
+    articles, rss_health = fetch_rss_feeds(
+        config.get("rss_feeds", []), hours_back=hours_back, return_health=True
+    )
+    save_json_atomic(os.path.join("reports", "rss_health.json"), rss_health)
+    validate_rss_health(
+        rss_health,
+        max_failure_ratio=float(
+            config.get("output", {}).get("rss_max_failure_ratio", 0.5)
+        ),
+    )
     print(f"Fetched {len(articles)} articles.", flush=True)
     
     # P3.21: 评分前增加基于 URL/Title 的快速预去重
@@ -312,10 +464,9 @@ def main():
         
         for idx, article in enumerate(articles):
             article['id'] = idx
-            link = article.get('link')
-            
-            if link in cache_data and 'score_data' in cache_data[link]:
-                sd = cache_data[link]['score_data']
+
+            sd, cache_key = find_cached_article(cache_data, article, config)
+            if sd is not None:
                 try:
                     i_score = float(sd.get('innovation_score', 0))
                     t_score = float(sd.get('traffic_score', 0))
@@ -323,8 +474,9 @@ def main():
                     i_score = t_score = 0
                 print(f"[{idx+1}/{len(articles)}] (Cached) [I:{i_score:.1f} T:{t_score:.1f}] {article['title'][:30]}...", flush=True)
                 article['score_data'] = sd
-                if 'deep_dive' in cache_data[link]:
-                    article['deep_dive'] = cache_data[link]['deep_dive']
+                article['_cache_key'] = cache_key
+                if 'deep_dive' in cache_data[cache_key]:
+                    article['deep_dive'] = cache_data[cache_key]['deep_dive']
                 scored_articles.append(article)
             else:
                 new_articles.append(article)
@@ -363,12 +515,7 @@ def main():
             passed_pre_filter = []
             
             def process_pre_filter_batch(batch):
-                try:
-                    res = pre_filter_articles_batch(batch, config)
-                    return res.get("results", [])
-                except Exception as e:
-                    print(f"Phase 1 Error: {e}", flush=True)
-                    return []
+                return run_validated_batch(batch, config, pre_filter_articles_batch)
             
             batches_p1 = [new_articles[i:i + 20] for i in range(0, len(new_articles), 20)]
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
@@ -397,9 +544,7 @@ def main():
                                 matched['score_data'] = sd
                                 scored_articles.append(matched)
                                 
-                                link = matched.get('link')
-                                if link not in cache_data: cache_data[link] = {}
-                                cache_data[link]['score_data'] = sd
+                                store_article_score(cache_data, matched, sd, config)
                                 cache_updates += 1
                                 
             print(f"Phase 1 complete. {len(passed_pre_filter)} articles survived.", flush=True)
@@ -408,12 +553,7 @@ def main():
                 print("--- Phase 2: Detailed Scoring (Batches of 5) ---", flush=True)
                 
                 def process_scoring_batch(batch):
-                    try:
-                        res = score_articles_batch(batch, config)
-                        return res.get("results", [])
-                    except Exception as e:
-                        print(f"Phase 2 Error: {e}", flush=True)
-                        return []
+                    return run_validated_batch(batch, config, score_articles_batch)
                         
                 batches_p2 = [passed_pre_filter[i:i + 5] for i in range(0, len(passed_pre_filter), 5)]
                 with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
@@ -427,12 +567,7 @@ def main():
                             matched = next((a for a in passed_pre_filter if a['id'] == article_id), None)
                             if matched:
                                 matched['score_data'] = {
-                                    "is_relevant": r.get("is_relevant", True),
-                                    "innovation_score": r.get("innovation_score", 0),
-                                    "traffic_score": r.get("traffic_score", 0),
-                                    "justification": r.get("justification", ""),
-                                    "translated_title": r.get("translated_title", matched['title']),
-                                    "translated_summary": r.get("translated_summary", "")
+                                    key: value for key, value in r.items() if key != "id"
                                 }
                                 scored_articles.append(matched)
                                 try:
@@ -442,9 +577,9 @@ def main():
                                     i_s = t_s = 0
                                 print(f"  -> Scored [{matched['id']}] [I:{i_s:.1f} T:{t_s:.1f}] {matched['title'][:30]}", flush=True)
                                 
-                                link = matched.get('link')
-                                if link not in cache_data: cache_data[link] = {}
-                                cache_data[link]['score_data'] = matched['score_data']
+                                store_article_score(
+                                    cache_data, matched, matched['score_data'], config
+                                )
                                 cache_updates += 1
                                 
             if cache_updates > 0:
@@ -463,24 +598,31 @@ def main():
         print(f"Checking Deep Dive for {len(high_scoring_for_dd)} highly rated articles (concurrently)...", flush=True)
         
         def process_dd(a):
-            link = a.get('link')
-            if 'deep_dive' not in a and (link not in cache_data or 'deep_dive' not in cache_data[link]):
+            cache_key = a.get('_cache_key')
+            if 'deep_dive' not in a and (
+                not cache_key
+                or cache_key not in cache_data
+                or 'deep_dive' not in cache_data[cache_key]
+            ):
                 print(f"Generating Deep Dive for {a['title'][:30]}...", flush=True)
                 dd = generate_deep_dive_report(a, config)
-                return a, link, dd
-            elif link in cache_data and 'deep_dive' in cache_data[link]:
-                a['deep_dive'] = cache_data[link]['deep_dive']
+                return a, cache_key, dd
+            elif cache_key in cache_data and 'deep_dive' in cache_data[cache_key]:
+                a['deep_dive'] = cache_data[cache_key]['deep_dive']
             return None, None, None
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             futures = [executor.submit(process_dd, a) for a in high_scoring_for_dd]
             for future in concurrent.futures.as_completed(futures):
                 try:
-                    a, link, dd = future.result()
+                    a, cache_key, dd = future.result()
                     if dd:
                         a['deep_dive'] = dd
-                        if link not in cache_data: cache_data[link] = {}
-                        cache_data[link]['deep_dive'] = dd
+                        if not cache_key:
+                            cache_key = store_article_score(
+                                cache_data, a, a['score_data'], config
+                            )
+                        cache_data[cache_key]['deep_dive'] = dd
                         new_dd = True
                 except Exception as e:
                     print(f"Error in deep dive worker: {e}", flush=True)

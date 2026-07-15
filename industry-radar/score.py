@@ -1,12 +1,131 @@
 import os
 import json
+import math
 from datetime import datetime
 from dotenv import load_dotenv
 from llm_router import _call_llm_with_fallback
 
 load_dotenv()
 
+SCORING_PROMPT_VERSION = "dual-track-v2"
+
+
+class ScoreValidationError(ValueError):
+    """Raised when scoring configuration or LLM output violates the contract."""
+
+
+def _current_date_text():
+    return datetime.now().astimezone().strftime("%Y-%m-%d")
+
+
+def _strict_rubric(config, current_date):
+    language = config.get("output", {}).get("language", "Chinese")
+    return f"""
+    Current Date: {current_date}
+
+    CRITICAL REJECTION RULES: is_relevant MUST be false for roundups/digests,
+    shopping deals or advertisements, re-hashed old news, pure stock-price moves,
+    pure theoretical research without a near-term industry application, and vague
+    macro commentary without concrete technical or quantitative evidence.
+
+    CRITICAL SCORING ANCHORS (all four sub-scores are integer 0-100):
+    - 90-100: Global paradigm shift or independently verified breakthrough.
+    - 70-89: Major industry milestone, >$100M financing, critical giant product
+      launch, or major structural policy change.
+    - 40-69: Routine product update, $10M-$50M financing, steady earnings, or
+      incremental technical improvement.
+    - 0-39: Gossip, minor updates, generic PR, or no measurable real-world impact.
+
+    Before scoring, explicitly evaluate barrier_to_entry, market_size, and
+    immediacy. Set is_vague_or_roundup=true when evidence is insufficient and in
+    that case set is_relevant=false. Provide reasoning_chain before scores,
+    a one-sentence justification in {language}, translated_title, and a
+    one-sentence translated_summary no longer than 50 characters.
+    """
+
+
+def _validate_weights(config):
+    weights = config.get("scoring_weights", {})
+    definitions = (
+        ("innovation", {"tech": 0.6, "commercial": 0.4}),
+        ("traffic", {"hype": 0.6, "macro": 0.4}),
+    )
+    validated = {}
+    for name, defaults in definitions:
+        values = weights.get(name, defaults)
+        if not isinstance(values, dict) or set(values) != set(defaults):
+            raise ScoreValidationError(f"{name} weights must contain {sorted(defaults)}")
+        clean = {}
+        for key in defaults:
+            value = values[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ScoreValidationError(f"{name}.{key} weight must be numeric")
+            value = float(value)
+            if not math.isfinite(value) or value < 0:
+                raise ScoreValidationError(f"{name}.{key} weight must be finite and non-negative")
+            clean[key] = value
+        if not math.isclose(sum(clean.values()), 1.0, rel_tol=0, abs_tol=1e-9):
+            raise ScoreValidationError(f"{name} weights must sum to 1")
+        validated[name] = clean
+    return validated
+
+
+def _validate_score_result(result, expected_id=None, require_id=False):
+    if not isinstance(result, dict):
+        raise ScoreValidationError("score result must be an object")
+    if require_id:
+        if "id" not in result:
+            raise ScoreValidationError("score result missing id")
+        if result["id"] != expected_id:
+            raise ScoreValidationError(f"score result id {result['id']!r} does not match {expected_id!r}")
+
+    for field in ("is_relevant", "is_vague_or_roundup"):
+        if type(result.get(field)) is not bool:
+            raise ScoreValidationError(f"{field} must be a boolean")
+
+    for field in ("tech_score", "commercial_score", "hype_score", "macro_score"):
+        value = result.get(field)
+        if type(value) is not int or not 0 <= value <= 100:
+            raise ScoreValidationError(f"{field} must be an integer in [0, 100]")
+
+    for field in (
+        "barrier_to_entry",
+        "market_size",
+        "immediacy",
+        "reasoning_chain",
+        "justification",
+        "translated_title",
+        "translated_summary",
+    ):
+        if not isinstance(result.get(field), str):
+            raise ScoreValidationError(f"{field} must be a string")
+    if len(result["translated_summary"]) > 50:
+        raise ScoreValidationError("translated_summary must not exceed 50 characters")
+
+    validated = dict(result)
+    if validated["is_vague_or_roundup"]:
+        validated["is_relevant"] = False
+        validated["justification"] = (
+            "REJECTED: Vague macro-commentary, roundup, or lacks concrete data."
+        )
+    return validated
+
+
+def _apply_composite_scores(result, weights):
+    result["innovation_score"] = (
+        result["tech_score"] * weights["innovation"]["tech"]
+        + result["commercial_score"] * weights["innovation"]["commercial"]
+    ) / 10.0
+    result["traffic_score"] = (
+        result["hype_score"] * weights["traffic"]["hype"]
+        + result["macro_score"] * weights["traffic"]["macro"]
+    ) / 10.0
+    return result
+
 def score_article(article, config):
+    weights = _validate_weights(config)
+    current_date = _current_date_text()
+    rubric = _strict_rubric(config, current_date)
     prompt = f"""
     You are an expert industry analyst and VC. Evaluate this tech news article based on the dual-track criteria.
     
@@ -17,7 +136,10 @@ def score_article(article, config):
     
     Article Title: {article['title']}
     Article Summary: {article['summary']}
-    Current Date: {datetime.now().strftime('%Y-%m-%d')}
+    Published At: {article.get('published_at', 'unknown')}
+    Source: {article.get('source', 'unknown')}
+
+    {rubric}
     
     Tasks:
     1. Determine if this article is relevant to the tech industry (True/False). 
@@ -28,15 +150,27 @@ def score_article(article, config):
        - Vague, generic, or purely macro-level commentary lacking specific technical details, quantitative data, or concrete innovations (e.g., "market is growing", "competition intensifies", or "many companies are releasing models" without specifying unique technical specs).
     2. Explicitly determine if this article is a vague roundup, digest, or macro-level commentary without concrete technical data. Set `is_vague_or_roundup` to True if it is.
     3. Output 4 core sub-scores (0-100 integers): 'tech_score', 'commercial_score', 'hype_score', 'macro_score'.
-    4. Output a 'reasoning_chain' explaining the rationale BEFORE giving the scores.
-    5. Provide a concise 1-sentence justification explaining the scores in {config.get('output', {}).get('language', 'Chinese')}.
-    6. Provide the translation of the 'Article Title' into {config.get('output', {}).get('language', 'Chinese')}.
-    7. Provide a HIGHLY CONDENSED summary of the article content. **CRITICAL RULE: The translated_summary MUST be ONE SINGLE SENTENCE and MUST NOT exceed 50 Chinese characters. Be extremely brief.**
+       **CRITICAL SCORING ANCHORS - YOU MUST STRICTLY FOLLOW THESE RUBRICS:**
+       - **90-100**: Global paradigm shift or absolute breakthrough (e.g., AGI achieved, TSMC 1nm success, cure for cancer). Will fundamentally change the world immediately.
+       - **70-89**: Major industry milestone, highly impactful VC funding (> $100M), critical product launch by a tech giant (e.g., Apple Vision Pro, GPT-4), or a massive structural policy change.
+       - **40-69**: Routine product updates, moderate funding rounds ($10M-$50M), steady earnings reports, or incremental technical improvements.
+       - **0-39**: Trivial gossip, extremely minor updates, generic executive PR talk, or things with no real-world impact.
+    4. Provide structured reasoning before scoring. You must explicitly evaluate:
+       - 'barrier_to_entry': How hard is this to replicate?
+       - 'market_size': Is the target market massive or niche?
+       - 'immediacy': Is the impact happening right now, or years in the future?
+    5. Output a 'reasoning_chain' summarizing the structured reasoning.
+    6. Provide a concise 1-sentence justification explaining the scores in {config.get('output', {}).get('language', 'Chinese')}.
+    7. Provide the translation of the 'Article Title' into {config.get('output', {}).get('language', 'Chinese')}.
+    8. Provide a HIGHLY CONDENSED summary of the article content. **CRITICAL RULE: The translated_summary MUST be ONE SINGLE SENTENCE and MUST NOT exceed 50 Chinese characters. Be extremely brief.**
     
     You must output strictly in JSON format matching this schema:
     {{
       "is_relevant": boolean,
       "is_vague_or_roundup": boolean,
+      "barrier_to_entry": string,
+      "market_size": string,
+      "immediacy": string,
       "reasoning_chain": string,
       "tech_score": integer,
       "commercial_score": integer,
@@ -49,38 +183,24 @@ def score_article(article, config):
     """
     
     result = _call_llm_with_fallback(prompt, config, title_context=article['title'][:30])
-    if result:
-        # Enforce rejection if LLM flags it as vague/roundup
-        if result.get("is_vague_or_roundup", False):
-            result["is_relevant"] = False
-            result["justification"] = "REJECTED: Vague macro-commentary, roundup, or lacks concrete data."
-            
-        tech = float(result.get("tech_score", 0))
-        comm = float(result.get("commercial_score", 0))
-        hype = float(result.get("hype_score", 0))
-        macro = float(result.get("macro_score", 0))
-        
-        weights = config.get("scoring_weights", {})
-        inn_weights = weights.get("innovation", {"tech": 0.6, "commercial": 0.4})
-        traf_weights = weights.get("traffic", {"hype": 0.6, "macro": 0.4})
-        
-        result["innovation_score"] = (tech * inn_weights.get("tech", 0.6) + comm * inn_weights.get("commercial", 0.4)) / 10.0
-        result["traffic_score"] = (hype * traf_weights.get("hype", 0.6) + macro * traf_weights.get("macro", 0.4)) / 10.0
-        return result
-        
-    return {"innovation_score": 0, "traffic_score": 0, "justification": "All API endpoints failed or unconfigured", "is_relevant": False, "translated_title": article['title'], "translated_summary": "Error"}
+    result = _validate_score_result(result)
+    llm_meta = result.pop("_llm", {})
+    if isinstance(llm_meta, dict) and llm_meta.get("provider") and llm_meta.get("model"):
+        result["llm_provider"] = llm_meta["provider"]
+        result["llm_model"] = llm_meta["model"]
+        result["llm_degraded"] = bool(llm_meta.get("degraded", False))
+    result["source_confidence"] = (
+        "trusted" if article.get("source") in config.get("trusted_sources", []) else "standard"
+    )
+    result["prompt_version"] = SCORING_PROMPT_VERSION
+    return _apply_composite_scores(result, weights)
 
 def deduplicate_articles(articles, config):
     if len(articles) <= 1:
         return articles
         
-    from llm_router import _call_llm_with_fallback
-    import json
-    
     # Sort articles by published_at (earliest first)
     sorted_articles = sorted(articles, key=lambda x: x.get('published_at', '9999-12-31'))
-    
-    from llm_router import _call_llm_with_fallback
     import difflib
     
     # Pre-deduplicate using local string matching to save LLM tokens
@@ -162,11 +282,19 @@ def deduplicate_articles(articles, config):
         return final_list
         
     final_articles = []
-    processed = set()
+    processed_group_ids = set()
     for group in groups:
-        if not group:
+        if not isinstance(group, list) or not group:
             continue
-        valid_group_indices = [idx for idx in group if 0 <= idx < len(local_dedup_groups) and idx not in processed]
+        valid_group_indices = []
+        for idx in group:
+            if (
+                type(idx) is int
+                and 0 <= idx < len(local_dedup_groups)
+                and idx not in processed_group_ids
+                and idx not in valid_group_indices
+            ):
+                valid_group_indices.append(idx)
         if not valid_group_indices:
             continue
             
@@ -174,7 +302,7 @@ def deduplicate_articles(articles, config):
         combined_articles = []
         for idx in valid_group_indices:
             combined_articles.extend(local_dedup_groups[idx])
-            processed.add(idx)
+            processed_group_ids.add(idx)
             
         base_article = combined_articles[0]
         
@@ -266,20 +394,28 @@ def deduplicate_articles(articles, config):
         else:
             final_articles.append(base_article)
         
-    # Add back any articles that weren't included in any group
-    for i, a in enumerate(sorted_articles):
-        if i not in processed:
-            final_articles.append(a)
+    # Add each omitted local group exactly once. `processed_group_ids` contains
+    # local-group indices, never indices from the original article list.
+    for group_id, local_group in enumerate(local_dedup_groups):
+        if group_id not in processed_group_ids:
+            best_article = max(
+                local_group,
+                key=lambda x: x.get('score_data', {}).get('innovation_score', 0)
+                + x.get('score_data', {}).get('traffic_score', 0),
+            )
+            final_articles.append(best_article)
             
     return final_articles
 
 def pre_filter_articles_batch(articles_batch, config):
+    current_date = _current_date_text()
     payload = []
     for a in articles_batch:
         payload.append({
             "id": a["id"],
             "title": a["title"],
-            "summary": a["summary"][:100]
+            "summary": a["summary"][:100],
+            "published_at": a.get("published_at", "unknown"),
         })
         
     prompt = f"""
@@ -287,6 +423,7 @@ def pre_filter_articles_batch(articles_batch, config):
     You will receive a list of articles. For each article, determine if it is relevant to Hardcore Tech, Investment, or cutting-edge innovation.
     
     Target Industries: {', '.join([ind['name'] for ind in config.get('industries', [])])}
+    Current Date: {current_date}
     
     CRITICAL REJECTION RULES: Return is_relevant=false if the article is:
     1. A news roundup/digest (e.g. "Morning brief", "晚报").
@@ -305,15 +442,43 @@ def pre_filter_articles_batch(articles_batch, config):
     """
     
     result = _call_llm_with_fallback(prompt, config, title_context=f"Pre-filter Batch ({len(articles_batch)} items)")
+    if not isinstance(result, dict) or not isinstance(result.get("results"), list):
+        raise ScoreValidationError("pre-filter results must be a list")
+    expected_ids = [article["id"] for article in articles_batch]
+    if len(set(expected_ids)) != len(expected_ids):
+        raise ScoreValidationError("input article ids must be unique")
+    returned_ids = []
+    for item in result["results"]:
+        if not isinstance(item, dict):
+            raise ScoreValidationError("pre-filter item must be an object")
+        if type(item.get("is_relevant")) is not bool:
+            raise ScoreValidationError("pre-filter is_relevant must be a boolean")
+        returned_ids.append(item.get("id"))
+    missing_ids = [item_id for item_id in expected_ids if item_id not in returned_ids]
+    duplicate_ids = {item_id for item_id in returned_ids if returned_ids.count(item_id) > 1}
+    unknown_ids = [item_id for item_id in returned_ids if item_id not in expected_ids]
+    if missing_ids:
+        raise ScoreValidationError(f"pre-filter missing ids: {missing_ids}")
+    if duplicate_ids:
+        raise ScoreValidationError(
+            f"pre-filter duplicate ids: {sorted(duplicate_ids, key=str)}"
+        )
+    if unknown_ids:
+        raise ScoreValidationError(f"pre-filter unknown ids: {unknown_ids}")
     return result
 
 def score_articles_batch(articles_batch, config):
+    weights = _validate_weights(config)
+    current_date = _current_date_text()
+    rubric = _strict_rubric(config, current_date)
     payload = []
     for a in articles_batch:
         payload.append({
             "id": a["id"],
             "title": a["title"],
-            "summary": a["summary"][:300]
+            "summary": a["summary"][:300],
+            "published_at": a.get("published_at", "unknown"),
+            "source": a.get("source", "unknown"),
         })
         
     prompt = f"""
@@ -323,23 +488,32 @@ def score_articles_batch(articles_batch, config):
     
     Criteria:
     {config.get('importance_criteria', '')}
+
+    Published At is supplied per article.
+    {rubric}
     
     Input Articles JSON:
     {json.dumps(payload, ensure_ascii=False)}
     
     For EACH article in the input, provide:
-    1. 'reasoning_chain': A short paragraph explaining the logic BEFORE scoring.
-    2. 4 sub-scores (0-100 integers): 'tech_score', 'commercial_score', 'hype_score', 'macro_score'.
-    3. 'justification': 1-sentence explanation of scores in {config.get('output', {}).get('language', 'Chinese')}
-    4. 'translated_title': Translate title to {config.get('output', {}).get('language', 'Chinese')}
-    5. 'translated_summary': HIGHLY CONDENSED summary (MAX 50 Chinese characters)
+    1. 'is_relevant' and 'is_vague_or_roundup' booleans.
+    2. 'barrier_to_entry', 'market_size', and 'immediacy' structured assessments.
+    3. 'reasoning_chain': A short paragraph explaining the logic BEFORE scoring.
+    4. 4 sub-scores (0-100 integers): 'tech_score', 'commercial_score', 'hype_score', 'macro_score'.
+    5. 'justification': 1-sentence explanation of scores in {config.get('output', {}).get('language', 'Chinese')}
+    6. 'translated_title': Translate title to {config.get('output', {}).get('language', 'Chinese')}
+    7. 'translated_summary': HIGHLY CONDENSED summary (MAX 50 Chinese characters)
     
     Return STRICTLY a JSON object matching this schema exactly:
     {{
       "results": [
         {{
           "id": integer,
-          "is_relevant": true,
+          "is_relevant": boolean,
+          "is_vague_or_roundup": boolean,
+          "barrier_to_entry": string,
+          "market_size": string,
+          "immediacy": string,
           "reasoning_chain": string,
           "tech_score": integer (e.g. 83),
           "commercial_score": integer (e.g. 76),
@@ -355,29 +529,45 @@ def score_articles_batch(articles_batch, config):
     
     result = _call_llm_with_fallback(prompt, config, title_context=f"Score Batch ({len(articles_batch)} items)")
     
-    if result and "results" in result:
-        trusted_sources = config.get("trusted_sources", [])
-        for res_item in result["results"]:
-            tech = float(res_item.get("tech_score", 0))
-            comm = float(res_item.get("commercial_score", 0))
-            hype = float(res_item.get("hype_score", 0))
-            macro = float(res_item.get("macro_score", 0))
-            
-            weights = config.get("scoring_weights", {})
-            inn_weights = weights.get("innovation", {"tech": 0.6, "commercial": 0.4})
-            traf_weights = weights.get("traffic", {"hype": 0.6, "macro": 0.4})
-            
-            res_item["innovation_score"] = (tech * inn_weights.get("tech", 0.6) + comm * inn_weights.get("commercial", 0.4)) / 10.0
-            res_item["traffic_score"] = (hype * traf_weights.get("hype", 0.6) + macro * traf_weights.get("macro", 0.4)) / 10.0
-            # Find original article by id
-            a_id = res_item.get("id")
-            original_a = next((a for a in articles_batch if a["id"] == a_id), None)
-            if original_a and original_a.get("source") in trusted_sources:
-                # Boost innovation score for trusted sources
-                base_score = float(res_item.get("innovation_score", 0))
-                boosted = min(10.0, base_score + 1.0)
-                res_item["innovation_score"] = boosted
-                # Add a marker to the justification
-                res_item["justification"] = f"[🌟顶级信源加权] {res_item.get('justification', '')}"
+    if not isinstance(result, dict) or not isinstance(result.get("results"), list):
+        raise ScoreValidationError("results must be a list")
+
+    result_items = result["results"]
+
+    expected_ids = [a["id"] for a in articles_batch]
+    if len(set(expected_ids)) != len(expected_ids):
+        raise ScoreValidationError("input article ids must be unique")
+    returned_ids = [item.get("id") for item in result_items if isinstance(item, dict)]
+    duplicate_ids = {item_id for item_id in returned_ids if returned_ids.count(item_id) > 1}
+    missing_ids = [item_id for item_id in expected_ids if item_id not in returned_ids]
+    unknown_ids = [item_id for item_id in returned_ids if item_id not in expected_ids]
+    if missing_ids:
+        raise ScoreValidationError(f"missing ids: {missing_ids}")
+    if duplicate_ids:
+        raise ScoreValidationError(f"duplicate ids: {sorted(duplicate_ids, key=str)}")
+    if unknown_ids:
+        raise ScoreValidationError(f"unknown ids: {unknown_ids}")
+
+    trusted_sources = config.get("trusted_sources", [])
+    llm_meta = result.get("_llm", {})
+    validated_items = []
+    article_by_id = {a["id"]: a for a in articles_batch}
+    for raw_item in result_items:
+        if not isinstance(raw_item, dict):
+            raise ScoreValidationError("score result must be an object")
+        article_id = raw_item.get("id")
+        res_item = _validate_score_result(raw_item, expected_id=article_id, require_id=True)
+        _apply_composite_scores(res_item, weights)
+        original_a = article_by_id[article_id]
+        res_item["source_confidence"] = (
+            "trusted" if original_a.get("source") in trusted_sources else "standard"
+        )
+        res_item["prompt_version"] = SCORING_PROMPT_VERSION
+        if isinstance(llm_meta, dict) and llm_meta.get("provider") and llm_meta.get("model"):
+            res_item["llm_provider"] = llm_meta["provider"]
+            res_item["llm_model"] = llm_meta["model"]
+            res_item["llm_degraded"] = bool(llm_meta.get("degraded", False))
+        validated_items.append(res_item)
+    result["results"] = validated_items
                 
     return result

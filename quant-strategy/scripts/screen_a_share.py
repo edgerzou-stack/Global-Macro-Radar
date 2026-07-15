@@ -41,7 +41,7 @@ def calculate_ttm_dividend_yield_for_code(
         dividend_df = stock_dividend_cninfo_cached(symbol=symbol)
     except Exception as e:
         import logging
-        logging.error(f"Failed to fetch dividend data for {symbol}: {e}", exc_info=True)
+        logging.warning(f"Failed to fetch dividend data for {symbol} (possibly no dividend history).")
         return None
 
     if dividend_df.empty:
@@ -673,40 +673,54 @@ def passes_valuation_formula(row: pd.Series, max_value: float) -> bool:
 
 
 
+# 红利股防御型/跨越周期底池
+DEFENSIVE_INDUSTRIES = [
+    # 公用事业（极强防御）
+    "电力行业", "燃气", "水务", "公用事业",
+    # 交通基建（现金牛）
+    "铁路公路", "港口航运", "交运设备",
+    # 必选消费（抗通胀/抗衰退）
+    "食品饮料", "酿酒行业", "农牧饲渔", "中药", "医药商业",
+    # 金融大基建（高分红底仓）
+    "银行", "保险", "出版"
+]
+
 def filter_dividend_strategy(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
     if df.empty:
         return df.copy()
         
     roe_series = df.get("3年平均净资产收益率", df.get("净资产收益率"))
     net_margin_series = df.get("3年平均净利率", df.get("销售净利率"))
-    
     mask = (
         df["估值公式值"].notna() & (df["估值公式值"] < args.valuation_formula_max)
         & df["3年经营现金流平均增速"].notna() & (df["3年经营现金流平均增速"] > 0)
         & df["总市值"].notna() & (df["总市值"] > args.market_cap_min_yi * 1e8)
-        & df["资产负债率"].notna() & (df["资产负债率"] < args.debt_ratio_max)
         & net_margin_series.notna() & (net_margin_series > args.avg_net_profit_margin_min)
         & df["3年净利润CAGR"].notna() & (df["3年净利润CAGR"] > args.profit_cagr_min)
         & roe_series.notna() & (roe_series > args.dividend_roe_min)
     )
     return df[mask].copy()
 
-# 成长股科技制造底池
-GROWTH_INDUSTRIES = [
-    # 科技 (Tech)
+# 成长股强周期底池
+CYCLICAL_GROWTH_INDUSTRIES = [
+    # 硬科技与半导体 (周期性极强)
     "半导体", "计算机设备", "软件开发", "通信设备", "通信服务",
     "光学光电子", "消费电子", "元件", "其他电子Ⅱ", "电子化学品Ⅱ",
-    "IT服务Ⅱ", "数字媒体"
+    "IT服务Ⅱ", "数字媒体",
+    # 大宗与强周期资源 (顺周期爆发)
+    "能源金属", "小金属", "有色金属", "煤炭行业", "钢铁行业", "化肥行业",
+    # 牛市旗手与可选消费
+    "证券", "乘用车", "汽车零部件", "电池",
+    # 周期制造/出海
+    "专用设备", "通用设备", "航海装备", "工程机械"
 ]
 
 def filter_growth_strategy(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
     """
     3-Quarter Continuous Improvement Strategy (连续3个季度业绩环比改善/减亏):
-    1. Industry in GROWTH_INDUSTRIES
-    2. Market Cap > args.market_cap_min_yi * 100 million
-    3. Debt Ratio < args.debt_ratio_max
-    4. Past 3 quarters QoQ Profit & Revenue Growth must be > 0 (supports loss-reduction)
-    5. PEG constraint: PE < min(Profit YoY, Revenue YoY)
+    1. Market Cap > args.market_cap_min_yi * 100 million
+    2. Past 3 quarters QoQ Profit & Revenue Growth must be > 0 (supports loss-reduction)
+    3. PEG constraint: PE < min(Profit YoY, Revenue YoY)
     """
     if df.empty:
         return df.copy()
@@ -717,9 +731,7 @@ def filter_growth_strategy(df: pd.DataFrame, args: argparse.Namespace) -> pd.Dat
     revenue_yoy_series = df.get("营业总收入-同比增长", df.get("营业总收入同比增长率"))
 
     mask = (
-        df["所处行业"].isin(GROWTH_INDUSTRIES)
-        & df["总市值"].notna() & (df["总市值"] > args.market_cap_min_yi * 1e8)
-        & (df["资产负债率"].isna() | (df["资产负债率"] < args.debt_ratio_max))
+        df["总市值"].notna() & (df["总市值"] > args.market_cap_min_yi * 1e8)
         & df["3个季度连续加速增长"].fillna(False)
         & (df["PE"].isna() | ((df["PE"] < profit_yoy_series) & (df["PE"] < revenue_yoy_series)))
     )
@@ -755,7 +767,6 @@ def threshold_payload(args: argparse.Namespace) -> dict:
         "require_continuous_growth": args.require_continuous_growth,
         "profit_cagr_min": args.profit_cagr_min,
         "long_term_cagr_years": LONG_TERM_CAGR_YEARS,
-        "debt_ratio_max": args.debt_ratio_max,
     }
 
 
@@ -853,12 +864,6 @@ def evaluate_holding(row: pd.Series, args: argparse.Namespace, user_input: str) 
             1.0 if row.get("3年净利润同比均为正") else 0.0,
             lambda x: x == 1.0,
         ),
-        (
-            "资产负债率",
-            f"资产负债率 < {args.debt_ratio_max}%",
-            row["资产负债率"],
-            lambda x: x < args.debt_ratio_max,
-        ),
     ]
 
     if args.require_continuous_growth:
@@ -932,7 +937,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--growth-yoy-min", type=float, default=30.0)
     parser.add_argument("--growth-roe-min", type=float, default=10.0)
     # Dividend thresholds
-    parser.add_argument("--debt-ratio-max", type=float, default=50.0)
     parser.add_argument("--dividend-roe-min", type=float, default=10.0,
                         help="Minimum 3-year avg ROE for dividend strategy (default: 10%%)")
     parser.add_argument(

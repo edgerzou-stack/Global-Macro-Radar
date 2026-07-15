@@ -141,13 +141,16 @@ def fetch_quote_snapshot_cached(codes: list[str]) -> pd.DataFrame:
             if price is not None:
                 rows.append({
                     "股票代码": code,
-                    "股票简称": f"Hist_{code}",
+                    "股票简称": code,
                     "最新价": price,
                     "今开": price,
                     "昨收": price,
-                    "PE": 2.0,      # Mock value to pass valuation filter (PE * PB < 10)
-                    "PB": 1.0,
-                    "总市值": 200e8  # Mock value 200亿 to pass market cap filter
+                    # Price history cannot supply point-in-time fundamentals.
+                    # Missing values must be excluded by downstream filters rather
+                    # than replaced with numbers engineered to pass them.
+                    "PE": None,
+                    "PB": None,
+                    "总市值": None,
                 })
         return pd.DataFrame(rows)
 

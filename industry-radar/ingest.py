@@ -1,79 +1,220 @@
-import feedparser
-import requests
-import logging
+import calendar
 import concurrent.futures
+import logging
+import time
+from datetime import datetime, timedelta, timezone
+
+import cloudscraper
+import feedparser
+from bs4 import BeautifulSoup
+from dateutil import parser as date_parser
+
 
 logger = logging.getLogger(__name__)
-from datetime import datetime, timedelta
-from bs4 import BeautifulSoup
 
-def fetch_rss_feeds(feeds, hours_back=168):
-    """Fetches articles from a list of RSS feeds within the last X hours, in parallel."""
-    time_limit = datetime.now() - timedelta(hours=hours_back)
+ALLOWED_FEED_CONTENT_TYPES = ("rss", "atom", "xml")
+MAX_FUTURE_SKEW = timedelta(minutes=5)
+
+
+def _field(obj, name, default=None):
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _as_utc(value):
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _entry_datetime(entry):
+    for field in ("published_parsed", "updated_parsed"):
+        parsed = _field(entry, field)
+        if parsed:
+            try:
+                return datetime.fromtimestamp(calendar.timegm(parsed), tz=timezone.utc)
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+    for field in ("published", "updated"):
+        raw = _field(entry, field)
+        if not raw:
+            continue
+        try:
+            return _as_utc(date_parser.parse(raw))
+        except (TypeError, ValueError, OverflowError) as exc:
+            logger.warning("Date parse error for %r: %s", raw, exc)
+    return None
+
+
+def _source_title(parsed_feed, fallback):
+    feed_meta = _field(parsed_feed, "feed", {})
+    return _field(feed_meta, "title", fallback) or fallback
+
+
+def _clean_html(value, separator=" "):
+    if not value:
+        return ""
+    return BeautifulSoup(str(value), "html.parser").get_text(
+        separator=separator, strip=True
+    )
+
+
+def _validate_content_type(response):
+    headers = getattr(response, "headers", {}) or {}
+    content_type = str(headers.get("Content-Type", "")).lower()
+    if content_type and not any(token in content_type for token in ALLOWED_FEED_CONTENT_TYPES):
+        raise ValueError(f"Unexpected feed content type: {content_type}")
+    return content_type
+
+
+def fetch_rss_feeds(
+    feeds,
+    hours_back=168,
+    *,
+    now=None,
+    return_health=False,
+    request_timeout=15,
+    max_workers=10,
+):
+    """Fetch recent RSS articles and optionally return per-source health state.
+
+    Timestamps are normalized to UTC. Entries without a trustworthy timestamp are
+    quarantined rather than being presented as newly published.
+    """
+    now_utc = _as_utc(now or datetime.now(timezone.utc))
+    time_limit = now_utc - timedelta(hours=hours_back)
 
     def fetch_single_feed(feed_url):
+        started = time.perf_counter()
         local_articles = []
+        health = {
+            "url": feed_url,
+            "status": "failed",
+            "fresh_entries": 0,
+            "total_entries": 0,
+            "quarantined_entries": 0,
+            "newest_published_at": None,
+            "bozo": False,
+            "content_type": "",
+            "error": "",
+            "latency_ms": 0.0,
+        }
         try:
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                )
             }
-            res = requests.get(feed_url, headers=headers, timeout=10)
-            feed = feedparser.parse(res.content)
-            for entry in feed.entries:
-                if hasattr(entry, 'published_parsed') and entry.published_parsed:
-                    pub_date = datetime(*entry.published_parsed[:6])
-                elif hasattr(entry, 'updated_parsed') and entry.updated_parsed:
-                    pub_date = datetime(*entry.updated_parsed[:6])
-                else:
-                    raw_date = getattr(entry, 'published', getattr(entry, 'updated', None))
-                    if raw_date:
-                        try:
-                            from dateutil import parser as date_parser
-                            pub_date = date_parser.parse(raw_date).replace(tzinfo=None)
-                        except Exception as e:
-                            logger.warning(f"Date parse error for {raw_date}: {e}")
-                            pub_date = datetime.now()
-                    else:
-                        pub_date = datetime.now()
+            scraper = cloudscraper.create_scraper()
+            response = scraper.get(feed_url, headers=headers, timeout=request_timeout)
+            if hasattr(response, "raise_for_status"):
+                response.raise_for_status()
+            elif getattr(response, "status_code", 200) >= 400:
+                raise RuntimeError(f"HTTP {response.status_code}")
+            health["content_type"] = _validate_content_type(response)
 
-                if pub_date >= time_limit:
-                    # P2.16: 为 ingest.py 添加正文抓取
-                    content = ""
-                    if hasattr(entry, 'content'):
-                        content = " ".join([c.value for c in entry.content])
-                    
-                    raw_title = getattr(entry, 'title', '')
-                    clean_title = BeautifulSoup(raw_title, "html.parser").get_text(strip=True) if raw_title else "No Title"
-                    
-                    raw_summary = getattr(entry, 'summary', '')
-                    clean_summary = BeautifulSoup(raw_summary, "html.parser").get_text(separator=" ", strip=True) if raw_summary else ""
-                    
-                    clean_content = BeautifulSoup(content, "html.parser").get_text(separator=" ", strip=True) if content else ""
+            parsed_feed = feedparser.parse(response.content)
+            entries = list(_field(parsed_feed, "entries", []) or [])
+            health["total_entries"] = len(entries)
+            health["bozo"] = bool(_field(parsed_feed, "bozo", False))
+            source_name = _source_title(parsed_feed, feed_url)
+            newest = None
 
-                    local_articles.append({
-                        'title': clean_title,
-                        'link': getattr(entry, 'link', ''),
-                        'summary': clean_summary,
-                        'content': clean_content,
-                        'source': feed.feed.title if hasattr(feed.feed, 'title') else feed_url,
-                        'published_at': pub_date.isoformat()
-                    })
-            source_name = feed.feed.title if hasattr(feed.feed, 'title') else feed_url
-            print(f"  ✓ {source_name}: {len(local_articles)} articles")
-        except Exception as e:
-            print(f"  ✗ {feed_url}: {e}", flush=True)
-        return local_articles
+            if not entries:
+                health["error"] = "Feed contains no entries"
+                print(f"  ✗ {feed_url}: no entries", flush=True)
+                health["latency_ms"] = round(
+                    (time.perf_counter() - started) * 1000.0, 3
+                )
+                return local_articles, health
+
+            for entry in entries:
+                pub_date = _entry_datetime(entry)
+                if pub_date is None or pub_date > now_utc + MAX_FUTURE_SKEW:
+                    health["quarantined_entries"] += 1
+                    continue
+
+                newest = pub_date if newest is None else max(newest, pub_date)
+                if pub_date < time_limit:
+                    continue
+
+                content_items = _field(entry, "content", []) or []
+                content = " ".join(
+                    str(_field(item, "value", "")) for item in content_items
+                )
+                raw_title = _field(entry, "title", "")
+                raw_summary = _field(entry, "summary", "")
+                local_articles.append(
+                    {
+                        "title": _clean_html(raw_title, separator="") or "No Title",
+                        "link": _field(entry, "link", "") or "",
+                        "summary": _clean_html(raw_summary),
+                        "content": _clean_html(content),
+                        "source": source_name,
+                        "published_at": pub_date.isoformat(),
+                    }
+                )
+
+            health["fresh_entries"] = len(local_articles)
+            health["newest_published_at"] = newest.isoformat() if newest else None
+            degraded_reasons = []
+            if health["bozo"]:
+                degraded_reasons.append(
+                    f"bozo feed: {_field(parsed_feed, 'bozo_exception', 'parse error')}"
+                )
+            if health["quarantined_entries"]:
+                degraded_reasons.append(
+                    f"{health['quarantined_entries']} entries quarantined"
+                )
+            if not local_articles:
+                degraded_reasons.append("no fresh entries")
+
+            health["status"] = "degraded" if degraded_reasons else "healthy"
+            health["error"] = "; ".join(degraded_reasons)
+            marker = "⚠" if health["status"] == "degraded" else "✓"
+            print(
+                f"  {marker} {source_name}: {len(local_articles)} fresh articles "
+                f"({health['status']})",
+                flush=True,
+            )
+        except Exception as exc:
+            health["status"] = "failed"
+            health["error"] = str(exc)
+            print(f"  ✗ {feed_url}: {exc}", flush=True)
+        health["latency_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
+        return local_articles, health
 
     print(f"Fetching {len(feeds)} RSS feeds in parallel...")
     articles = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(fetch_single_feed, url): url for url in feeds}
+    health_by_index = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(fetch_single_feed, url): index
+            for index, url in enumerate(feeds)
+        }
         for future in concurrent.futures.as_completed(futures):
-            articles.extend(future.result())
+            index = futures[future]
+            local_articles, health = future.result()
+            articles.extend(local_articles)
+            health_by_index[index] = health
 
+    articles.sort(
+        key=lambda item: (item.get("published_at", ""), item.get("link", "")),
+        reverse=True,
+    )
+    health_results = [health_by_index[index] for index in range(len(feeds))]
     print(f"Total: {len(articles)} articles fetched.")
+    if return_health:
+        return articles, health_results
     return articles
+
 
 if __name__ == "__main__":
     feeds = ["https://techcrunch.com/feed/"]
-    print(fetch_rss_feeds(feeds, hours_back=168))
+    print(fetch_rss_feeds(feeds, hours_back=168, return_health=True))

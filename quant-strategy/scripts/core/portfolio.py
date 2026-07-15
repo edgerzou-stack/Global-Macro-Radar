@@ -1,4 +1,5 @@
 import datetime
+import math
 import pytz
 import yfinance as yf
 import akshare as ak
@@ -9,7 +10,22 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from core.ttl_cache import ttl_cache
 
 from core.data_gateway import DataGateway
+from core.quarantine import quarantine_exclusion
 data_gateway = DataGateway()
+
+
+def _should_block_exit(market_name, entry_date, entry_price, effective_today):
+    try:
+        price = float(entry_price)
+    except (TypeError, ValueError):
+        return True
+    if not math.isfinite(price) or price <= 0:
+        return True
+    return (
+        market_name == "A-Share"
+        and str(entry_date or "")[:10] >= str(effective_today)[:10]
+    )
+
 
 class PortfolioManager:
     def __init__(self, db_utils_module):
@@ -17,44 +33,37 @@ class PortfolioManager:
         Pass the db_utils module to interact with the database.
         """
         self.db = db_utils_module
-        
+
     def get_simulated_trade_price(self, prices_dict: Dict[str, Any], market_type: str) -> float:
         """
         Returns the simulated trade price based on report generation time in the local market's timezone.
         """
-        if not isinstance(prices_dict, dict):
-            return float(prices_dict) if isinstance(prices_dict, (int, float)) else 0.0
-            
-        from core.clock import clock
-        now_utc = clock.now(pytz.utc)
-        
-        if "_a_" in market_type or "_hk_" in market_type:
-            local_time = now_utc.astimezone(pytz.timezone("Asia/Shanghai"))
-            close_time = 16.0 if "_hk_" in market_type else 15.0
-        elif "_us_" in market_type:
-            local_time = now_utc.astimezone(pytz.timezone("US/Eastern"))
-            close_time = 16.0
-        else:
-            local_time = now_utc.astimezone(pytz.timezone("Asia/Shanghai"))
-            close_time = 15.0
-            
-        time_val = local_time.hour + local_time.minute / 60.0
-        latest = prices_dict.get("最新价", 0)
-        
-        def valid_price(p, fallback):
+        def valid_price(value):
             try:
-                return float(p) if p is not None and float(p) > 0 else float(fallback)
-            except (ValueError, TypeError):
-                return float(fallback)
-                
-        # If market is closed (pre-market or post-market), we cannot execute immediately.
-        # Return 0.0 to mark the trade as "Pending" until the next Open.
-        print(f"DEBUG get_simulated_trade_price: time_val={time_val}, latest={latest}, close_time={close_time}")
-        if time_val < 9.5 or time_val >= close_time:
+                price = float(value)
+            except (TypeError, ValueError):
+                return 0.0
+            return price if math.isfinite(price) and price > 0 else 0.0
+
+        raw_price = prices_dict.get("最新价", 0) if isinstance(prices_dict, dict) else prices_dict
+        price = valid_price(raw_price)
+        if price <= 0:
             return 0.0
+
+        from core.market import AShareMarket, HKMarket, USMarket
+        if "_us_" in market_type:
+            market = USMarket()
+        elif "_hk_" in market_type:
+            market = HKMarket()
         else:
-            return valid_price(latest, 0.0)
-            
+            market = AShareMarket()
+
+        try:
+            return price if market.is_trading_time() else 0.0
+        except Exception:
+            # Execution must fail closed if the calendar cannot be evaluated.
+            return 0.0
+
     def resolve_pending_prices(self):
         """
         Scans portfolio and trade_history for 0.0 (Pending) prices.
@@ -65,7 +74,7 @@ class PortfolioManager:
         import datetime
         import pandas as pd
         import os
-        
+
         conn = self.db.get_connection()
         cursor = conn.cursor()
         try:
@@ -95,10 +104,25 @@ class PortfolioManager:
                     print(f"Failed to fetch name to code map: {e}")
                 return name_to_code
 
-            cursor.execute("SELECT id, strategy, name_or_code, entry_date FROM portfolio WHERE entry_price <= 0.0")
+            portfolio_exclusion, _ = quarantine_exclusion(conn, "portfolio")
+            cursor.execute(
+                """
+                SELECT id, strategy, name_or_code, entry_date
+                FROM portfolio
+                WHERE (entry_price IS NULL OR entry_price <= 0.0)
+                """ + portfolio_exclusion
+            )
             portfolio_pending = cursor.fetchall()
 
-            cursor.execute("SELECT id, strategy, name_or_code, entry_date, entry_price, exit_date, exit_price FROM trade_history WHERE entry_price <= 0.0 OR exit_price <= 0.0")
+            trade_exclusion, _ = quarantine_exclusion(conn, "trade_history")
+            cursor.execute(
+                """
+                SELECT id, strategy, name_or_code, entry_date, entry_price, exit_date, exit_price
+                FROM trade_history
+                WHERE (entry_price IS NULL OR entry_price <= 0.0
+                   OR exit_price IS NULL OR exit_price <= 0.0)
+                """ + trade_exclusion
+            )
             trade_pending = cursor.fetchall()
 
             if not portfolio_pending and not trade_pending:
@@ -108,14 +132,16 @@ class PortfolioManager:
             for row in portfolio_pending:
                 reqs.append({'type': 'portfolio', 'id': row[0], 'strat': row[1], 'key': row[2], 'date': row[3], 'field': 'ep'})
             for row in trade_pending:
-                if row[4] <= 0.0:
+                if row[4] is None or row[4] <= 0.0:
                     reqs.append({'type': 'trade', 'id': row[0], 'strat': row[1], 'key': row[2], 'date': row[3], 'field': 'ep'})
-                if row[6] <= 0.0:
+                if row[6] is None or row[6] <= 0.0:
                     reqs.append({'type': 'trade', 'id': row[0], 'strat': row[1], 'key': row[2], 'date': row[5], 'field': 'xp'})
 
             import pytz
 
             def fetch_open_price(req):
+                if not req['date']:
+                    return 0.0
                 # Fallback for old records that only have YYYY-MM-DD
                 if len(req['date']) <= 10:
                     dt_full = datetime.datetime.strptime(req['date'] + " 19:00:00", "%Y-%m-%d %H:%M:%S")
@@ -124,7 +150,7 @@ class PortfolioManager:
 
                 bjt = pytz.timezone('Asia/Shanghai')
                 dt_bjt = bjt.localize(dt_full)
-                
+
                 # Determine next available trading date based on order time
                 # If ordered before 9:30 AM local market time, it's today. Otherwise, next day.
                 from core.market import AShareMarket, HKMarket, USMarket
@@ -134,34 +160,34 @@ class PortfolioManager:
                     market = HKMarket()
                 else:
                     market = AShareMarket()
-                    
+
                 dt_local = dt_bjt.astimezone(market.tz)
-                
+
                 if dt_local.time() < datetime.time(9, 30):
                     target_date = dt_local.date()
                 else:
                     target_date = dt_local.date() + datetime.timedelta(days=1)
-                
+
                 target_date = market.get_next_trading_date(target_date)
-                    
+
                 # Time Guard: Do not fetch if the target date is in the future
                 # or if it's today but before the market opens (9:30 AM local).
                 now_utc = clock.now(pytz.utc)
                 now_local = now_utc.astimezone(market.tz)
-                
+
                 if target_date > now_local.date():
                     return 0.0 # Future date, price not available yet
-                    
+
                 if target_date == now_local.date():
                     if now_local.time() < datetime.time(9, 30):
                         return 0.0 # Market not opened yet today
-                        
+
                 target_dt_str = target_date.strftime("%Y%m%d")
-                
+
                 key = req['key']
                 if '_hk_' in req['strat'] and not key.upper().endswith('.HK'):
                     key = f"{key}.HK"
-                    
+
                 try:
                     return data_gateway.get_open_price(key, target_dt_str)
                 except Exception as e:
@@ -173,7 +199,7 @@ class PortfolioManager:
             updates = {'portfolio': {}, 'trade': {}}
             for req in reqs:
                 price = fetch_open_price(req)
-                if price > 0:
+                if isinstance(price, (int, float)) and math.isfinite(price) and price > 0:
                     if req['id'] not in updates[req['type']]:
                         updates[req['type']][req['id']] = {}
                     updates[req['type']][req['id']][req['field']] = price
@@ -192,7 +218,10 @@ class PortfolioManager:
                 ep = data.get('ep', ep)
                 xp = data.get('xp', xp)
 
-                if ep > 0 and xp > 0:
+                ep_valid = isinstance(ep, (int, float)) and math.isfinite(ep) and ep > 0
+                xp_valid = isinstance(xp, (int, float)) and math.isfinite(xp) and xp > 0
+
+                if ep_valid and xp_valid:
                     fee_hk = float(os.getenv("FEE_HK", 0.002))
                     fee_a = float(os.getenv("FEE_A", 0.001))
                     fee_us = float(os.getenv("FEE_US", 0.000))
@@ -214,20 +243,21 @@ class PortfolioManager:
             if updated:
                 conn.commit()
 
-
         finally:
             conn.close()
 
-    def diff_and_update(self, strategy_targets: dict, current_prices: dict, snapshot_date: str):
+    def diff_and_update(self, strategy_targets: Dict[str, List[Dict]], current_prices: Dict[str, Any], snapshot_date: str):
         """
         Calculates diff between current targets and old portfolio, updates DB, generates trades.
         """
+        from core.position_math import validate_hfq_integrity, calculate_harmonic_average_cost, calculate_true_pnl, DataIntegrityError
+
         self.resolve_pending_prices()
         old_portfolio, _ = self.db.load_portfolio_and_trades()
         new_portfolio = {s: {} for s in strategy_targets.keys()}
         new_trades = []
         diff = {s: {"added": [], "removed": []} for s in strategy_targets.keys()}
-        
+
         from core.cash_manager import CashManager
         import pytz
         import datetime
@@ -235,13 +265,13 @@ class PortfolioManager:
         import yfinance as yf
         from core.clock import clock
         import os
-        
+
         cash_mgr = CashManager()
         conn = self.db.get_connection()
         cursor = conn.cursor()
         try:
             cursor.execute("BEGIN TRANSACTION")
-            
+
             for strat, target_keys in strategy_targets.items():
                 cash_mgr.initialize_strategy(strat, cursor=cursor)
                 target_keys_set = set(target_keys)
@@ -309,9 +339,11 @@ class PortfolioManager:
 
                     effective_today = market.get_effective_trading_date()
 
-                    if entry_date[:10] >= effective_today or ep <= 0:
-                        # T+1 rule: ignore trades if the market hasn't opened for a new session since entry
-                        # OR if entry_price <= 0 (meaning the buy order hasn't been confirmed/resolved yet)
+                    if _should_block_exit(
+                        market.name, entry_date, ep, effective_today
+                    ):
+                        # A-share T+1 blocks same-session exits. All markets block
+                        # exits while the entry execution price is still pending.
                         new_portfolio[strat][key] = old_pos
                         if key in hard_stop_keys:
                             print(f"T+1 BLOCK: Cannot hard stop-loss {key} today as it was bought today or is still pending execution.")
@@ -338,36 +370,47 @@ class PortfolioManager:
                     raw_pnl = (cp / ep - 1) - fee if (ep is not None and ep > 0) else 0
                     pnl = raw_pnl
 
-                    # Fetch adjusted prices for accurate returns while preserving exact execution prices
+                    true_adj_ep = ep
+                    true_adj_cp = cp
+                    is_data_corrupted = False
+
                     try:
                         if ep > 0:
                             start_date = entry_date.replace('-','')[:8]
                             end_date = snapshot_date.replace('-','')[:8]
-                            
                             key_fetch = f"{key}.HK" if '_hk_' in strat and not key.upper().endswith('.HK') else key
-                                
+
                             df_adj = data_gateway.get_historical_prices(key_fetch, start_date, end_date, adjust="hfq")
                             df_unadj = data_gateway.get_historical_prices(key_fetch, start_date, end_date, adjust="")
-                            
+
                             if not df_adj.empty and not df_unadj.empty and len(df_adj) >= 1 and len(df_unadj) >= 1:
                                 first_adj = float(df_adj.iloc[0]['收盘'])
                                 first_unadj = float(df_unadj.iloc[0]['收盘'])
                                 last_adj = float(df_adj.iloc[-1]['收盘'])
                                 last_unadj = float(df_unadj.iloc[-1]['收盘'])
-                                
+
+                                # Use position_math for cross-validation!
+                                validate_hfq_integrity(first_adj, last_adj, first_unadj, last_unadj)
+
                                 factor_entry = first_adj / first_unadj if first_unadj > 0 else 1.0
                                 factor_exit = last_adj / last_unadj if last_unadj > 0 else 1.0
-                                
+
                                 true_adj_ep = ep * factor_entry
                                 true_adj_cp = cp * factor_exit
-                                if true_adj_ep > 0:
-                                    pnl = (true_adj_cp / true_adj_ep - 1) - fee
-                            else:
-                                import logging
-                                logging.warning(f"Failed to fetch sufficient adjusted prices for {key}. Using raw PnL.")
+                    except DataIntegrityError as e:
+                        import logging
+                        logging.error(f"[INTEGRITY BLOCK] {key} skipped today: {e}")
+                        is_data_corrupted = True
                     except Exception as e:
                         import logging
-                        logging.error(f"Error calculating adjusted PnL for {key}: {e}. Using raw PnL.")
+                        logging.warning(f"Failed to fetch sufficient adjusted prices for {key}: {e}")
+
+                    if is_data_corrupted:
+                        # Dirty read or missing factor data. Keep position safely unchanged!
+                        new_portfolio[strat][key] = old_pos
+                        continue
+
+                    pnl = calculate_true_pnl(true_adj_ep, true_adj_cp, fee)
 
                     if key in hard_stop_keys:
                         reason = "[风控熔断] 加仓满3次后仍重度亏损，触发绝对止损线强制清仓"
@@ -397,10 +440,44 @@ class PortfolioManager:
 
                     if ep > 0 and shares < 3:
                         cp = self.get_simulated_trade_price(current_prices.get(key, {}), strat)
-                        if cp > 0 and cp <= ep * 0.90:  # -10% threshold
+
+                        # Validate integrity before averaging down!
+                        true_adj_ep = ep
+                        true_adj_cp = cp
+                        is_data_corrupted = False
+                        try:
+                            start_date = old_pos.get("entry_date", snapshot_date).replace('-','')[:8]
+                            end_date = snapshot_date.replace('-','')[:8]
+                            key_fetch = f"{key}.HK" if '_hk_' in strat and not key.upper().endswith('.HK') else key
+
+                            df_adj = data_gateway.get_historical_prices(key_fetch, start_date, end_date, adjust="hfq")
+                            df_unadj = data_gateway.get_historical_prices(key_fetch, start_date, end_date, adjust="")
+
+                            if not df_adj.empty and not df_unadj.empty and len(df_adj) >= 1 and len(df_unadj) >= 1:
+                                first_adj = float(df_adj.iloc[0]['收盘'])
+                                first_unadj = float(df_unadj.iloc[0]['收盘'])
+                                last_adj = float(df_adj.iloc[-1]['收盘'])
+                                last_unadj = float(df_unadj.iloc[-1]['收盘'])
+                                validate_hfq_integrity(first_adj, last_adj, first_unadj, last_unadj)
+
+                                factor_entry = first_adj / first_unadj if first_unadj > 0 else 1.0
+                                factor_exit = last_adj / last_unadj if last_unadj > 0 else 1.0
+                                true_adj_ep = ep * factor_entry
+                                true_adj_cp = cp * factor_exit
+                        except DataIntegrityError as e:
+                            import logging
+                            logging.error(f"[INTEGRITY BLOCK] {key} skipped averaging today: {e}")
+                            is_data_corrupted = True
+                        except Exception:
+                            pass
+
+                        if is_data_corrupted:
+                            continue
+
+                        if true_adj_cp > 0 and true_adj_cp <= true_adj_ep * 0.90:  # -10% threshold on HFQ prices!
                             if cash_mgr.allocate(strat, cursor=cursor): # Try to lock funds!
-                                print(f"POSITION AVERAGING: {key} in {strat} dropped -10% from cost {ep:.2f} to {cp:.2f}. Adding tranche {shares + 1}/3.")
-                                new_ep = (shares + 1) / ((shares / ep) + (1 / cp))
+                                print(f"POSITION AVERAGING: {key} in {strat} dropped -10% from true cost {true_adj_ep:.2f} to {true_adj_cp:.2f}. Adding tranche {shares + 1}/3.")
+                                new_ep = calculate_harmonic_average_cost(shares, ep, 1, cp)
                                 new_portfolio[strat][key]["entry_price"] = new_ep
                                 new_portfolio[strat][key]["shares"] = shares + 1
                                 diff[strat]["added"].append({"name": key, "entry_price": cp, "reason": f"网格加仓(当前第{shares+1}份)"})
@@ -423,7 +500,7 @@ class PortfolioManager:
             # Persist transactions safely
             self.db.update_portfolio_and_trades(new_portfolio, new_trades, snapshot_date=snapshot_date, cursor=cursor)
             conn.commit()
-            
+
             return new_portfolio, new_trades, diff
         except Exception as e:
             conn.rollback()

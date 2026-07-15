@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import math
 import pandas as pd
 from core.data_anomaly import DataAnomalyError
 
@@ -44,10 +45,11 @@ class CircuitBreaker:
             self.failures = 0
 
 class DataGateway:
-    # Class level circuit breakers (persist across requests in a single run)
-    CB_BAOSTOCK = CircuitBreaker("baostock", threshold=2)
-    CB_SINA = CircuitBreaker("sina_akshare", threshold=2)
-    CB_YFINANCE = CircuitBreaker("yfinance", threshold=2)
+    # Deprecated compatibility aliases. Runtime requests use instance-scoped
+    # breakers so one test or pipeline run cannot poison another run.
+    CB_BAOSTOCK = CircuitBreaker("baostock", threshold=10)
+    CB_SINA = CircuitBreaker("sina_akshare", threshold=10)
+    CB_YFINANCE = CircuitBreaker("yfinance", threshold=10)
 
     def __init__(self, db_path=None):
         if db_path is None:
@@ -57,7 +59,68 @@ class DataGateway:
             db_path = os.path.join(cache_dir, "market_data_cache.db")
         
         self.db_path = db_path
+        self.breakers = {
+            "baostock": CircuitBreaker("baostock", threshold=10),
+            "sina": CircuitBreaker("sina_akshare", threshold=10),
+            "yfinance": CircuitBreaker("yfinance", threshold=10),
+        }
         self._init_db()
+
+    def _ensure_source_available(self, source: str):
+        breaker = self.breakers[source]
+        if breaker.tripped:
+            raise CircuitBreakerError(
+                f"Data source '{breaker.name}' is disabled for this gateway run"
+            )
+
+    def _call_source(self, source: str, fetch, *args, **kwargs):
+        # Check outside the adapter too, so mocks and future adapters cannot
+        # accidentally bypass a tripped breaker.
+        self._ensure_source_available(source)
+        return fetch(*args, **kwargs)
+
+    @staticmethod
+    def _validate_prices(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+        """Return normalized price data or fail closed on any corrupt row."""
+        if df is None or df.empty:
+            raise DataIntegrityError(f"Empty market data for {symbol}")
+
+        required = ["日期", "开盘", "收盘", "最高", "最低", "成交量"]
+        missing = [column for column in required if column not in df.columns]
+        if missing:
+            raise DataIntegrityError(
+                f"Market data for {symbol} is missing columns: {', '.join(missing)}"
+            )
+
+        result = df.copy()
+        result["日期"] = result["日期"].astype(str).str.replace("-", "", regex=False).str[:8]
+        if result["日期"].eq("").any() or result["日期"].duplicated().any():
+            raise DataIntegrityError(f"Invalid or duplicate dates in market data for {symbol}")
+        if not result["日期"].is_monotonic_increasing:
+            raise DataIntegrityError(f"Market data dates are not monotonic for {symbol}")
+
+        numeric_columns = ["开盘", "收盘", "最高", "最低", "成交量"]
+        for column in numeric_columns:
+            result[column] = pd.to_numeric(result[column], errors="coerce")
+            if not result[column].map(lambda value: math.isfinite(float(value))).all():
+                raise DataIntegrityError(
+                    f"Non-finite {column} value in market data for {symbol}"
+                )
+
+        if (result[["开盘", "收盘", "最高", "最低"]] <= 0).any().any():
+            raise DataIntegrityError(f"Non-positive OHLC value in market data for {symbol}")
+        if (result["成交量"] < 0).any():
+            raise DataIntegrityError(f"Negative volume in market data for {symbol}")
+        if (
+            (result["最低"] > result["开盘"])
+            | (result["最低"] > result["收盘"])
+            | (result["最高"] < result["开盘"])
+            | (result["最高"] < result["收盘"])
+            | (result["最低"] > result["最高"])
+        ).any():
+            raise DataIntegrityError(f"Inconsistent OHLC values in market data for {symbol}")
+
+        return result
 
     def _init_db(self):
         with sqlite3.connect(self.db_path, timeout=30.0) as conn:
@@ -201,11 +264,9 @@ class DataGateway:
                 """, to_insert)
                 conn.commit()
 
-    @retry(stop=stop_after_attempt(1))
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     def _fetch_from_baostock(self, symbol: str, start_date: str, end_date: str, adjust: str) -> pd.DataFrame:
-        if DataGateway.CB_BAOSTOCK.tripped:
-            raise CircuitBreakerError("BaoStock circuit breaker is tripped.")
-            
+        self._ensure_source_available("baostock")
         bs_sym = self._to_bs_symbol(symbol)
         start_fmt = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]}"
         end_fmt = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:]}"
@@ -242,21 +303,18 @@ class DataGateway:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors='coerce')
             
-            DataGateway.CB_BAOSTOCK.record_success()
+            self.breakers["baostock"].record_success()
             return df
-        except ValueError as e:
-            raise e
         except Exception as e:
-            DataGateway.CB_BAOSTOCK.record_failure()
+            if not isinstance(e, CircuitBreakerError):
+                self.breakers["baostock"].record_failure()
             raise e
         finally:
             bs.logout()
 
-    @retry(stop=stop_after_attempt(1))
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     def _fetch_from_sina(self, symbol: str, start_date: str, end_date: str, adjust: str) -> pd.DataFrame:
-        if DataGateway.CB_SINA.tripped:
-            raise CircuitBreakerError("Sina circuit breaker is tripped.")
-            
+        self._ensure_source_available("sina")
         sina_sym = self._to_sina_symbol(symbol)
         try:
             df = ak.stock_zh_a_daily(symbol=sina_sym, start_date=start_date, end_date=end_date, adjust=adjust)
@@ -275,19 +333,16 @@ class DataGateway:
                 else:
                     df['日期'] = df['日期'].astype(str).str.replace('-', '')
             
-            DataGateway.CB_SINA.record_success()
+            self.breakers["sina"].record_success()
             return df
-        except ValueError as e:
-            raise e
         except Exception as e:
-            DataGateway.CB_SINA.record_failure()
+            if not isinstance(e, CircuitBreakerError):
+                self.breakers["sina"].record_failure()
             raise e
 
-    @retry(stop=stop_after_attempt(1))
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     def _fetch_from_yfinance(self, symbol: str, start_date: str, end_date: str, adjust: str = "") -> pd.DataFrame:
-        if DataGateway.CB_YFINANCE.tripped:
-            raise CircuitBreakerError("YFinance circuit breaker is tripped.")
-            
+        self._ensure_source_available("yfinance")
         yf_sym = self._to_yf_symbol(symbol)
         start_fmt = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]}"
         end_dt = datetime.datetime.strptime(end_date, "%Y%m%d") + datetime.timedelta(days=1)
@@ -309,12 +364,11 @@ class DataGateway:
                 })
                 df['日期'] = df['日期'].dt.strftime('%Y%m%d')
                 
-            DataGateway.CB_YFINANCE.record_success()
+            self.breakers["yfinance"].record_success()
             return df
-        except ValueError as e:
-            raise e
         except Exception as e:
-            DataGateway.CB_YFINANCE.record_failure()
+            if not isinstance(e, CircuitBreakerError):
+                self.breakers["yfinance"].record_failure()
             raise e
 
     def get_historical_prices(self, symbol: str, start_date: str, end_date: str, adjust: str = "") -> pd.DataFrame:
@@ -324,8 +378,10 @@ class DataGateway:
         df_cache = self._get_from_cache(symbol, start_date, end_date, adjust)
         
         if not df_cache.empty:
+            df_cache = self._validate_prices(df_cache, symbol)
+            cache_min = str(df_cache['日期'].min()).replace('-', '')[:8]
             cache_max = str(df_cache['日期'].max()).replace('-', '')[:8]
-            if cache_max >= end_date:
+            if cache_min <= start_date and cache_max >= end_date:
                 return df_cache
 
         df_new = pd.DataFrame()
@@ -334,39 +390,47 @@ class DataGateway:
         if is_a_share:
             # Multi-level Failover Strategy for A-Shares
             try:
-                df_new = self._fetch_from_baostock(symbol, start_date, end_date, adjust)
+                df_new = self._call_source(
+                    "baostock", self._fetch_from_baostock,
+                    symbol, start_date, end_date, adjust
+                )
             except Exception as e_bs:
                 logger.warning(f"DataGateway: baostock failed for {symbol}: {e_bs}. Falling back to Sina.")
                 try:
-                    df_new = self._fetch_from_sina(symbol, start_date, end_date, adjust)
+                    df_new = self._call_source(
+                        "sina", self._fetch_from_sina,
+                        symbol, start_date, end_date, adjust
+                    )
                 except Exception as e_sina:
                     logger.warning(f"DataGateway: Sina failed for {symbol}: {e_sina}. Falling back to YFinance.")
+                    if adjust == "hfq":
+                        logger.error(f"DataGateway: Cannot use YFinance for A-Share HFQ data for {symbol}. It returns unadjusted prices and causes cache poisoning.")
+                        raise FatalSystemError(f"A-Share HFQ data unavailable for {symbol} (Baostock/Sina failed). Aborting pipeline to prevent severe PnL corruption.")
                     try:
-                        df_new = self._fetch_from_yfinance(symbol, start_date, end_date, adjust)
+                        df_new = self._call_source(
+                            "yfinance", self._fetch_from_yfinance,
+                            symbol, start_date, end_date, adjust
+                        )
                     except Exception as e_yf:
                         logger.error(f"DataGateway: All A-share sources failed for {symbol}.")
-                        
-                        # Check global double (or triple) circuit breaker logic
-                        if DataGateway.CB_BAOSTOCK.tripped and DataGateway.CB_SINA.tripped and DataGateway.CB_YFINANCE.tripped:
-                            err_msg = "FATAL ERROR: All three data sources (BaoStock, Sina, YFinance) have tripped their circuit breakers. Aborting pipeline to prevent dirty data."
-                            logger.critical(err_msg)
-                            raise FatalSystemError(err_msg)
+                        raise FatalSystemError(
+                            f"All A-share data sources failed for {symbol}. Aborting pipeline."
+                        ) from e_yf
         else:
             # Non-A shares (US/HK)
             try:
-                df_new = self._fetch_from_yfinance(symbol, start_date, end_date, adjust)
+                df_new = self._call_source(
+                    "yfinance", self._fetch_from_yfinance,
+                    symbol, start_date, end_date, adjust
+                )
             except Exception as e:
                 logger.error(f"DataGateway: YFinance failed for {symbol}: {e}.")
-                if DataGateway.CB_YFINANCE.tripped:
-                    err_msg = "FATAL ERROR: YFinance circuit breaker tripped for non-A-share asset. Aborting pipeline."
-                    logger.critical(err_msg)
-                    raise FatalSystemError(err_msg)
+                raise FatalSystemError(
+                    f"YFinance failed for non-A-share asset {symbol}. Aborting pipeline."
+                ) from e
                 
         if not df_new.empty:
-            if (df_new['收盘'] <= 0).any():
-                logger.error(f"DataGateway: Integrity check failed (price <= 0) for {symbol}")
-                df_new = df_new[df_new['收盘'] > 0]
-                
+            df_new = self._validate_prices(df_new, symbol)
             self._save_to_cache(symbol, df_new, adjust)
             
             if not df_cache.empty:
@@ -374,6 +438,10 @@ class DataGateway:
                 
             df_new['日期'] = df_new['日期'].astype(str).str.replace('-', '').str[:8]
             df_new = df_new[(df_new['日期'] >= start_date) & (df_new['日期'] <= end_date)]
+            if df_new.empty:
+                raise DataIntegrityError(
+                    f"No market data for {symbol} in requested range {start_date}-{end_date}"
+                )
             return df_new
             
         return df_cache
@@ -421,8 +489,13 @@ class DataGateway:
         try:
             df = self.get_historical_prices(symbol, effective_date_str, effective_date_str, adjust="")
             if not df.empty:
-                return float(df.iloc[-1]['收盘'])
+                price = float(df.iloc[-1]['收盘'])
+                if not math.isfinite(price) or price <= 0:
+                    raise DataIntegrityError(f"Invalid current price for {symbol}: {price}")
+                return price
         except FatalSystemError:
+            raise
+        except DataIntegrityError:
             raise
         except Exception as e:
             logger.error(f"Failed to get current price for {symbol}: {e}")

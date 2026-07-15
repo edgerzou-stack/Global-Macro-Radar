@@ -9,6 +9,41 @@ Welcome to the **Quant Strategy Execution Scripts** directory. This directory is
 
 These scripts are utility tools designed to be executed via standard Python 3.9+. Ensure your virtual environment is active before executing them.
 
+### Shadow acceptance and controlled live health probes
+
+`shadow_runner.py` is offline by default. It opens the production ledger read-only,
+creates an isolated SQLite backup for every iteration, disables real orders, and
+blocks network access for all ordinary and custom stages.
+
+```bash
+python3 scripts/shadow_runner.py --iterations 20
+```
+
+`--allow-live-api` adds only two bounded, read-only health stages: the production
+RSS ingest health contract and `DataGateway` market-source probes. It does not run
+the news scorer, load an LLM client, submit an order, or write the production DB.
+Only HTTPS GET/HEAD and read-only provider query adapters are permitted. Each
+iteration has one shared deadline and logical source-request budget.
+
+Recommended first authorized live sample:
+
+```bash
+python3 scripts/shadow_runner.py \
+  --iterations 1 \
+  --allow-live-api \
+  --live-rss-feed https://openai.com/news/rss.xml \
+  --live-symbol 600519 \
+  --live-symbol AAPL \
+  --live-request-limit 6 \
+  --live-timeout-seconds 45 \
+  --live-lookback-days 10
+```
+
+Use `--skip-live-rss` or `--skip-live-market` to isolate one family of probes.
+Reports contain per-source freshness, latency, success rate, request counts, and
+A-share Baostock/Sina close-price cross-checks. API keys are never printed and LLM
+use remains disabled even if LLM variables exist in the parent environment.
+
 ## Content Index
 
 | Item | Type | Description |
