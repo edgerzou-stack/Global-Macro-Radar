@@ -44,6 +44,45 @@ Reports contain per-source freshness, latency, success rate, request counts, and
 A-share Baostock/Sina close-price cross-checks. API keys are never printed and LLM
 use remains disabled even if LLM variables exist in the parent environment.
 
+### Deterministic offline global-screen flow
+
+Set `GLOBAL_SCREEN_FIXTURE` to a version-1 JSON fixture to run
+`screen_global_quant.py` without A-share, US/HK, hot-spot, current-price, or LLM
+network fetches. The run still executes the real `PortfolioManager` diff/update,
+creates all strategy accounts, persists one `strategy_daily_results` row per
+strategy (including empty results), and atomically replaces the global-screen
+artifact.
+
+```json
+{
+  "fixture_version": 1,
+  "snapshot_date": "2026-07-11",
+  "results": {
+    "dividend_a_stock": [{"股票代码": "000001", "股票简称": "Fixture"}],
+    "growth_a_stock": [],
+    "dividend_us_stock": [],
+    "growth_us_stock": [],
+    "dividend_hk_stock": [],
+    "growth_hk_stock": [],
+    "hot_spot_a_stock": [],
+    "hot_spot_us_stock": [],
+    "hot_spot_hk_stock": []
+  },
+  "current_prices": {"000001": {"最新价": 10.5}}
+}
+```
+
+```bash
+GLOBAL_SCREEN_FIXTURE=/absolute/path/global-screen-fixture.json \
+SQLITE_DB_PATH=/absolute/path/test-quant.db QUANT_DB_ENV=test \
+python3 scripts/screen_global_quant.py --output-file /absolute/path/global_screen.json
+```
+
+The schema is strict: all nine strategy keys are required, unknown top-level keys
+are rejected, prices must be positive and finite, and prices must cover both the
+fixture targets and any positions already present in the selected ledger. Use an
+isolated test/backtest database; never point an offline fixture run at production.
+
 ## Content Index
 
 | Item | Type | Description |

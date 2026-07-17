@@ -27,16 +27,49 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 from urllib.parse import quote
 
-from core.quarantine import quarantined_row_ids
+import yaml
+
+from core.quarantine import quarantine_filter, quarantined_row_ids
 
 
 StageCallable = Callable[["ShadowContext"], Optional[Mapping[str, Any]]]
 
-DEFAULT_LIVE_RSS_FEEDS = (
+SMOKE_LIVE_RSS_FEEDS = (
     "https://openai.com/news/rss.xml",
     "https://www.technologyreview.com/feed/",
 )
-DEFAULT_LIVE_SYMBOLS = ("600519", "AAPL")
+DEFAULT_LIVE_RSS_FEEDS = SMOKE_LIVE_RSS_FEEDS
+DEFAULT_LIVE_SYMBOLS = ("600519", "0700.HK", "AAPL")
+MAX_LIVE_RSS_FEEDS = 40
+
+
+def load_full_live_rss_profile(radar_root: Optional[Path] = None) -> tuple[str, ...]:
+    """Load the complete configured RSS set without importing radar runtime code."""
+    if radar_root is None:
+        radar_root = Path(__file__).resolve().parents[2] / "industry-radar"
+    radar_root = Path(radar_root).expanduser().resolve()
+    config_path = radar_root / "config.yaml"
+    if not config_path.is_file():
+        config_path = radar_root / "config.example.yaml"
+    try:
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as error:
+        raise ValueError(f"Cannot load RSS profile {config_path}: {error}") from error
+    feeds = payload.get("rss_feeds")
+    if (
+        not isinstance(feeds, list)
+        or not feeds
+        or any(not isinstance(url, str) or not url.startswith("https://") for url in feeds)
+        or len(feeds) != len(set(feeds))
+    ):
+        raise ValueError(
+            f"RSS profile {config_path} must contain unique HTTPS rss_feeds"
+        )
+    if len(feeds) > MAX_LIVE_RSS_FEEDS:
+        raise ValueError(
+            f"RSS profile {config_path} exceeds {MAX_LIVE_RSS_FEEDS} sources"
+        )
+    return tuple(feeds)
 
 
 class NetworkAccessDisabled(RuntimeError):
@@ -225,6 +258,7 @@ class ShadowConfig:
     live_request_limit: int = 8
     live_timeout_seconds: float = 45.0
     live_lookback_days: int = 10
+    live_profile: str = "custom"
 
     def __post_init__(self):
         object.__setattr__(self, "production_db", Path(self.production_db).expanduser().resolve())
@@ -241,8 +275,10 @@ class ShadowConfig:
             raise ValueError("freshness_days must be non-negative")
         object.__setattr__(self, "live_rss_feeds", tuple(self.live_rss_feeds))
         object.__setattr__(self, "live_symbols", tuple(self.live_symbols))
-        if len(self.live_rss_feeds) > 10:
-            raise ValueError("live_rss_feeds must contain at most 10 feeds")
+        if len(self.live_rss_feeds) > MAX_LIVE_RSS_FEEDS:
+            raise ValueError(
+                f"live_rss_feeds must contain at most {MAX_LIVE_RSS_FEEDS} feeds"
+            )
         if len(self.live_symbols) > 10:
             raise ValueError("live_symbols must contain at most 10 symbols")
         if any(not str(url).startswith("https://") for url in self.live_rss_feeds):
@@ -256,6 +292,8 @@ class ShadowConfig:
             raise ValueError("live_timeout_seconds must be between 1 and 300")
         if not 1 <= self.live_lookback_days <= 30:
             raise ValueError("live_lookback_days must be between 1 and 30")
+        if self.live_profile not in {"custom", "full", "smoke"}:
+            raise ValueError("live_profile must be custom, full, or smoke")
 
 
 @dataclasses.dataclass
@@ -478,11 +516,21 @@ def ledger_invariants_stage(context: ShadowContext) -> Mapping[str, Any]:
     with read_only_connection(context.database_path) as connection:
         tables = _table_names(connection)
         if "strategy_accounts" in tables:
+            account_filter, account_parameters, quarantined_accounts = quarantine_filter(
+                connection, "strategy_accounts"
+            )
+            observations["quarantined_strategy_accounts"] = len(
+                quarantined_accounts
+            )
             issues["negative_cash"] = connection.execute(
                 "SELECT COUNT(*) FROM strategy_accounts WHERE available_cash < 0"
+                + account_filter,
+                account_parameters,
             ).fetchone()[0]
             issues["non_positive_capital"] = connection.execute(
                 "SELECT COUNT(*) FROM strategy_accounts WHERE total_capital <= 0"
+                + account_filter,
+                account_parameters,
             ).fetchone()[0]
         if "portfolio" in tables:
             quarantined_portfolio_ids = quarantined_row_ids(connection, "portfolio")
@@ -759,6 +807,7 @@ def market_live_health_stage(context: ShadowContext) -> Mapping[str, Any]:
                     latency_ms=latency_ms,
                     probe_status="healthy",
                 )
+                freshness_status = context.metrics.sources[source]["status"]
                 observations.setdefault(symbol, {})[provider] = (source_date, close)
                 source_results.append(
                     {
@@ -767,6 +816,7 @@ def market_live_health_stage(context: ShadowContext) -> Mapping[str, Any]:
                         "status": "healthy",
                         "success": True,
                         "latest_date": _parse_source_date(source_date).isoformat(),
+                        "freshness_status": freshness_status,
                         "latency_ms": latency_ms,
                     }
                 )
@@ -789,6 +839,7 @@ def market_live_health_stage(context: ShadowContext) -> Mapping[str, Any]:
                         "status": "failed",
                         "success": False,
                         "latest_date": None,
+                        "freshness_status": "unknown",
                         "latency_ms": latency_ms,
                         "error": f"{type(error).__name__}: {error}",
                     }
@@ -811,7 +862,12 @@ def market_live_health_stage(context: ShadowContext) -> Mapping[str, Any]:
             )
 
     successful = sum(item["success"] for item in source_results)
-    if not source_results or successful == 0:
+    freshness_failed = any(
+        item.get("success")
+        and item.get("freshness_status") in {"stale", "future"}
+        for item in source_results
+    )
+    if not source_results or successful == 0 or freshness_failed:
         stage_status = "failed"
     elif successful != len(source_results) or any(
         not check["passed"] for check in cross_checks
@@ -898,6 +954,7 @@ class ShadowRunner:
                 "freshness_days": self.config.freshness_days,
                 "live_request_limit": self.config.live_request_limit,
                 "live_timeout_seconds": self.config.live_timeout_seconds,
+                "live_profile": self.config.live_profile,
                 "live_rss_feeds": list(self.config.live_rss_feeds),
                 "live_symbols": list(self.config.live_symbols),
                 "production_db": str(self.config.production_db),
@@ -1295,6 +1352,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run bounded read-only RSS and market-data health probes.",
     )
     parser.add_argument(
+        "--live-profile",
+        choices=("full", "smoke"),
+        default="full",
+        help=(
+            "RSS acceptance profile. full loads every feed from config.yaml "
+            "(falling back to config.example.yaml); smoke uses two canary feeds."
+        ),
+    )
+    parser.add_argument(
         "--live-rss-feed",
         action="append",
         default=None,
@@ -1312,7 +1378,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--skip-live-market", action="store_true", help="Disable the market live probe."
     )
-    parser.add_argument("--live-request-limit", type=int, default=8)
+    parser.add_argument(
+        "--live-request-limit",
+        type=int,
+        default=None,
+        help="Per-iteration external request budget; defaults to the selected profile size.",
+    )
     parser.add_argument("--live-timeout-seconds", type=float, default=45.0)
     parser.add_argument("--live-lookback-days", type=int, default=10)
     return parser
@@ -1320,12 +1391,34 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-    live_rss_feeds = tuple(args.live_rss_feed or DEFAULT_LIVE_RSS_FEEDS)
-    live_symbols = tuple(args.live_symbol or DEFAULT_LIVE_SYMBOLS)
+    if not args.allow_live_api:
+        live_rss_feeds = ()
+        live_symbols = ()
+        live_profile = args.live_profile
+    elif args.live_rss_feed:
+        live_rss_feeds = tuple(args.live_rss_feed)
+        live_profile = "custom"
+    elif args.live_profile == "full":
+        live_rss_feeds = load_full_live_rss_profile()
+        live_profile = "full"
+    else:
+        live_rss_feeds = SMOKE_LIVE_RSS_FEEDS
+        live_profile = "smoke"
+    if args.allow_live_api:
+        live_symbols = tuple(args.live_symbol or DEFAULT_LIVE_SYMBOLS)
     if args.skip_live_rss:
         live_rss_feeds = ()
     if args.skip_live_market:
         live_symbols = ()
+    market_requests = sum(
+        2 if len(str(symbol)) == 6 and str(symbol).isdigit() else 1
+        for symbol in live_symbols
+    )
+    live_request_limit = (
+        args.live_request_limit
+        if args.live_request_limit is not None
+        else max(8, len(live_rss_feeds) + market_requests)
+    )
     runner = ShadowRunner(
         ShadowConfig(
             production_db=args.production_db,
@@ -1333,10 +1426,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             output_dir=args.output_dir,
             iterations=args.iterations,
             allow_live_api=args.allow_live_api,
+            live_profile=live_profile,
             freshness_days=args.freshness_days,
             live_rss_feeds=live_rss_feeds,
             live_symbols=live_symbols,
-            live_request_limit=args.live_request_limit,
+            live_request_limit=live_request_limit,
             live_timeout_seconds=args.live_timeout_seconds,
             live_lookback_days=args.live_lookback_days,
         )

@@ -1,6 +1,8 @@
 import os
 import sqlite3
 import math
+import json
+import re
 import pandas as pd
 from core.data_anomaly import DataAnomalyError
 
@@ -10,8 +12,10 @@ import akshare as ak
 import baostock as bs
 import logging
 from tenacity import retry, stop_after_attempt, wait_exponential
+from functools import lru_cache
 
 logger = logging.getLogger(__name__)
+HISTORICAL_PRICE_FIXTURE_SCHEMA_VERSION = 1
 
 class DataIntegrityError(Exception):
     """Raised when fetched data fails integrity checks (e.g., price <= 0)."""
@@ -24,6 +28,79 @@ class CircuitBreakerError(Exception):
 class FatalSystemError(Exception):
     """Raised when all data sources are broken (double circuit breaker)."""
     pass
+
+
+@lru_cache(maxsize=8)
+def _load_historical_fixture_cached(path, mtime_ns):
+    del mtime_ns  # File rewrites produce a distinct cache key.
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            fixture = json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        raise DataIntegrityError(
+            f"Cannot load historical price fixture {path}: {error}"
+        ) from error
+    if not isinstance(fixture, dict):
+        raise DataIntegrityError("historical price fixture must be an object")
+    if set(fixture) != {"schema_version", "series"}:
+        raise DataIntegrityError(
+            "historical price fixture has invalid top-level fields"
+        )
+    if fixture.get("schema_version") != HISTORICAL_PRICE_FIXTURE_SCHEMA_VERSION:
+        raise DataIntegrityError("unsupported historical price fixture schema_version")
+    series = fixture.get("series")
+    if not isinstance(series, list):
+        raise DataIntegrityError("historical price fixture series must be a list")
+
+    result = {}
+    for index, entry in enumerate(series):
+        if not isinstance(entry, dict) or set(entry) != {
+            "symbol", "adjust", "start_date", "end_date", "rows"
+        }:
+            raise DataIntegrityError(
+                f"historical price fixture series {index} has invalid fields"
+            )
+        symbol = entry.get("symbol")
+        adjust = entry.get("adjust")
+        coverage_start = str(entry.get("start_date", "")).replace("-", "")
+        coverage_end = str(entry.get("end_date", "")).replace("-", "")
+        rows = entry.get("rows")
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise DataIntegrityError(
+                f"historical price fixture series {index} has invalid symbol"
+            )
+        if adjust not in {"", "qfq", "hfq"}:
+            raise DataIntegrityError(
+                f"historical price fixture series {index} has invalid adjust"
+            )
+        try:
+            if (
+                not re.fullmatch(r"\d{8}", coverage_start)
+                or not re.fullmatch(r"\d{8}", coverage_end)
+                or coverage_start > coverage_end
+            ):
+                raise ValueError
+            datetime.datetime.strptime(coverage_start, "%Y%m%d")
+            datetime.datetime.strptime(coverage_end, "%Y%m%d")
+        except ValueError as error:
+            raise DataIntegrityError(
+                f"historical price fixture series {index} has invalid coverage dates"
+            ) from error
+        if not isinstance(rows, list) or not rows:
+            raise DataIntegrityError(
+                f"historical price fixture series {index} rows must be non-empty"
+            )
+        key = (symbol, adjust)
+        if key in result:
+            raise DataIntegrityError(
+                f"duplicate historical price fixture series for {symbol}/{adjust}"
+            )
+        result[key] = {
+            "start_date": coverage_start,
+            "end_date": coverage_end,
+            "rows": rows,
+        }
+    return result
 
 class CircuitBreaker:
     def __init__(self, name: str, threshold: int = 2):
@@ -52,11 +129,15 @@ class DataGateway:
     CB_YFINANCE = CircuitBreaker("yfinance", threshold=10)
 
     def __init__(self, db_path=None):
+        self.historical_fixture_path = os.environ.get("HISTORICAL_PRICE_FIXTURE")
         if db_path is None:
-            scripts_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            cache_dir = os.path.join(scripts_dir, ".cache")
-            os.makedirs(cache_dir, exist_ok=True)
-            db_path = os.path.join(cache_dir, "market_data_cache.db")
+            if self.historical_fixture_path:
+                db_path = None
+            else:
+                scripts_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                cache_dir = os.path.join(scripts_dir, ".cache")
+                os.makedirs(cache_dir, exist_ok=True)
+                db_path = os.path.join(cache_dir, "market_data_cache.db")
         
         self.db_path = db_path
         self.breakers = {
@@ -64,7 +145,60 @@ class DataGateway:
             "sina": CircuitBreaker("sina_akshare", threshold=10),
             "yfinance": CircuitBreaker("yfinance", threshold=10),
         }
-        self._init_db()
+        if self.db_path is not None:
+            self._init_db()
+
+    def _get_from_historical_fixture(
+        self, symbol: str, start_date: str, end_date: str, adjust: str
+    ) -> pd.DataFrame:
+        path = os.path.abspath(os.fspath(self.historical_fixture_path))
+        try:
+            mtime_ns = os.stat(path).st_mtime_ns
+        except OSError as error:
+            raise DataIntegrityError(
+                f"Cannot stat historical price fixture {path}: {error}"
+            ) from error
+        series = _load_historical_fixture_cached(path, mtime_ns)
+        key = (symbol, adjust)
+        if key not in series:
+            raise DataIntegrityError(
+                f"historical price fixture has no exact series for {symbol}/{adjust}"
+            )
+        fixture_series = series[key]
+        frame = self._validate_prices(pd.DataFrame(fixture_series["rows"]), symbol)
+        parsed_fixture_dates = pd.to_datetime(
+            frame["日期"], format="%Y%m%d", errors="coerce"
+        )
+        if parsed_fixture_dates.isna().any():
+            raise DataIntegrityError(
+                f"historical price fixture contains invalid dates for {symbol}/{adjust}"
+            )
+        if (
+            (frame["日期"] < fixture_series["start_date"])
+            | (frame["日期"] > fixture_series["end_date"])
+        ).any():
+            raise DataIntegrityError(
+                f"historical price fixture rows exceed declared coverage for "
+                f"{symbol}/{adjust}"
+            )
+        if (
+            start_date < fixture_series["start_date"]
+            or end_date > fixture_series["end_date"]
+        ):
+            raise DataIntegrityError(
+                f"historical price fixture does not cover {symbol}/{adjust} "
+                f"range {start_date}-{end_date}; "
+                f"available={fixture_series['start_date']}-{fixture_series['end_date']}"
+            )
+        result = frame[
+            (frame["日期"] >= start_date) & (frame["日期"] <= end_date)
+        ].copy()
+        if result.empty:
+            raise DataIntegrityError(
+                f"historical price fixture has no rows for {symbol}/{adjust} "
+                f"range {start_date}-{end_date}"
+            )
+        return result
 
     def _ensure_source_available(self, source: str):
         breaker = self.breakers[source]
@@ -374,6 +508,23 @@ class DataGateway:
     def get_historical_prices(self, symbol: str, start_date: str, end_date: str, adjust: str = "") -> pd.DataFrame:
         start_date = str(start_date).replace('-', '')
         end_date = str(end_date).replace('-', '')
+        if not re.fullmatch(r"\d{8}", start_date) or not re.fullmatch(
+            r"\d{8}", end_date
+        ) or start_date > end_date:
+            raise DataIntegrityError(
+                f"Invalid historical price range {start_date}-{end_date}"
+            )
+        try:
+            datetime.datetime.strptime(start_date, "%Y%m%d")
+            datetime.datetime.strptime(end_date, "%Y%m%d")
+        except ValueError as error:
+            raise DataIntegrityError(
+                f"Invalid historical price range {start_date}-{end_date}"
+            ) from error
+        if self.historical_fixture_path:
+            return self._get_from_historical_fixture(
+                str(symbol), start_date, end_date, adjust
+            )
         
         df_cache = self._get_from_cache(symbol, start_date, end_date, adjust)
         

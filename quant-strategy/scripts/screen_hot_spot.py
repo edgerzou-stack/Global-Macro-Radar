@@ -1,8 +1,10 @@
 import os
 import re
 import json
+import hashlib
 import requests
 import math
+import tempfile
 import time
 # Load .env manually (no dotenv dependency needed)
 def _load_env(path):
@@ -18,11 +20,132 @@ def _load_env(path):
     env_path = os.environ.get("RADAR_ENV", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "industry-radar", ".env"))
     _load_env(env_path)
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Import A-share fetcher for A-share hot spots
 from data_provider import fetch_quote_snapshot_cached
 from llm_utils import call_llm
+
+
+HOT_SPOT_SCHEMA_VERSION = 1
+HOT_SPOT_STRATEGIES = (
+    "hot_spot_a_stock",
+    "hot_spot_us_stock",
+    "hot_spot_hk_stock",
+)
+
+
+def empty_hot_spot_data():
+    return {strategy: [] for strategy in HOT_SPOT_STRATEGIES}
+
+
+def load_hot_spot_fixture(path):
+    fixture_path = os.path.abspath(os.fspath(path))
+    try:
+        with open(fixture_path, "r", encoding="utf-8") as handle:
+            fixture = json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"Cannot load hot-spot fixture {fixture_path}: {error}"
+        ) from error
+    if not isinstance(fixture, dict):
+        raise ValueError("hot-spot fixture must be a JSON object")
+    if fixture.get("schema_version") != HOT_SPOT_SCHEMA_VERSION:
+        raise ValueError("unsupported hot-spot fixture schema_version")
+    data = fixture.get("data")
+    if not isinstance(data, dict) or set(data) != set(HOT_SPOT_STRATEGIES):
+        raise ValueError("hot-spot fixture has invalid strategy keys")
+    if any(not isinstance(data[key], list) for key in HOT_SPOT_STRATEGIES):
+        raise ValueError("hot-spot fixture strategy payloads must be lists")
+    return {key: list(data[key]) for key in HOT_SPOT_STRATEGIES}
+
+
+def _effective_date():
+    from core.clock import clock
+
+    return clock.today().isoformat()
+
+
+def _run_id(effective_date=None):
+    date_text = str(effective_date or _effective_date())
+    return os.environ.get("RUN_ID") or f"daily-{date_text}"
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def save_hot_spot_artifact(
+    output_path,
+    data,
+    *,
+    report_path,
+    hot_news_count,
+    effective_date=None,
+    run_id=None,
+    generated_at=None,
+):
+    """Atomically publish a run-scoped hot-spot artifact."""
+    expected_keys = set(HOT_SPOT_STRATEGIES)
+    if not isinstance(data, dict) or set(data) != expected_keys:
+        raise ValueError("hot-spot data must contain exactly the configured strategies")
+    if any(not isinstance(data[key], list) for key in HOT_SPOT_STRATEGIES):
+        raise ValueError("hot-spot strategy payloads must be lists")
+    if type(hot_news_count) is not int or hot_news_count < 0:
+        raise ValueError("hot_news_count must be a non-negative integer")
+    if not report_path or not os.path.isfile(report_path):
+        raise FileNotFoundError(f"Radar report does not exist: {report_path}")
+
+    date_text = effective_date or _effective_date()
+    run_text = run_id or _run_id(date_text)
+    if not isinstance(run_text, str) or not run_text.strip():
+        raise ValueError("run_id must be a non-empty string")
+    created = generated_at or datetime.now(timezone.utc)
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+
+    is_empty = all(not data[key] for key in HOT_SPOT_STRATEGIES)
+    artifact = {
+        "schema_version": HOT_SPOT_SCHEMA_VERSION,
+        "run_id": run_text,
+        "effective_date": date_text,
+        "generated_at": created.astimezone(timezone.utc).isoformat(),
+        "status": "ok_empty" if is_empty else "ok",
+        "hot_news_count": hot_news_count,
+        "source_report": {
+            "path": os.path.abspath(report_path),
+            "sha256": _sha256_file(report_path),
+        },
+        "data": data,
+    }
+
+    output_path = os.path.abspath(output_path)
+    output_dir = os.path.dirname(output_path)
+    os.makedirs(output_dir, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=output_dir,
+            prefix=".hot_spot_today.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = handle.name
+            json.dump(artifact, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, output_path)
+        temporary_path = None
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+    return artifact
 
 def get_latest_radar_report():
     radar_reports_dir = os.environ.get("RADAR_REPORTS_DIR", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "industry-radar", "reports"))
@@ -220,20 +343,40 @@ def filter_global(items):
 def main():
     report_file = get_latest_radar_report()
     if not report_file:
-        print("No radar report found.")
-        return
+        raise RuntimeError("No fresh radar report found; refusing to reuse old hot spots")
+
+    from config import PROJECT_ROOT
+    output_path = os.path.join(PROJECT_ROOT, "hot_spot_today.json")
         
     print(f"Reading radar report: {report_file}")
     hot_news = extract_hot_news(report_file)
     if not hot_news:
         print("No high-traffic news found.")
-        return
+        artifact = save_hot_spot_artifact(
+            output_path,
+            empty_hot_spot_data(),
+            report_path=report_file,
+            hot_news_count=0,
+        )
+        print(f"Saved empty hot spot artifact to {output_path}")
+        return artifact
+
+    fixture_path = os.environ.get("HOT_SPOT_FIXTURE")
+    if fixture_path:
+        print(f"Loading deterministic hot-spot fixture: {fixture_path}")
+        artifact = save_hot_spot_artifact(
+            output_path,
+            load_hot_spot_fixture(fixture_path),
+            report_path=report_file,
+            hot_news_count=len(hot_news),
+        )
+        print(f"Saved fixture-backed hot spot artifact to {output_path}")
+        return artifact
         
     print(f"Found {len(hot_news)} high-traffic news items. Querying LLM...")
     
     # Extract previous holdings to anchor the LLM
     previous_holdings = {}
-    from config import PROJECT_ROOT
     global_screen_path = os.path.join(PROJECT_ROOT, "global_screen.json")
     if os.path.exists(global_screen_path):
         try:
@@ -250,7 +393,7 @@ def main():
     llm_pools = get_hot_stocks_from_llm(hot_news, previous_holdings)
     print(f"LLM suggested pools: {llm_pools}")
     
-    final_output = {}
+    final_output = empty_hot_spot_data()
     
     # Process A shares
     a_share_results = filter_a_share(llm_pools.get("A_Stock", []))
@@ -343,12 +486,15 @@ def main():
     for k in ["hot_spot_a_stock", "hot_spot_us_stock", "hot_spot_hk_stock"]:
         final_output[k] = rank_top_10_via_llm(k, final_output.get(k, []), hot_news, previous_holdings)
         
-    from config import PROJECT_ROOT
-    output_path = os.path.join(PROJECT_ROOT, "hot_spot_today.json")
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(final_output, f, ensure_ascii=False, indent=2)
-        
+    hot_news_count = sum(1 for line in hot_news if line.startswith("### "))
+    artifact = save_hot_spot_artifact(
+        output_path,
+        final_output,
+        report_path=report_file,
+        hot_news_count=hot_news_count,
+    )
     print(f"Saved global hot spot stocks to {output_path}")
+    return artifact
 
 if __name__ == "__main__":
     main()

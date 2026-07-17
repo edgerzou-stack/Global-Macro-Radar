@@ -265,7 +265,8 @@ def load_portfolio_and_trades():
 def update_portfolio(portfolio_dict):
     conn = get_connection()
     c = conn.cursor()
-    c.execute("DELETE FROM portfolio")
+    portfolio_exclusion, _ = quarantine_exclusion(conn, "portfolio")
+    c.execute("DELETE FROM portfolio WHERE 1=1" + portfolio_exclusion)
     for strat, holdings in portfolio_dict.items():
         for key, info in holdings.items():
             c.execute("INSERT INTO portfolio (strategy, name_or_code, entry_date, entry_price, shares) VALUES (?, ?, ?, ?, ?)",
@@ -334,7 +335,11 @@ def _execute_portfolio_updates(c, portfolio_dict, trades_list, snapshot_date):
         
     for strat, holdings in portfolio_dict.items():
         # Granular CRUD: Only delete the portfolio for the specific strategy being updated.
-        c.execute("DELETE FROM portfolio WHERE strategy = ?", (strat,))
+        portfolio_exclusion, _ = quarantine_exclusion(c.connection, "portfolio")
+        c.execute(
+            "DELETE FROM portfolio WHERE strategy = ?" + portfolio_exclusion,
+            (strat,),
+        )
         
         for key, info in holdings.items():
             # P2.18: Save weights and shares
@@ -388,7 +393,11 @@ def load_latest_daily_results():
     conn = get_connection()
     c = conn.cursor()
     # Find the latest result_date
-    c.execute("SELECT MAX(result_date) FROM strategy_daily_results")
+    result_exclusion, _ = quarantine_exclusion(conn, "strategy_daily_results")
+    c.execute(
+        "SELECT MAX(result_date) FROM strategy_daily_results WHERE 1=1"
+        + result_exclusion
+    )
     latest_date_row = c.fetchone()
     if not latest_date_row or not latest_date_row[0]:
         conn.close()
@@ -397,7 +406,11 @@ def load_latest_daily_results():
     latest_date = latest_date_row[0]
     
     # Fetch all strategies for that date
-    c.execute("SELECT strategy, result_json FROM strategy_daily_results WHERE result_date=?", (latest_date,))
+    c.execute(
+        "SELECT strategy, result_json FROM strategy_daily_results "
+        "WHERE result_date=?" + result_exclusion,
+        (latest_date,),
+    )
     rows = c.fetchall()
     conn.close()
     

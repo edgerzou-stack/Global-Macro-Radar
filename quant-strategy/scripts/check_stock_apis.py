@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 import logging
 import datetime
 import math
@@ -8,6 +9,12 @@ from core.data_gateway import DataGateway
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("StockAPIHealthCheck")
+STOCK_API_HEALTH_FIXTURE_SCHEMA_VERSION = 1
+EXPECTED_HEALTH_SOURCES = {
+    "baostock": ("600519", ""),
+    "sina": ("600519", ""),
+    "yfinance": ("AAPL", ""),
+}
 
 
 def validate_price_frame_fresh(frame, as_of, max_age_days=5):
@@ -27,13 +34,108 @@ def validate_price_frame_fresh(frame, as_of, max_age_days=5):
         raise ValueError("latest market price must be finite positive")
     return latest_date
 
+
+def load_stock_api_health_fixture(path, as_of):
+    fixture_path = os.path.abspath(os.fspath(path))
+    try:
+        with open(fixture_path, "r", encoding="utf-8") as handle:
+            fixture = json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"Cannot load stock API health fixture {fixture_path}: {error}"
+        ) from error
+    if not isinstance(fixture, dict):
+        raise ValueError("stock API health fixture must be a JSON object")
+    if set(fixture) != {"schema_version", "as_of", "sources"}:
+        raise ValueError("stock API health fixture has invalid top-level fields")
+    if fixture.get("schema_version") != STOCK_API_HEALTH_FIXTURE_SCHEMA_VERSION:
+        raise ValueError("unsupported stock API health fixture schema_version")
+    if fixture.get("as_of") != as_of.isoformat():
+        raise ValueError(
+            f"stock API health fixture as_of must equal {as_of.isoformat()}"
+        )
+    sources = fixture.get("sources")
+    if not isinstance(sources, dict) or set(sources) != set(EXPECTED_HEALTH_SOURCES):
+        raise ValueError("stock API health fixture has invalid source keys")
+
+    frames = {}
+    for source, (expected_symbol, expected_adjust) in EXPECTED_HEALTH_SOURCES.items():
+        entry = sources[source]
+        if not isinstance(entry, dict) or set(entry) != {"symbol", "adjust", "rows"}:
+            raise ValueError(f"stock API health fixture {source} has invalid fields")
+        if entry.get("symbol") != expected_symbol:
+            raise ValueError(
+                f"stock API health fixture {source} must use {expected_symbol}"
+            )
+        if entry.get("adjust") != expected_adjust:
+            raise ValueError(
+                f"stock API health fixture {source} has invalid adjust"
+            )
+        rows = entry.get("rows")
+        if not isinstance(rows, list) or not rows:
+            raise ValueError(
+                f"stock API health fixture {source} rows must be non-empty"
+            )
+        frame = DataGateway._validate_prices(pd.DataFrame(rows), expected_symbol)
+        parsed_dates = pd.to_datetime(frame["日期"], format="%Y%m%d", errors="coerce")
+        if parsed_dates.isna().any() or (parsed_dates.dt.date > as_of).any():
+            raise ValueError(
+                f"stock API health fixture {source} contains invalid/future dates"
+            )
+        validate_price_frame_fresh(frame, as_of)
+        frames[source] = frame
+    return frames
+
+
+def validate_a_share_cross_check(df_baostock, df_sina, *, strict_dates=False):
+    bs_date = df_baostock.iloc[-1]['日期']
+    sina_date = df_sina.iloc[-1]['日期']
+    bs_price = float(df_baostock.iloc[-1]['收盘'])
+    sina_price = float(df_sina.iloc[-1]['收盘'])
+    if bs_date != sina_date:
+        if strict_dates:
+            raise ValueError(
+                "A-share fixture source dates mismatch: "
+                f"Baostock={bs_date}, Sina={sina_date}"
+            )
+        logger.warning(
+            f"A-share Cross-Check Warning: Latest dates mismatch. "
+            f"Baostock: {bs_date}, Sina: {sina_date}. Proceeding anyway."
+        )
+        return
+    diff_pct = abs(bs_price - sina_price) / max(bs_price, sina_price)
+    if diff_pct > 0.005:
+        raise ValueError(
+            "A-share cross-check divergence for 600519 on "
+            f"{bs_date}: Baostock={bs_price}, Sina={sina_price}, diff={diff_pct:.2%}"
+        )
+    logger.info(
+        f"A-share Cross-Check passed: Baostock ({bs_price}) vs "
+        f"Sina ({sina_price}) on {bs_date}."
+    )
+
 def main():
     logger.info("Starting Pre-flight Health Check for Stock APIs...")
+    from core.clock import clock
+
+    fixture_path = os.environ.get("STOCK_API_HEALTH_FIXTURE")
+    if fixture_path:
+        try:
+            frames = load_stock_api_health_fixture(fixture_path, clock.today())
+            validate_a_share_cross_check(
+                frames["baostock"], frames["sina"], strict_dates=True
+            )
+            validate_price_frame_fresh(frames["yfinance"], clock.today())
+        except Exception as error:
+            logger.error(f"Fixture-backed Stock API health check failed: {error}")
+            sys.exit(1)
+        logger.info("All fixture-backed Stock APIs are healthy. Ready for daily run.")
+        sys.exit(0)
+
     dg = DataGateway()
 
     # Check A-share API (Cross-validation between Baostock and Sina)
     try:
-        from core.clock import clock
         # Use a recent trading date. We just fetch the last 7 days and take the most recent overlapping day.
         end_dt = clock.today()
         start_dt = end_dt - datetime.timedelta(days=7)
@@ -51,23 +153,7 @@ def main():
         validate_price_frame_fresh(df_baostock, end_dt)
         validate_price_frame_fresh(df_sina, end_dt)
 
-        # Get the latest overlapping date
-        bs_date = df_baostock.iloc[-1]['日期']
-        sina_date = df_sina.iloc[-1]['日期']
-
-        bs_price = float(df_baostock.iloc[-1]['收盘'])
-        sina_price = float(df_sina.iloc[-1]['收盘'])
-
-        # If dates match, cross-check the price discrepancy
-        if bs_date == sina_date:
-            diff_pct = abs(bs_price - sina_price) / max(bs_price, sina_price)
-            if diff_pct > 0.005:  # 0.5% threshold
-                logger.error(f"CROSS-CHECK FAILED! Baostock and Sina report divergent prices for 600519 on {bs_date}. Baostock: {bs_price}, Sina: {sina_price}. Diff: {diff_pct:.2%}")
-                sys.exit(1)
-            else:
-                logger.info(f"A-share Cross-Check passed: Baostock ({bs_price}) vs Sina ({sina_price}) on {bs_date}.")
-        else:
-            logger.warning(f"A-share Cross-Check Warning: Latest dates mismatch. Baostock: {bs_date}, Sina: {sina_date}. Proceeding anyway.")
+        validate_a_share_cross_check(df_baostock, df_sina)
 
         logger.info("A-share API chain is healthy.")
     except Exception as e:

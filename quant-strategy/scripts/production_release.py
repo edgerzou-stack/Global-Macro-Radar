@@ -7,6 +7,7 @@ token, and the fixed Asia/Shanghai maintenance window.
 
 import argparse
 import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -18,8 +19,13 @@ from datetime import datetime, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from migrations.quarantine_manifest import apply_quarantine_schema
+from migrations.quarantine_manifest import (
+    QUARANTINE_PRIMARY_KEYS,
+    apply_quarantine_schema,
+    install_quarantine_write_guards,
+)
 from migrations.v006_execution_ledger import apply_v006
+from core.writer_lock import writer_fence
 
 
 PRODUCTION_CONFIRM_TOKEN = "APPLY-V6-QUARANTINE-2026-07-18"
@@ -32,6 +38,7 @@ QUARANTINE_TABLES = (
     "quarantine_manifests",
     "quarantine_candidates",
     "quarantine_rows",
+    "quarantine_key_index",
 )
 IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -66,6 +73,35 @@ class FreshAuditError(ProductionReleaseError):
 
 def normalize_path(path):
     return os.path.realpath(os.path.abspath(os.path.expanduser(os.fspath(path))))
+
+
+def acquire_production_writer_fence(source_path):
+    """Acquire a non-blocking advisory fence shared by production releases.
+
+    The SQLite ``BEGIN IMMEDIATE`` transaction remains the authoritative fence
+    against arbitrary database writers. This file lock additionally prevents
+    two release coordinators from reaching the mutation phase concurrently.
+    """
+
+    lock_path = normalize_path(source_path) + ".release.lock"
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except Exception:
+        os.close(descriptor)
+        raise ProductionAuthorizationError(
+            f"Another production release holds the writer fence: {lock_path}"
+        )
+    return descriptor
+
+
+def release_production_writer_fence(descriptor):
+    if descriptor is None:
+        return
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
 
 
 def get_canonical_production_path():
@@ -560,6 +596,53 @@ def validate_fresh_audit_for_production(audit, now):
         raise FreshAuditError("Fresh audit contains uncovered anomaly rows")
 
 
+def _index_quarantine_identity(
+    conn, *, manifest_id, candidate_id, source_table, primary_key
+):
+    expected_columns = QUARANTINE_PRIMARY_KEYS.get(source_table)
+    if expected_columns is None:
+        raise CandidateSelectionError(
+            f"No normalized quarantine primary key is approved for {source_table!r}"
+        )
+    actual_columns = tuple(_primary_key_columns(conn, source_table))
+    if actual_columns != expected_columns or set(primary_key) != set(expected_columns):
+        raise CandidateSelectionError(
+            f"Quarantine primary-key mismatch for {source_table}: "
+            f"expected={expected_columns}, actual={actual_columns}"
+        )
+    values = tuple(primary_key[column] for column in expected_columns)
+    if any(value is None or isinstance(value, (bool, dict, list)) for value in values):
+        raise CandidateSelectionError(
+            f"Invalid normalized quarantine key for {source_table}: {primary_key!r}"
+        )
+    if expected_columns == ("id",) and (
+        not isinstance(values[0], int) or values[0] <= 0
+    ):
+        raise CandidateSelectionError(
+            f"Invalid integer quarantine id for {source_table}: {values[0]!r}"
+        )
+    key_1 = str(values[0])
+    key_2 = str(values[1]) if len(values) == 2 else ""
+    source_pk_json = _canonical_json(primary_key)
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO quarantine_key_index (
+            manifest_id, candidate_id, source_table, key_arity,
+            key_1, key_2, source_pk_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            manifest_id,
+            candidate_id,
+            source_table,
+            len(values),
+            key_1,
+            key_2,
+            source_pk_json,
+        ),
+    )
+
+
 def apply_quarantine_candidates(
     conn,
     *,
@@ -571,23 +654,55 @@ def apply_quarantine_candidates(
 ):
     apply_quarantine_schema(conn)
     manifest_id = f"quarantine-{audit_sha256[:16]}-{source_sha256[:16]}"
-    existing = conn.execute(
-        "SELECT manifest_id FROM quarantine_manifests WHERE manifest_id=?",
-        (manifest_id,),
-    ).fetchone()
-    if existing:
-        counts = {
-            row[0]: row[1]
-            for row in conn.execute(
-                "SELECT candidate_id, copied_row_count FROM quarantine_candidates WHERE manifest_id=?",
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN")
+    try:
+        existing = conn.execute(
+            "SELECT manifest_id FROM quarantine_manifests WHERE manifest_id=?",
+            (manifest_id,),
+        ).fetchone()
+        if existing:
+            counts = {
+                row[0]: row[1]
+                for row in conn.execute(
+                    "SELECT candidate_id, copied_row_count "
+                    "FROM quarantine_candidates WHERE manifest_id=?",
+                    (manifest_id,),
+                )
+            }
+            for candidate_id, source_table, raw_primary_key in conn.execute(
+                "SELECT candidate_id, source_table, source_pk_json "
+                "FROM quarantine_rows WHERE manifest_id=?",
                 (manifest_id,),
-            )
-        }
-        return {"manifest_id": manifest_id, "candidate_row_counts": counts, "idempotent_reuse": True}
+            ).fetchall():
+                try:
+                    primary_key = json.loads(raw_primary_key)
+                except (TypeError, json.JSONDecodeError) as error:
+                    raise CandidateSelectionError(
+                        f"Invalid quarantine primary key for {source_table}"
+                    ) from error
+                _index_quarantine_identity(
+                    conn,
+                    manifest_id=manifest_id,
+                    candidate_id=candidate_id,
+                    source_table=source_table,
+                    primary_key=primary_key,
+                )
+            install_quarantine_write_guards(conn)
+            if owns_transaction:
+                conn.commit()
+            return {
+                "manifest_id": manifest_id,
+                "candidate_row_counts": counts,
+                "idempotent_reuse": True,
+            }
 
-    candidates = audit.get("isolation_candidates") or []
-    selected = [(candidate, select_candidate_rows(conn, candidate)) for candidate in candidates]
-    with conn:
+        candidates = audit.get("isolation_candidates") or []
+        selected = [
+            (candidate, select_candidate_rows(conn, candidate))
+            for candidate in candidates
+        ]
         conn.execute(
             """
             INSERT INTO quarantine_manifests (
@@ -653,7 +768,25 @@ def apply_quarantine_candidates(
                             hashlib.sha256(row_json.encode("utf-8")).hexdigest(),
                         ),
                     )
-    return {"manifest_id": manifest_id, "candidate_row_counts": counts, "idempotent_reuse": False}
+                    _index_quarantine_identity(
+                        conn,
+                        manifest_id=manifest_id,
+                        candidate_id=candidate_id,
+                        source_table=table,
+                        primary_key=primary_key,
+                    )
+        install_quarantine_write_guards(conn)
+        if owns_transaction:
+            conn.commit()
+    except Exception:
+        if owns_transaction:
+            conn.rollback()
+        raise
+    return {
+        "manifest_id": manifest_id,
+        "candidate_row_counts": counts,
+        "idempotent_reuse": False,
+    }
 
 
 def _load_audit(path):
@@ -686,38 +819,68 @@ def validate_production_authorization(source_path, confirm_token, now=None):
     return shanghai_now
 
 
-def _apply_release_to_database(path, audit, audit_sha, source_sha, mode, created_at):
+def _apply_release_to_database(
+    path,
+    audit,
+    audit_sha,
+    source_sha,
+    mode,
+    created_at,
+    *,
+    locked_preflight=None,
+    fault_injector=None,
+):
     with sqlite3.connect(path, timeout=30.0) as conn:
         conn.execute("PRAGMA foreign_keys=ON")
-        pre_checks = validate_database(conn)
-        validate_v6_name_collisions(conn)
-        legacy_before = legacy_snapshot(conn)
-        apply_v006(conn)
-        first_fingerprint = v6_fingerprint(conn)
-        first_counts = {
-            table: conn.execute(f"SELECT COUNT(*) FROM {_quote_identifier(table)}").fetchone()[0]
-            for table in V6_TABLES
-        }
-        apply_v006(conn)
-        second_fingerprint = v6_fingerprint(conn)
-        second_counts = {
-            table: conn.execute(f"SELECT COUNT(*) FROM {_quote_identifier(table)}").fetchone()[0]
-            for table in V6_TABLES
-        }
-        if first_fingerprint != second_fingerprint or first_counts != second_counts:
-            raise SchemaFingerprintMismatch("apply_v006 is not idempotent")
-        quarantine = apply_quarantine_candidates(
-            conn,
-            audit=audit,
-            audit_sha256=audit_sha,
-            source_sha256=source_sha,
-            release_mode=mode,
-            created_at=created_at,
-        )
-        post_checks = validate_database(conn)
-        legacy_after = legacy_snapshot(conn)
-        if legacy_before != legacy_after:
-            raise DatabaseValidationError("Legacy tables changed during additive release")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if locked_preflight is not None:
+                locked_preflight(conn)
+            pre_checks = validate_database(conn)
+            validate_v6_name_collisions(conn)
+            legacy_before = legacy_snapshot(conn)
+            apply_v006(conn)
+            if fault_injector:
+                fault_injector("after_v006")
+            first_fingerprint = v6_fingerprint(conn)
+            first_counts = {
+                table: conn.execute(
+                    f"SELECT COUNT(*) FROM {_quote_identifier(table)}"
+                ).fetchone()[0]
+                for table in V6_TABLES
+            }
+            apply_v006(conn)
+            second_fingerprint = v6_fingerprint(conn)
+            second_counts = {
+                table: conn.execute(
+                    f"SELECT COUNT(*) FROM {_quote_identifier(table)}"
+                ).fetchone()[0]
+                for table in V6_TABLES
+            }
+            if first_fingerprint != second_fingerprint or first_counts != second_counts:
+                raise SchemaFingerprintMismatch("apply_v006 is not idempotent")
+            quarantine = apply_quarantine_candidates(
+                conn,
+                audit=audit,
+                audit_sha256=audit_sha,
+                source_sha256=source_sha,
+                release_mode=mode,
+                created_at=created_at,
+            )
+            if fault_injector:
+                fault_injector("after_quarantine")
+            post_checks = validate_database(conn)
+            legacy_after = legacy_snapshot(conn)
+            if legacy_before != legacy_after:
+                raise DatabaseValidationError(
+                    "Legacy tables changed during additive release"
+                )
+            if fault_injector:
+                fault_injector("before_commit")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         return {
             "pre_checks": pre_checks,
             "post_checks": post_checks,
@@ -758,7 +921,7 @@ Never overwrite the live database in place and never drop the trade-history guar
     return str(target.resolve())
 
 
-def run_release(
+def _run_release_unlocked(
     *,
     source_db,
     audit_path,
@@ -825,14 +988,37 @@ def run_release(
         if apply_production:
             if sha256_file(source_path) != source_sha:
                 raise AuditDriftError("Production database changed during copy drill")
-            applied = _apply_release_to_database(
-                source_path,
-                audit,
-                audit_sha,
-                source_sha,
-                "production",
-                started_at,
-            )
+            fence = acquire_production_writer_fence(source_path)
+            try:
+                # Revalidate authorization and the fresh audit immediately before
+                # entering the source database's writer transaction. The locked
+                # preflight below repeats database/WAL checks after BEGIN IMMEDIATE.
+                revalidation_time = now or datetime.now(SHANGHAI)
+                authorization_time = validate_production_authorization(
+                    source_path, confirm_token, now=revalidation_time
+                )
+                validate_fresh_audit_for_production(audit, authorization_time)
+
+                def locked_preflight(connection):
+                    if sha256_file(source_path) != source_sha:
+                        raise AuditDriftError(
+                            "Production database changed before locked mutation"
+                        )
+                    validate_database(connection)
+                    validate_against_audit(connection, source_path, audit)
+                    validate_v6_name_collisions(connection)
+
+                applied = _apply_release_to_database(
+                    source_path,
+                    audit,
+                    audit_sha,
+                    source_sha,
+                    "production",
+                    started_at,
+                    locked_preflight=locked_preflight,
+                )
+            finally:
+                release_production_writer_fence(fence)
             manifest.update(applied)
             manifest["working_database"] = source_path
             post_backup = online_backup(source_path, output_path / "post_release_backup.db")
@@ -854,6 +1040,32 @@ def run_release(
         manifest["failed_at"] = datetime.now(SHANGHAI).isoformat()
         _write_json_atomic(manifest_path, manifest)
         raise
+
+
+def run_release(
+    *,
+    source_db,
+    audit_path,
+    output_dir,
+    apply_production=False,
+    confirm_token=None,
+    now=None,
+):
+    """Exclude daily runners for the complete release/copy-drill lifecycle."""
+    mode = "production" if apply_production else "dry-run"
+    with writer_fence(
+        source_db,
+        owner=f"production-release:{mode}",
+        timeout=0.0,
+    ):
+        return _run_release_unlocked(
+            source_db=source_db,
+            audit_path=audit_path,
+            output_dir=output_dir,
+            apply_production=apply_production,
+            confirm_token=confirm_token,
+            now=now,
+        )
 
 
 def _default_audit_path():

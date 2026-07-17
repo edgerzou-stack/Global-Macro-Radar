@@ -17,8 +17,11 @@ def apply_v006(conn: sqlite3.Connection) -> None:
     if current_version > SCHEMA_VERSION:
         return
 
-    with conn:
-        conn.executescript(
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN")
+    try:
+        statements = [
             """
             CREATE TABLE IF NOT EXISTS orders (
                 order_id TEXT PRIMARY KEY,
@@ -41,16 +44,18 @@ def apply_v006(conn: sqlite3.Connection) -> None:
                 reserved_cash_minor INTEGER NOT NULL DEFAULT 0 CHECK(reserved_cash_minor >= 0),
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
-            );
-
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS journal_transactions (
                 transaction_id TEXT PRIMARY KEY,
                 idempotency_key TEXT NOT NULL UNIQUE,
                 event_type TEXT NOT NULL,
                 reference_id TEXT NOT NULL,
                 created_at TEXT NOT NULL
-            );
-
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS journal_entries (
                 entry_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 transaction_id TEXT NOT NULL REFERENCES journal_transactions(transaction_id),
@@ -65,8 +70,9 @@ def apply_v006(conn: sqlite3.Connection) -> None:
                     OR (credit_minor > 0 AND debit_minor = 0)
                 ),
                 UNIQUE(transaction_id, line_no)
-            );
-
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS fills (
                 fill_id TEXT PRIMARY KEY,
                 order_id TEXT NOT NULL REFERENCES orders(order_id),
@@ -77,16 +83,31 @@ def apply_v006(conn: sqlite3.Connection) -> None:
                 gross_minor INTEGER NOT NULL CHECK(gross_minor > 0),
                 executed_at TEXT NOT NULL,
                 transaction_id TEXT NOT NULL UNIQUE REFERENCES journal_transactions(transaction_id)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_orders_state_updated
-                ON orders(state, updated_at);
-            CREATE INDEX IF NOT EXISTS idx_orders_strategy_symbol
-                ON orders(strategy_id, symbol);
-            CREATE INDEX IF NOT EXISTS idx_fills_order_executed
-                ON fills(order_id, executed_at);
-            CREATE INDEX IF NOT EXISTS idx_journal_entries_transaction_currency
-                ON journal_entries(transaction_id, currency);
+            )
+            """,
             """
-        )
+            CREATE INDEX IF NOT EXISTS idx_orders_state_updated
+                ON orders(state, updated_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_orders_strategy_symbol
+                ON orders(strategy_id, symbol)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_fills_order_executed
+                ON fills(order_id, executed_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_journal_entries_transaction_currency
+                ON journal_entries(transaction_id, currency)
+            """,
+        ]
+        for statement in statements:
+            conn.execute(statement)
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        if owns_transaction:
+            conn.commit()
+    except Exception:
+        if owns_transaction:
+            conn.rollback()
+        raise

@@ -1,22 +1,45 @@
-version: '3.8'
-
 services:
   radar-app:
+    profiles: ["scheduler"]
     build: .
     container_name: global-macro-radar
-    restart: always
+    restart: "${SCHEDULER_RESTART_POLICY:-no}"
     env_file:
-      - .env
+      - path: .env
+        required: false
     volumes:
-      # 持久化数据库
-      - ./quant_system.db:/app/quant_system.db
-      # 持久化量化策略生成的图表和报告
-      - ./quant-strategy/reports:/app/quant-strategy/reports
+      # SQLite WAL/SHM and atomic JSON replacement require a writable directory.
+      - ./runtime/data:/data
+      - ./runtime/data/quant-strategy/cache:/app/quant-strategy/.cache
+      - ./runtime/data/quant-strategy/scripts-cache:/app/quant-strategy/scripts/.cache
+      - ./runtime/data/quant-strategy/reports:/app/quant-strategy/reports
+      - ./runtime/data/quant-strategy/logs:/app/quant-strategy/logs
       # 持久化雷达生成的报告
       - ./industry-radar/reports:/app/industry-radar/reports
       # 持久化日志
       - ./logs:/app/logs
-      # 持久化文章缓存
-      - ./industry-radar/article_cache.json:/app/industry-radar/article_cache.json
+      - ./industry-radar/config.yaml:/app/industry-radar/config.yaml:ro
+      - ${FIXTURE_HOST_DIR:-./fixtures}:/fixtures:ro
     environment:
-      - TZ=Asia/Shanghai
+      TZ: Asia/Shanghai
+      PIPELINE_MODE: ${PIPELINE_MODE:-}
+      PROJECT_ROOT: /app/quant-strategy
+      RADAR_CACHE_FILE: /data/industry-radar/article_cache.json
+      PIPELINE_STATE_DIR: /data/quant-strategy/state
+      PIPELINE_DATABASE: ${PIPELINE_DATABASE:-/data/quant-strategy/shadow.db}
+      PIPELINE_FIXTURE_ROOT: ${PIPELINE_FIXTURE_ROOT:-}
+      SCHEDULER_TIMES: ${SCHEDULER_TIMES:-}
+      SCHEDULER_ENABLED: ${SCHEDULER_ENABLED:-NO}
+      SCHEDULER_HEARTBEAT: /tmp/gmr-scheduler-heartbeat
+      CONFIRM_PRODUCTION_WRITES: ${CONFIRM_PRODUCTION_WRITES:-NO}
+      DELIVERY_MODE: ${DELIVERY_MODE:-sink}
+      CONFIRM_LIVE_DELIVERY: ${CONFIRM_LIVE_DELIVERY:-NO}
+      PIPELINE_TIMEOUT_SECONDS: ${PIPELINE_TIMEOUT_SECONDS:-7200}
+      SCHEDULER_SHUTDOWN_GRACE_SECONDS: ${SCHEDULER_SHUTDOWN_GRACE_SECONDS:-30}
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+      - /home/radar:size=64m,uid=10001,gid=10001,mode=0700
+      - /app/quant-strategy:size=512m,uid=10001,gid=10001,mode=0750
+    security_opt:
+      - no-new-privileges:true
