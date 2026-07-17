@@ -51,10 +51,11 @@ instead of excluding low-coverage production modules.
 | `live-shadow` | isolated test database only | real orders disabled; delivery sink | optional |
 | `production` | canonical `quant-strategy/quant_system.db` only | production fences apply; delivery defaults to sink | optional |
 
-At present, `live-shadow` has the same write and delivery safety profile as
-`shadow`. The label does not itself enable a live market-data source; individual
-read-only data adapters still determine whether a live API or a supplied fixture
-is used.
+`live-shadow` has the same write and delivery safety profile as `shadow`. With no
+fixture variables it runs the real RSS, market-data and configured LLM adapters;
+with fixtures it uses those explicit inputs. Unlike `offline` and `shadow`, live
+modes do not export a date-only `MOCK_DATE`, because doing so can fabricate a
+cross-time-zone market session. `PIPELINE_EFFECTIVE_DATE` still binds artifacts.
 
 ### Offline fixture bundle
 
@@ -93,26 +94,62 @@ Offline, deterministic E2E:
   --run-id offline-e2e-20260715
 ```
 
-Create a read-consistent shadow seed without opening the source for writing:
+For a clean schema without audit anomalies, a read-consistent shadow seed may be
+created without opening the source for writing:
 
 ```bash
 sqlite3 quant-strategy/quant_system.db \
   ".backup '/absolute/scratch/shadow.db'"
 ```
 
-Then run shadow or live-shadow:
+The current legacy production database contains audit-selected anomalies and
+must not use that direct seed for a full-flow acceptance. First run the release
+coordinator in its default copy-only mode. It creates `working_copy.db`, applies
+v6 and additive quarantine only to the copy, and verifies legacy row counts:
+
+```bash
+python3 quant-strategy/scripts/production_release.py \
+  --source-db "$(pwd)/quant-strategy/quant_system.db" \
+  --audit /absolute/reports/production_db_audit.json \
+  --output-dir /absolute/scratch/new-release-dir
+
+SQLITE_DB_PATH=/absolute/scratch/new-release-dir/working_copy.db \
+QUANT_DB_ENV=test PYTHONPATH=quant-strategy/scripts \
+python3 -c 'import db_utils; connection=db_utils.init_db(); connection.close()'
+```
+
+Never add `--apply-production` or a confirmation token to this acceptance step.
+Then run shadow or live-shadow with an explicit identity and sink delivery:
 
 ```bash
 ./run_all.sh \
   --mode shadow \
   --database /absolute/scratch/shadow.db \
-  --artifact-root /absolute/artifacts
+  --artifact-root /absolute/artifacts \
+  --effective-date YYYY-MM-DD \
+  --run-id unique-shadow-run \
+  --delivery-mode sink
 
 ./run_all.sh \
   --mode live-shadow \
-  --database /absolute/scratch/live-shadow.db \
-  --artifact-root /absolute/artifacts
+  --database /absolute/scratch/new-release-dir/working_copy.db \
+  --artifact-root /absolute/artifacts \
+  --effective-date YYYY-MM-DD \
+  --run-id unique-live-shadow-run \
+  --delivery-mode sink
 ```
+
+Do not set any fixture variables for a real live-shadow acceptance. Success
+requires a `completed` release manifest, a `completed` run manifest, a `sink`
+delivery journal, `integrity_check=ok`, zero active non-positive entry prices,
+and an unchanged production database hash. `shadow_runner.py --allow-live-api`
+is a bounded source probe and does not replace this full flow.
+
+NAV values each market at its latest officially completed session. An open
+session is never treated as if its daily close already exists. If strict OHLC
+validation fails only because of an unrelated open field, NAV performs a fresh
+close-only read: close must remain positive, finite and bounded by high/low, and
+the degraded row is not written into the OHLC cache.
 
 Production requires both the explicit mode and a second write acknowledgement.
 It also rejects every database path except the canonical production path:

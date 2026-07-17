@@ -491,6 +491,15 @@ class PortfolioManager:
                         continue
 
                     price = self.get_simulated_trade_price(current_prices.get(key, {}), strat)
+                    if price <= 0:
+                        # A target is not an execution.  Missing, stale, malformed,
+                        # or out-of-session quotes must not reserve cash or create a
+                        # zero-cost position that the NAV stage cannot value.
+                        print(
+                            f"NEW ENTRY DEFERRED: {key} in {strat} has no "
+                            "authoritative in-session execution price."
+                        )
+                        continue
                     if cash_mgr.allocate(strat, cursor=cursor):
                         diff[strat]["added"].append({"name": key, "entry_price": price})
                         new_portfolio[strat][key] = {"entry_date": snapshot_date, "entry_price": price, "shares": 1}

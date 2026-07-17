@@ -279,9 +279,14 @@ class RunContext:
             "ARTIFACT_DIR": run_artifact_dir,
             "SQLITE_DB_PATH": str(self.database_path),
             "QUANT_DB_ENV": database_environment,
-            "MOCK_DATE": self.effective_date.isoformat(),
             "DELIVERY_MODE": self.delivery_mode.value,
         }
+        if self.mode in {RunMode.OFFLINE, RunMode.SHADOW}:
+            # Fixture-backed runs need a deterministic clock.  A date-only
+            # MOCK_DATE must never leak into live modes: converting its naive
+            # midnight between market time zones can fabricate an open session
+            # on the previous day and admit prices outside the real session.
+            values["MOCK_DATE"] = self.effective_date.isoformat()
         if self.mode is not RunMode.PRODUCTION:
             values.update(
                 {

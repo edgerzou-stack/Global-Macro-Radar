@@ -1,111 +1,75 @@
-# Global Quant Strategy: 全球多资产双核心量化选股引擎
+# Global Quant Strategy
 
-[![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC_BY--NC_4.0-lightgrey.svg)](#)
+该模块把 A 股、港股和美股的基本面/行情筛选、模拟持仓、现金、NAV 与报告连接为可审计流程。它不是只面向 A 股的“双策略脚本”，当前持久化九个策略桶：
 
+| 策略族 | A 股 | 美股 | 港股 |
+| --- | --- | --- | --- |
+| Dividend | `dividend_a_stock` | `dividend_us_stock` | `dividend_hk_stock` |
+| Growth | `growth_a_stock` | `growth_us_stock` | `growth_hk_stock` |
+| Hot Spot | `hot_spot_a_stock` | `hot_spot_us_stock` | `hot_spot_hk_stock` |
 
-本模块是一个基于 Python 的全球量化基本面选股框架。聚焦于从 A 股、港股及美股全市场中，通过严苛的财务与行情多维过滤，自动化筛选出兼顾“高股息现金流护城河”与“硬核科技极度低估”的极品标的。
+具体阈值以代码、版本化配置和报告中的 threshold payload 为准，不把 README 中的数字当成永久策略合同。
 
-系统内置自动状态持久化与“调仓嗅探”机制，每次运行都会智能对比上一次的标的池，并输出明确的新增与剔除提示，就像一位不知疲倦的专业量化基金经理。
+## 数据和筛选闸门
 
----
+- Universe 刷新采用原子替换；大幅漂移或 stale fallback 会停止发布。
+- A 股行情执行 Baostock/Sina 交叉验证并保留有界 fallback。
+- US/HK 批量数据报告 attempted/evaluated/source_errors/coverage，低于覆盖阈值 fail closed。
+- 财务数据按披露时间做 point-in-time 过滤，缺字段不能被默认为通过。
+- 热点输入绑定新闻报告日期、run identity 和内容哈希，拒绝旧报告复用。
+- 新建仓只有在交易时段取得权威、有限正数价格后才占用现金；否则 defer。
 
-## 核心策略矩阵 (Dual-Core Strategies)
+## 账本边界
 
-项目目前主打两套并行的实战量化策略，彼此独立且互补：
+legacy `portfolio`、`trade_history`、`strategy_accounts` 仍是统一日流程的主读写路径。v6 `orders`、`fills`、`journal_transactions`、`journal_entries` 已实现幂等订单、部分成交、整数最小货币单位、复式平衡和故障原子回滚，但尚未取代 legacy 主账本。
 
-### 1. 稳健红利策略 (Dividend Strategy)
-致力于在熊市或震荡市中寻找绝对的安全边际和“印钞机”级别的造血能力。
-*   **低估值底线**：`(总市值 - 总市值 / PB) / (总市值 / PE) < 10` （即 `PE * (PB - 1) / PB < 10`）
-*   **高分红要求**：TTM 股息率 > 3.0%
-*   **抗风险体质**：总市值 > 100 亿元，且资产负债率 < 50%
-*   **成长性底座**：近 3 年净利润复合增长率 (CAGR) > 5%。
-*   **核心护城河**：近 3 年平均净利率 > 10%，且 **近 3 年经营现金流同比增速的算术平均值 > 0%** （过滤虚假利润）。
+关键保护包括：
 
-### 2. 连续高增成长策略 (Global Accelerating Growth Strategy)
-扫描全球核心市场（A股、港股、美股），致力于寻找业绩正处于加速爆发期的科技遗珠。
-*   **赛道纯度**：必须属于高潜力或硬科技细分行业（如半导体、软件开发、通信、消费电子等）。
-*   **4季度连续改善**：过去连续 4 个季度的营收和净利润同比均实现正向增长（完美兼容盈利持续扩大与“业绩减亏”的反转模型）。
-*   **估值与风控**：总市值 > 100 亿元且资产负债率 < 50%。A 股附加 PEG 极度低估逻辑（动态 PE < 利润与营收同比增速的较小值）。
-*   **LLM 智能归因**：对符合量化条件的标的，自动接入大模型进行二次过滤，一句话点透其业务爆发点。
+- SQLite Online Backup 与 writer fence
+- strategy cash allocation/release 同事务提交
+- A 股 T+1、跨市场交易时段和 pending exit 保护
+- 无退出价时保持持仓，不用猜测价格强行成交
+- quarantine 只隔离审计指定的原始行，不删除或推测修复
+- NAV 使用各市场最近已完成交易日的精确收盘；异常 open 字段可被隔离，但 close 仍必须位于 high/low 内
+- NAV 任一仓位不可权威估值时整笔事务回滚
 
----
+## 回测正确性
 
-## 🛠 工作流与核心架构 (Workflow)
+PIT 回测合同要求：
 
-整个引擎的运转分为两个核心步骤：数据拉取计算层，和研报渲染追踪层。
+- 信号在下一交易日 open 执行，close 估值
+- fee、slippage、逐日 FX 进入现金流
+- fundamentals、指数成分和 corporate action 必须带公告/生效时间
+- split、dividend、delisting recovery 显式处理
+- 数据集 provenance、manifest 和结果写入独立 audit DB
+- 修改未来数据不能改变过去 NAV
 
-### 1. 引擎计算与调仓嗅探：`screen_a_share.py`
-该脚本使用多线程从网络源拉取 A 股最新的盘后收盘数据、最新财报（资产负债表及利润表）、历史三年年报及历史分红派息记录。
-随后根据上述的双轨策略进行层层过滤。
-**亮点**：脚本在生成当前结果后，会自动读取本地现存的 `dual_screen.json`（上一次的旧数据），利用 Set 集合求差集，算出**新增**与**剔除**的股票，并将对比结果（Diff）一并写入全新的 JSON。
+缺失真实 PIT 数据集时，fixture 结果只证明引擎合同，不代表策略收益。
 
-### 2. 自动化研报生成与资金曲线绘制：`generate_report.py` & `plot_pnl.py`
-读取 JSON 结果，同时渲染出**两种格式的专业报告**：
-1. **Markdown 数据表**：轻量级、方便提交 Git 和命令行快速预览。
-2. **离线单页面 HTML 交互报告**：具备极简现代化的 UI 设计，盈亏数值按红绿高亮，甚至使用 base64 原生内嵌了图表。
+## 正确运行入口
 
-此外，系统还自带严格的**历史交割追踪机制 (Trade History)**。当股票在调仓中被“剔除”时，会自动向历史真实行情接口回溯该股票在“买入日”和“卖出日”的确切收盘价，精准核算最终盈亏率（PnL）。
+不要手动串联 `screen_a_share.py`、`plot_pnl.py` 和 `generate_report.py` 作为生产流程。统一入口在仓库根目录：
 
-通过运行 `plot_pnl.py`，系统会**动态解析**交割单中的策略归属（如稳健红利、高增成长、甚至未来你自定义的“热点战法”），并基于所有的平仓记录绘制出**分策略的等权累计净收益曲线 (Equity Curves)** 与**各策略核心指标表**（包含笔数、胜率、收益），直观展现不同量化策略长期运作中的纯资金走势与抗回撤表现。该图表会被自动内嵌到最终的 HTML 报告中。
----
-
-## ️ 快速上手 (Quick Start)
-
-### 环境依赖
 ```bash
-pip install pandas akshare requests matplotlib
+./run_all.sh --mode live-shadow \
+  --database /absolute/path/to/test-copy.db \
+  --artifact-root /absolute/path/to/artifacts \
+  --effective-date YYYY-MM-DD \
+  --run-id unique-run-id \
+  --delivery-mode sink
 ```
 
-### 运行全量筛选
-```bash
-# 1. 运行核心选股引擎，执行双轨过滤，结果保存至 dual_screen.json
-python3 scripts/screen_a_share.py --require-continuous-growth --output-file dual_screen.json
+八阶段顺序、数据库副本准备、production release、scheduler 与恢复步骤见 [../OPERATIONS.md](../OPERATIONS.md)。脚本级用途见 [scripts/README.md](scripts/README.md)。
 
-# 2. 生成盈亏曲线图 (可选，但推荐)
-python3 scripts/plot_pnl.py
+## 输出
 
-# 3. 将 JSON 数据渲染为带调仓提示的 Markdown 和 HTML 双语研报
-python3 scripts/generate_report.py dual_screen.json screening_results.md
-```
+- `global_screen.json`：带 run 上下文的当前筛选结果
+- `strategy_daily_results`：按日期/策略保存的结果与 diff
+- `strategy_nav_history`：九策略 NAV/cash/holdings
+- artifact root：checkpoint、durable manifest、图表、delivery journal/HTML
 
-完成后，直接在浏览器中打开 `screening_results.html`（或查看 `.md`）即可查阅最新金股池、历史资金曲线及调仓动态！
-
----
-
-## 自动化无人值守运行 (Crontab Automation)
-
-本项目内置了带交易日历识别的自动调度脚本。如果你希望程序在每个交易日的下午 14:00 自动更新报告，可以在终端配置定时任务：
-
-1. 编辑定时任务表：
-```bash
-crontab -e
-```
-2. 追加以下配置项（注意替换为你自己的绝对路径）：
-```bash
-0 14 * * 1-5 /usr/bin/python3 /绝对路径/scripts/daily_runner.py >> /绝对路径/logs/daily_run.log 2>&1
-```
-
-配置完成后，脚本只会在真实的 A 股交易日被唤醒并执行上述完整的计算和报告渲染流程。遇到周末或节假日会自动静默退出。
-
----
+这些是运行产物，不应提交到 Git。
 
 ## Disclaimer
-本项目的所有代码及选股策略仅供量化程序学习与技术交流使用，所输出的股票名单不构成任何投资建议。股市有风险，投资需谨慎！
 
-
----
-
-
-## Content Index
-
-| Item | Type | Description |
-|---|---|---|
-| `SKILL.md` | **File** | Data / Resource File |
-| `scripts` | **Directory** | Submodule / Directory for scripts |
-
----
-
-## License & Copyright
-> **开源协议声明 (License & Copyright)**
-> 本仓库包含的架构文档、设计思路及配套代码均采用 **CC BY-NC 4.0 (知识共享-署名-非商业性使用)** 协议发布。
-> 允许个人学习、学术研究及开源技术交流。**严格禁止任何企业或个人将其直接或间接用于任何商业目的**（包括但不限于商业芯片研发、企业内部培训、闭源软件开发等）。如需商业使用，请与作者联系获取单独授权。
+系统输出仅供量化研究与工程验证，不构成投资建议。

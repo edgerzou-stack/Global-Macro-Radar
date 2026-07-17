@@ -1,122 +1,75 @@
-# Quant Strategy Execution Scripts
+# Quant Strategy Scripts
 
+本目录包含统一日流程、数据适配器、账本、验收、生产迁移和 PIT 回测入口。运行环境固定为 Python 3.11.9；依赖从仓库根 `requirements.txt` 安装。
 
-[![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC_BY--NC_4.0-lightgrey.svg)](#)
+## 四类入口
 
-Welcome to the **Quant Strategy Execution Scripts** directory. This directory is the engine room of the Quantitative Strategy system. It contains the primary execution scripts, backtesting frameworks, and multi-market screening logic.
+### 1. Unified daily flow
 
-## Usage
-
-These scripts are utility tools designed to be executed via standard Python 3.9+. Ensure your virtual environment is active before executing them.
-
-### Shadow acceptance and controlled live health probes
-
-`shadow_runner.py` is offline by default. It opens the production ledger read-only,
-creates an isolated SQLite backup for every iteration, disables real orders, and
-blocks network access for all ordinary and custom stages.
+生产和端到端验收只从根目录 `run_all.sh` 启动。`daily_runner.py` 顺序执行股票源检查、DB 检查、新闻、筛选、NAV、账本检查、图表和交付，并使用 run identity、writer fence、Online Backup、checkpoint/resume 与 durable manifest。
 
 ```bash
-python3 scripts/shadow_runner.py --iterations 20
+./run_all.sh --mode live-shadow \
+  --database /absolute/path/to/test-copy.db \
+  --artifact-root /absolute/path/to/artifacts \
+  --effective-date YYYY-MM-DD \
+  --run-id unique-run-id \
+  --delivery-mode sink
 ```
 
-`--allow-live-api` adds only two bounded, read-only health stages: the production
-RSS ingest health contract and `DataGateway` market-source probes. It does not run
-the news scorer, load an LLM client, submit an order, or write the production DB.
-Only HTTPS GET/HEAD and read-only provider query adapters are permitted. Each
-iteration has one shared deadline and logical source-request budget.
+### 2. Shadow acceptance
 
-Recommended first authorized live sample:
+`shadow_runner.py` 是有界健康探针，不是完整业务流程。默认对生产库只读并为每轮创建隔离备份；`--allow-live-api` 只增加 RSS/行情只读探针，强制禁用 LLM，不执行筛选交易或报告交付。
 
 ```bash
-python3 scripts/shadow_runner.py \
-  --iterations 1 \
-  --allow-live-api \
-  --live-rss-feed https://openai.com/news/rss.xml \
-  --live-symbol 600519 \
-  --live-symbol AAPL \
-  --live-request-limit 6 \
-  --live-timeout-seconds 45 \
-  --live-lookback-days 10
+python3 quant-strategy/scripts/shadow_runner.py --iterations 1 \
+  --allow-live-api --live-profile full
 ```
 
-Use `--skip-live-rss` or `--skip-live-market` to isolate one family of probes.
-Reports contain per-source freshness, latency, success rate, request counts, and
-A-share Baostock/Sina close-price cross-checks. API keys are never printed and LLM
-use remains disabled even if LLM variables exist in the parent environment.
+20/20 稳定性样本应分散在独立时间窗口中，每次 `--iterations 1`，避免一次突发请求掩盖源漂移。
 
-### Deterministic offline global-screen flow
+### 3. PIT backtest
 
-Set `GLOBAL_SCREEN_FIXTURE` to a version-1 JSON fixture to run
-`screen_global_quant.py` without A-share, US/HK, hot-spot, current-price, or LLM
-network fetches. The run still executes the real `PortfolioManager` diff/update,
-creates all strategy accounts, persists one `strategy_daily_results` row per
-strategy (including empty results), and atomically replaces the global-screen
-artifact.
+`backtest_engine.py` 消费版本化历史数据合同，生成 manifest、结果和隔离 audit DB。只有具备 point-in-time fundamentals、membership、FX、corporate actions 和 delisting 数据的运行才能用于策略结论。
 
-```json
-{
-  "fixture_version": 1,
-  "snapshot_date": "2026-07-11",
-  "results": {
-    "dividend_a_stock": [{"股票代码": "000001", "股票简称": "Fixture"}],
-    "growth_a_stock": [],
-    "dividend_us_stock": [],
-    "growth_us_stock": [],
-    "dividend_hk_stock": [],
-    "growth_hk_stock": [],
-    "hot_spot_a_stock": [],
-    "hot_spot_us_stock": [],
-    "hot_spot_hk_stock": []
-  },
-  "current_prices": {"000001": {"最新价": 10.5}}
-}
-```
+### 4. Production release
+
+`production_release.py` 与 daily flow 分离。默认 copy-only：只读打开源库，通过 SQLite Online Backup 生成副本，在副本应用 v6/quarantine 并验证恢复。生产写入还要求 canonical path、确认 token、fresh audit、writer fence 和指定维护窗口。
 
 ```bash
-GLOBAL_SCREEN_FIXTURE=/absolute/path/global-screen-fixture.json \
-SQLITE_DB_PATH=/absolute/path/test-quant.db QUANT_DB_ENV=test \
-python3 scripts/screen_global_quant.py --output-file /absolute/path/global_screen.json
+python3 quant-strategy/scripts/production_release.py \
+  --source-db /absolute/path/to/quant_system.db \
+  --audit /absolute/path/to/audit.json \
+  --output-dir /absolute/path/to/new-release-dir
 ```
 
-The schema is strict: all nine strategy keys are required, unknown top-level keys
-are rejected, prices must be positive and finite, and prices must cover both the
-fixture targets and any positions already present in the selected ledger. Use an
-isolated test/backtest database; never point an offline fixture run at production.
+日常验收禁止加入 `--apply-production`。详见 [PRODUCTION_RELEASE.md](PRODUCTION_RELEASE.md)。
 
-## Content Index
+## Offline fixture 边界
 
-| Item | Type | Description |
-|---|---|---|
-| `backtest.py` | **File** | Unit testing script for core functions. |
-| `core` | **Directory** | Submodule or categorized directory for `core`. |
-| `daily_runner.py` | **File** | Core logic or execution script. |
-| `data_provider.py` | **File** | Core logic or execution script. |
-| `db_utils.py` | **File** | Core logic or execution script. |
-| `fetch_universe.py` | **File** | Core logic or execution script. |
-| `generate_report.py` | **File** | Generates diagrams or HTML dashboard assets. |
-| `llm_utils.py` | **File** | Core logic or execution script. |
-| `migrate_to_sqlite.py` | **File** | Core logic or execution script. |
-| `plot_pnl.py` | **File** | Core logic or execution script. |
-| `screen_a_share.py` | **File** | Core logic or execution script. |
-| `screen_global_quant.py` | **File** | Core logic or execution script. |
-| `screen_global_quant_deps.py` | **File** | Core logic or execution script. |
-| `screen_hot_spot.py` | **File** | Core logic or execution script. |
-| `send_unified_email.py` | **File** | Core logic or execution script. |
-| `test_em.py` | **File** | Unit testing script for core functions. |
-| `test_em2.py` | **File** | Unit testing script for core functions. |
-| `test_em_quote.py` | **File** | Unit testing script for core functions. |
-| `test_em_quote2.py` | **File** | Unit testing script for core functions. |
-| `test_fetch.py` | **File** | Unit testing script for core functions. |
-| `test_fin.py` | **File** | Unit testing script for core functions. |
-| `test_tz.py` | **File** | Unit testing script for core functions. |
-| `test_yf_prices.py` | **File** | Unit testing script for core functions. |
-| `us_hk_quant.py` | **File** | Core logic or execution script. |
+单独设置 `GLOBAL_SCREEN_FIXTURE` 只验证全球筛选阶段，不等于完整 E2E。完整 `offline` 模式要求固定 bundle 中所有 fixture 文件齐全，任一缺失都 fail closed，并且只能使用标记为 `backtest` 的隔离数据库。
 
+## 关键脚本
 
----
+| 分类 | 脚本 | 作用 |
+| --- | --- | --- |
+| 编排 | `daily_runner.py`, `scheduler.py` | 八阶段流程、恢复和显式调度 |
+| 数据健康 | `check_stock_apis.py`, `fetch_universe.py`, `data_provider.py` | 源交叉验证、Universe、异步批量适配 |
+| 筛选 | `screen_hot_spot.py`, `screen_global_quant.py`, `us_hk_quant.py` | 热点与九策略筛选 |
+| 账本/NAV | `db_utils.py`, `calc_nav.py`, `check_ledger_sanity.py` | legacy 账本、精确会话 NAV 与检查 |
+| 报告 | `plot_pnl.py`, `generate_report.py`, `send_unified_email.py` | 图表、HTML/Markdown 和 outbox |
+| 验收 | `shadow_runner.py` | 隔离 shadow 与只读 live probes |
+| 迁移 | `production_release.py`, `migrations/` | v6、quarantine、copy/restore 演练 |
+| 回测 | `backtest_engine.py`, `core/backtest.py` | PIT 执行和审计 |
 
-## License & Copyright
+目录中的 `test_*.py` 诊断脚本不是专有回归套件；正式测试位于 private Core 的 `quant-strategy/tests`、`industry-radar/tests` 和根 `tests`，public 仓库不发布这些专有 tests/CI。
 
-> **开源协议声明 (License & Copyright)**
-> 本仓库包含的架构文档、设计思路及配套代码均采用 **CC BY-NC 4.0 (知识共享-署名-非商业性使用)** 协议发布。
-> 允许个人学习、学术研究及开源技术交流。**严格禁止任何企业或个人将其直接或间接用于任何商业目的**（包括但不限于商业芯片研发、企业内部培训、闭源软件开发等）。如需商业使用，请与作者联系获取单独授权。
+## 运行安全摘要
+
+- mode 和 database 必须显式指定。
+- production 日历查询失败时 fail closed。
+- `live-shadow` 不等于 `shadow_runner --allow-live-api`。
+- 非 production 强制禁真实订单；所有模式 delivery 默认 sink。
+- 真实 SMTP 需要 production + 双重显式确认。
+- scheduler 默认关闭，持久运行需 `--enable-scheduler`。
+- 成功以 durable run manifest 和 delivery journal 为准，不只看进程退出码。
