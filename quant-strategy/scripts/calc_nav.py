@@ -59,9 +59,9 @@ def _prepare_market_data(portfolio, today):
     for strategy, positions in portfolio.items():
         market = _market_for_strategy(strategy)
         end_raw = datetime.datetime.strptime(
-            market.get_effective_trading_date(), "%Y-%m-%d"
+            market.get_latest_completed_trading_date(), "%Y-%m-%d"
         ).date()
-        end_date = market.get_most_recent_trading_day(end_raw).strftime("%Y%m%d")
+        end_date = end_raw.strftime("%Y%m%d")
         for symbol, position in positions.items():
             if _positive_finite(position.get("entry_price")) is None:
                 continue
@@ -89,7 +89,7 @@ def _prepare_market_data(portfolio, today):
         frames = {}
         for adjust in ("hfq", ""):
             try:
-                frames[adjust] = data_gateway.get_historical_prices(
+                frames[adjust] = data_gateway.get_historical_closes(
                     symbol, bounds["start"], bounds["end"], adjust=adjust
                 )
             except Exception as error:

@@ -72,6 +72,37 @@ class Market:
                 current -= datetime.timedelta(days=1)
             return current.strftime('%Y-%m-%d')
 
+    def get_latest_completed_trading_date(self) -> str:
+        """Return the latest session whose official close is in the past.
+
+        This is deliberately stricter than ``get_effective_trading_date``.
+        NAV uses closing bars, so an open session is not yet a valid valuation
+        date even though it is already the effective execution session.
+        """
+        if not self.calendar:
+            raise RuntimeError(f"{self.name} has no authoritative market calendar")
+
+        now_local = self.get_current_time()
+        start_date = (now_local - datetime.timedelta(days=30)).date()
+        try:
+            import pandas as pd
+
+            schedule = self.calendar.schedule(
+                start_date=start_date,
+                end_date=now_local.date(),
+            )
+            now_utc = pd.Timestamp(now_local.astimezone(pytz.utc))
+            completed = schedule[schedule["market_close"] <= now_utc]
+            if completed.empty:
+                raise RuntimeError(
+                    f"{self.name} calendar has no completed session in lookback"
+                )
+            return completed.index[-1].strftime("%Y-%m-%d")
+        except Exception as error:
+            raise RuntimeError(
+                f"Unable to determine latest completed {self.name} session"
+            ) from error
+
     def get_next_trading_date(self, target_date: datetime.date) -> datetime.date:
         """
         Returns the exact next available trading day after or on the target_date.

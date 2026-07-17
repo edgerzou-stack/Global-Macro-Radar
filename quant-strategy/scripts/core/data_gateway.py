@@ -256,6 +256,44 @@ class DataGateway:
 
         return result
 
+    @staticmethod
+    def _validate_closing_prices(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+        """Validate a close-only valuation view without accepting bad closes.
+
+        Some upstream HK rows contain an invalid opening auction field while
+        their close remains bounded by the reported high/low.  NAV never uses
+        the open, so it may isolate that field; close/high/low integrity stays
+        mandatory and the degraded row is never written to the OHLC cache.
+        """
+        if df is None or df.empty:
+            raise DataIntegrityError(f"Empty closing-price data for {symbol}")
+        required = ["日期", "收盘", "最高", "最低"]
+        missing = [column for column in required if column not in df.columns]
+        if missing:
+            raise DataIntegrityError(
+                f"Closing-price data for {symbol} is missing columns: {', '.join(missing)}"
+            )
+
+        result = df.copy()
+        result["日期"] = result["日期"].astype(str).str.replace("-", "", regex=False).str[:8]
+        if result["日期"].eq("").any() or result["日期"].duplicated().any():
+            raise DataIntegrityError(f"Invalid or duplicate closing dates for {symbol}")
+        if not result["日期"].is_monotonic_increasing:
+            raise DataIntegrityError(f"Closing-price dates are not monotonic for {symbol}")
+        for column in ("收盘", "最高", "最低"):
+            result[column] = pd.to_numeric(result[column], errors="coerce")
+            if not result[column].map(lambda value: math.isfinite(float(value))).all():
+                raise DataIntegrityError(f"Non-finite {column} value for {symbol}")
+            if (result[column] <= 0).any():
+                raise DataIntegrityError(f"Non-positive {column} value for {symbol}")
+        if (
+            (result["最低"] > result["收盘"])
+            | (result["最高"] < result["收盘"])
+            | (result["最低"] > result["最高"])
+        ).any():
+            raise DataIntegrityError(f"Inconsistent close/high/low values for {symbol}")
+        return result[["日期", "收盘"]]
+
     def _init_db(self):
         with sqlite3.connect(self.db_path, timeout=30.0) as conn:
             c = conn.cursor()
@@ -596,6 +634,54 @@ class DataGateway:
             return df_new
             
         return df_cache
+
+    def get_historical_closes(
+        self, symbol: str, start_date: str, end_date: str, adjust: str = ""
+    ) -> pd.DataFrame:
+        """Return exact closing prices, isolating only unrelated OHLC fields.
+
+        The normal strict OHLC path remains authoritative.  The degraded path
+        is limited to non-A-share NAV valuation, performs a fresh bounded fetch,
+        validates close against high/low, and deliberately bypasses the cache.
+        """
+        try:
+            frame = self.get_historical_prices(symbol, start_date, end_date, adjust)
+            return frame[["日期", "收盘"]].copy()
+        except (DataIntegrityError, FatalSystemError) as original_error:
+            if self.historical_fixture_path or (len(symbol) == 6 and symbol.isdigit()):
+                raise
+            logger.warning(
+                "DataGateway: strict OHLC valuation failed for %s; isolating "
+                "non-close fields and revalidating exact closes: %s",
+                symbol,
+                original_error,
+            )
+
+        start_date = str(start_date).replace("-", "")
+        end_date = str(end_date).replace("-", "")
+        try:
+            degraded = self._call_source(
+                "yfinance",
+                self._fetch_from_yfinance,
+                symbol,
+                start_date,
+                end_date,
+                adjust,
+            )
+            closes = self._validate_closing_prices(degraded, symbol)
+            closes = closes[
+                (closes["日期"] >= start_date) & (closes["日期"] <= end_date)
+            ]
+            if closes.empty:
+                raise DataIntegrityError(
+                    f"No validated closing prices for {symbol} in "
+                    f"{start_date}-{end_date}"
+                )
+            return closes
+        except Exception as error:
+            raise FatalSystemError(
+                f"Validated closing prices are unavailable for {symbol}"
+            ) from error
 
     def get_open_price(self, symbol: str, target_date: str) -> float:
         from core.market import AShareMarket, HKMarket, USMarket

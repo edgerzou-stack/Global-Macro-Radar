@@ -1,103 +1,109 @@
 # Global Macro Radar
 
-[![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC_BY--NC_4.0-lightgrey.svg)](#)
+Global Macro Radar 是一个把实时产业新闻、全球多市场筛选、模拟账本、NAV、图表和报告交付串成单一可审计流程的研究系统。它覆盖 A 股、港股与美股，默认不提交真实订单，默认把交付写入本地 sink。
 
+> 本项目仅用于研究与工程验证，不构成投资建议。
 
+## 系统做什么
 
+`run_all.sh` 顺序执行八个阶段：
 
-> **开源协议声明 (License & Copyright)**
-> 本项目采用 **CC BY-NC 4.0 (知识共享署名-非商业性使用 4.0)** 协议开源。
-> 允许您自由学习、研究及个人日常投资使用。**严格禁止任何未经授权的商业化变现行为**（包括但不限于：基于此代码包装付费投研服务、SaaS产品、将其作为黑盒信号源发行金融私募产品等）。如需商业合作，请单独联系作者获取授权。
+1. 股票 API 健康检查与 A 股双源交叉验证
+2. SQLite 物理完整性与账户约束检查
+3. RSS 拉取、健康闸门、新闻去重与 LLM 双轨评分
+4. Universe 刷新、热点筛选和 A/HK/US 全球量化筛选
+5. 模拟账本结算与九策略 NAV
+6. 账本 sanity check
+7. NAV/PnL 图表
+8. 报告生成与 delivery outbox
 
-**Global Macro Radar** 是一个全自动化的“投研一体化”智能中枢系统。它通过整合**硬核科技产业新闻监控（LLM 驱动）**与**全球多资产量化选股（A股/港股/美股）**，每天为您生成一份结构化、数据驱动且极具洞察力的统一研报。
+量化层持久化 Dividend、Growth、Hot Spot × A/HK/US 共九个策略桶。新闻层先输出四个 0–100 整数子分，再按配置聚合为 Innovation/Traffic 两条 0–10 composite；来源可信度作为独立元数据，不会自动给内容分加分。
 
-本仓库是一个 Monorepo（单体仓库），无损整合了先前的 `QF_strategy` 量化策略库和 `industry-radar` 产业雷达库。
+## 安全模型
 
----
+| Mode | 数据库 | 真实订单 | Delivery | Fixture |
+| --- | --- | --- | --- | --- |
+| `offline` | 隔离 backtest DB | 禁用 | sink | 完整 bundle 必填 |
+| `shadow` | 隔离 test DB | 禁用 | sink | 可选 |
+| `live-shadow` | 隔离 test DB | 禁用 | sink | 不提供时使用真实源 |
+| `production` | canonical production DB | 受显式确认与 fence 保护 | 默认 sink | 可选 |
 
-## 核心特性 (Key Features)
+所有入口都要求显式 mode/database。production 还要求 canonical path 和二次写入确认；真实 SMTP 需要额外的 `--delivery-mode live --confirm-live-delivery`。scheduler 默认关闭。
 
-### 1. 智能产业雷达 (Industry Radar)
-基于大语言模型（支持 DeepSeek / Gemini / OpenAI）的自动新闻筛选与研报生成系统：
-- **双轨评分机制 (Dual-Track Scoring)**：以 `0.1` 的高精度浮点数对新闻的“硬核创新分”和“流量舆情分”进行独立评估，严格锚定打分基准。
-- **顶级信源白名单提权 (Source Whitelist)**：对来自 `Nature`, `Science`, `The Information` 等顶级信源的突破性事件自动给予分数加成与特殊标记。
-- **审美疲劳降权 (Hype Fatigue Penalty)**：自动识别并压低近期反复炒作的口水战和无实质性技术进展的 PR 软文权重。
-- **智能去重与溯源 (Smart Deduplication)**：基于超长上下文理解能力，精准将同一事件的多篇报道合并，并自动抓取外媒的原始出处（Primary Source）。
-- **深潜研报触发 (Deep Dive Generation)**：当某事件的“创新分 + 流量分 >= 18”时，自动触发深潜逻辑，生成万字长文级别的深度产业梳理。
-- **抗畸变时间解析引擎 (Robust Time Parser)**：引入双重兜底时间戳抽取算法，精准拦截非标时间格式引发的“旧闻穿越”漏洞，确保新闻 24 小时绝对新鲜度。
+运行时使用 SQLite Online Backup、writer fence、run identity、原子 checkpoint/resume 和 durable manifest。异常 legacy 数据只允许 quarantine，不猜测价格、成本或 PnL。
 
-### 2. 全球量化策略 (Global Quant Strategy)
-基于 `akshare` 和 `yfinance` 的自动化量化多因子初筛体系：
-- **高股息策略 (Dividend Yield)**：自动计算 A 股历史派息率与最新市值，挖掘稳健收息标的。
-- **核心高增长策略 (Core Growth)**：扫描全球市场，A 股要求最近 3 个季度营收与净利润连续实现同比双增且呈加速态势；港美股要求最近 1 个季度营收与净利润同步正增长，精准捕捉硬核基本面高景气标的。
-- **市场风口与 ETF 动量 (Hot Spot & Momentum)**：追踪全球核心宽基及行业 ETF，自动提取近期表现最强势的资金抱团板块。
-- **自动归因分析**：对每一只入选标的，自动调用大模型生成“入选逻辑 (Reason)”，用一句话点透其财务与技术面亮点。
+## 安装
 
----
+固定环境为 Python 3.11.9：
 
----
-
-## 架构哲学 (Architecture Philosophy)
-
-- **Code Logic First (代码逻辑优先)**: All strategy descriptions and documentation strictly map to the exact mathematical operations and logical operators used in the backend codebase (e.g., specific `pandas` filter masks, `if` conditions). We prioritize absolute fidelity to the running code over vague marketing narratives.
-- **Monorepo Cohesion**: Integrated previously scattered tools (`QF_strategy` and `industry-radar`) into a single, unified execution pipeline while maintaining strict sub-module boundaries.
-
----
-
-## 目录结构 (Architecture)
-
-```text
-Global-Macro-Radar/
-├── quant-strategy/          # 量化初筛与策略核心代码 (原 QF_strategy)
-│   ├── scripts/             # 每日量化跑批脚本、回测框架、Pnl绘图
-│   └── ...
-├── industry-radar/          # 产业新闻大模型分析核心代码
-│   ├── config.example.yaml  # 评分锚点、白名单及 RSS 订阅源配置
-│   ├── main.py              # 雷达主干逻辑
-│   ├── score.py             # 双轨打分与去重核心逻辑
-│   └── deep_dive.py         # 深度研报生成逻辑
-├── run_all.sh               # 全局一键启动总控脚本
-└── README.md                # 本说明文档
-```
-
----
-
-## 快速启动 (Quick Start)
-
-### 1. 环境准备
 ```bash
-# 推荐使用 Python 3.9 及以上版本
-python3 -m venv venv
-source venv/bin/activate
-pip install -r quant-strategy/requirements.txt # (如果有的话，或者手动安装 akshare, yfinance, openai, google-genai 等)
+python3.11 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt -r industry-radar/requirements.txt
 ```
 
-### 2. 配置密钥与邮箱
-在 `industry-radar` 目录下创建 `.env` 文件，填入您的大模型 API Keys：
-```env
-DEEPSEEK_API_KEY=your_key_here
-GEMINI_API_KEY=your_key_here
-OPENAI_API_KEY=your_key_here
-```
+创建本机配置；这些文件已被忽略，永远不要提交真实凭证或数据库：
 
-然后，复制 `config.example.yaml` 为 `config.yaml`，并在其中配置您的投研体系基准以及收发件邮箱：
 ```bash
+cp .env.example .env
 cp industry-radar/config.example.yaml industry-radar/config.yaml
+chmod 600 .env industry-radar/config.yaml
 ```
 
-### 3. 一键执行每日跑批
-只需在根目录下运行外壳脚本，系统即可自动并发执行量化初筛、RSS 信息流拉取、大模型打分，并将最终的精美 HTML 综合研报发送至您的邮箱。
+## 正确运行
+
+一个干净的隔离 test DB 可以直接用于 shadow：
 
 ```bash
-bash run_all.sh
+./run_all.sh \
+  --mode shadow \
+  --database /absolute/path/to/test.db \
+  --artifact-root /absolute/path/to/artifacts \
+  --effective-date YYYY-MM-DD \
+  --run-id unique-shadow-run \
+  --delivery-mode sink
 ```
 
----
-
-## 自动化部署建议
-建议将本系统与 macOS 的 `crontab`、`Keyboard Maestro` 或云服务器的定时任务结合，设定在每个交易日的早晨（如 8:00 AM）自动运行，打造您的专属 AI 投研早班车。
+真实源验收使用 `live-shadow`。如果种子来自包含 legacy 异常的生产库，先用 `production_release.py` 默认 copy-only 模式生成带 v6/quarantine 的 `working_copy.db`，不要加入 `--apply-production`：
 
 ```bash
-# 示例：每天早晨 8:00 自动执行
-0 8 * * 1-5 cd /path/to/Global-Macro-Radar && bash run_all.sh >> run.log 2>&1
+python3 quant-strategy/scripts/production_release.py \
+  --source-db /absolute/path/to/quant_system.db \
+  --audit /absolute/path/to/production_db_audit.json \
+  --output-dir /absolute/path/to/new-release-dir
+
+SQLITE_DB_PATH=/absolute/path/to/new-release-dir/working_copy.db \
+QUANT_DB_ENV=test PYTHONPATH=quant-strategy/scripts \
+python3 -c 'import db_utils; connection=db_utils.init_db(); connection.close()'
+
+./run_all.sh \
+  --mode live-shadow \
+  --database /absolute/path/to/new-release-dir/working_copy.db \
+  --artifact-root /absolute/path/to/artifacts \
+  --effective-date YYYY-MM-DD \
+  --run-id unique-live-shadow-run \
+  --delivery-mode sink
 ```
+
+成功不能只看退出码：同时核对 release/run manifest、delivery journal、数据库完整性和生产库前后哈希。完整的恢复、调度、Docker 与维护窗口协议见 [OPERATIONS.md](OPERATIONS.md)。
+
+## 可靠性边界
+
+- 新建仓必须取得权威、有限正数且处于真实交易时段的价格，否则 defer。
+- 无退出价时保留持仓，不用估算价强行成交。
+- NAV 使用各市场最近正式完成交易日的精确 close；尚未收盘的 session 不会被当成已有 daily close。
+- 严格 OHLC 失败时，non-A NAV 只允许隔离与估值无关的坏 open 字段；close 仍必须为有限正数且位于 high/low 内，降级数据不写入 OHLC cache。
+- LLM 结构化响应失败时，新闻评分和量化二次筛选各自按明确合同重试、停止或回退，并在日志中披露。
+
+## 模块导航
+
+- [Industry Radar](industry-radar/README.md)：RSS、评分、去重和新闻报告。
+- [Quant Strategy](quant-strategy/README.md)：九策略筛选、账本、NAV 与 PIT 回测边界。
+- [Scripts](quant-strategy/scripts/README.md)：统一流程、shadow、release 和 backtest 入口。
+- [Core](quant-strategy/scripts/core/README.md)：核心安全与金融原语。
+
+完整专有测试、CI、内部审计和验收证据由 private Core 仓库维护；public 仓库不包含这些内部目录，不能把 public checkout 当成完整验证资产。
+
+## License
+
+代码与文档采用 [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)；商业使用请另行取得授权。
