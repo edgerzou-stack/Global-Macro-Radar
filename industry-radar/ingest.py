@@ -1,6 +1,8 @@
 import calendar
 import concurrent.futures
+import json
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -14,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 ALLOWED_FEED_CONTENT_TYPES = ("rss", "atom", "xml")
 MAX_FUTURE_SKEW = timedelta(minutes=5)
+RSS_FIXTURE_SCHEMA_VERSION = 1
 
 
 def _field(obj, name, default=None):
@@ -71,6 +74,104 @@ def _validate_content_type(response):
     return content_type
 
 
+def _fixture_timestamp(value, field_name):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty ISO timestamp")
+    try:
+        parsed = date_parser.isoparse(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field_name} must be a valid ISO timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"{field_name} must include a timezone")
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def load_rss_fixture(path):
+    """Load a deterministic, already-ingested RSS snapshot without networking."""
+    fixture_path = os.path.abspath(os.fspath(path))
+    try:
+        with open(fixture_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cannot load RSS fixture {fixture_path}: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError("RSS fixture must be a JSON object")
+    if payload.get("schema_version") != RSS_FIXTURE_SCHEMA_VERSION:
+        raise ValueError("Unsupported RSS fixture schema_version")
+    raw_articles = payload.get("articles")
+    raw_health = payload.get("health")
+    if not isinstance(raw_articles, list) or not isinstance(raw_health, list):
+        raise ValueError("RSS fixture articles and health must be lists")
+
+    articles = []
+    for index, raw in enumerate(raw_articles):
+        if not isinstance(raw, dict):
+            raise ValueError(f"RSS fixture article {index} must be an object")
+        article = dict(raw)
+        for field in ("title", "link", "source"):
+            if not isinstance(article.get(field), str) or not article[field].strip():
+                raise ValueError(
+                    f"RSS fixture article {index} has invalid {field}"
+                )
+        for field in ("summary", "content"):
+            value = article.get(field, "")
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"RSS fixture article {index} has invalid {field}"
+                )
+            article[field] = value
+        article["published_at"] = _fixture_timestamp(
+            article.get("published_at"), f"articles[{index}].published_at"
+        )
+        articles.append(article)
+
+    health = []
+    seen_urls = set()
+    for index, raw in enumerate(raw_health):
+        if not isinstance(raw, dict):
+            raise ValueError(f"RSS fixture health {index} must be an object")
+        item = dict(raw)
+        url = item.get("url")
+        if not isinstance(url, str) or not url.strip() or url in seen_urls:
+            raise ValueError(f"RSS fixture health {index} has invalid/duplicate url")
+        seen_urls.add(url)
+        if item.get("status") not in {"healthy", "degraded", "failed"}:
+            raise ValueError(f"RSS fixture health {index} has invalid status")
+        for field in ("fresh_entries", "total_entries", "quarantined_entries"):
+            value = item.get(field, 0)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"RSS fixture health {index} has invalid {field}")
+            item[field] = value
+        if item["fresh_entries"] > item["total_entries"]:
+            raise ValueError(
+                f"RSS fixture health {index} fresh_entries exceeds total_entries"
+            )
+        expected_fresh = item["fresh_entries"] > 0
+        if "fresh" in item and item["fresh"] is not expected_fresh:
+            raise ValueError(f"RSS fixture health {index} has inconsistent fresh")
+        item["fresh"] = expected_fresh
+        if item["status"] == "failed" and expected_fresh:
+            raise ValueError(f"RSS fixture health {index} failed but has fresh entries")
+        newest = item.get("newest_published_at")
+        if newest is not None:
+            item["newest_published_at"] = _fixture_timestamp(
+                newest, f"health[{index}].newest_published_at"
+            )
+        health.append(item)
+
+    fresh_total = sum(item["fresh_entries"] for item in health)
+    if fresh_total != len(articles):
+        raise ValueError(
+            "RSS fixture article count does not match health fresh_entries total"
+        )
+    articles.sort(
+        key=lambda item: (item.get("published_at", ""), item.get("link", "")),
+        reverse=True,
+    )
+    return articles, health
+
+
 def fetch_rss_feeds(
     feeds,
     hours_back=168,
@@ -94,6 +195,7 @@ def fetch_rss_feeds(
         health = {
             "url": feed_url,
             "status": "failed",
+            "fresh": False,
             "fresh_entries": 0,
             "total_entries": 0,
             "quarantined_entries": 0,
@@ -162,6 +264,7 @@ def fetch_rss_feeds(
                 )
 
             health["fresh_entries"] = len(local_articles)
+            health["fresh"] = bool(local_articles)
             health["newest_published_at"] = newest.isoformat() if newest else None
             degraded_reasons = []
             if health["bozo"]:

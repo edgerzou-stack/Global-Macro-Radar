@@ -2,6 +2,11 @@ import sqlite3
 import os
 
 from db_utils import get_db_path, normalize_db_path
+from core.quarantine import quarantined_primary_keys
+
+
+class QuarantinedStrategyError(RuntimeError):
+    """Raised before a quarantined strategy account can be read or mutated."""
 
 class CashManager:
     """
@@ -25,6 +30,16 @@ class CashManager:
         conn.execute('PRAGMA busy_timeout=30000;')
         return conn
 
+    @staticmethod
+    def _assert_active_strategy(cursor, strategy_id):
+        quarantined = quarantined_primary_keys(
+            cursor.connection, "strategy_accounts"
+        )
+        if (strategy_id,) in quarantined:
+            raise QuarantinedStrategyError(
+                f"Strategy account {strategy_id!r} is quarantined"
+            )
+
     def initialize_strategy(self, strategy_id: str, cursor=None):
         """Inject 1M initial capital if strategy account does not exist."""
         c = cursor
@@ -34,6 +49,7 @@ class CashManager:
             c = conn.cursor()
             
         try:
+            self._assert_active_strategy(c, strategy_id)
             c.execute("SELECT total_capital FROM strategy_accounts WHERE strategy_id = ?", (strategy_id,))
             row = c.fetchone()
             if not row:
@@ -58,6 +74,7 @@ class CashManager:
         conn = self.get_connection()
         try:
             c = conn.cursor()
+            self._assert_active_strategy(c, strategy_id)
             c.execute("SELECT total_capital, available_cash FROM strategy_accounts WHERE strategy_id = ?", (strategy_id,))
             row = c.fetchone()
             return row[0], row[1]
@@ -84,6 +101,7 @@ class CashManager:
                 c = conn.cursor()
                 
             try:
+                self._assert_active_strategy(c, strategy_id)
                 c.execute(
                     "UPDATE strategy_accounts SET available_cash = available_cash - ? WHERE strategy_id = ?",
                     (tranche, strategy_id)
@@ -117,6 +135,7 @@ class CashManager:
             c = conn.cursor()
             
         try:
+            self._assert_active_strategy(c, strategy_id)
             c.execute(
                 "UPDATE strategy_accounts SET available_cash = available_cash + ? WHERE strategy_id = ?",
                 (returned_capital, strategy_id)

@@ -1,11 +1,104 @@
 import yfinance as yf
 import pandas as pd
 import concurrent.futures
+import json
 import time
 import random
 from data_provider import disk_cache
 import os
 import requests
+from dataclasses import dataclass
+from functools import lru_cache
+
+
+@dataclass(frozen=True)
+class FetchOutcome:
+    ticker: str
+    status: str
+    row: dict = None
+    reason: str = ""
+
+
+LAST_SCREEN_HEALTH = {}
+US_HK_FIXTURE_SCHEMA_VERSION = 1
+REQUIRED_ACCEPTED_COLUMNS = {
+    "股票代码",
+    "总市值(亿元)",
+    "净利润同比增长率",
+    "营业总收入同比增长率",
+    "最新单季环比双增",
+    "PE",
+}
+
+
+@lru_cache(maxsize=8)
+def _load_outcome_fixture_cached(path, mtime_ns):
+    del mtime_ns  # Included in the cache key so fixture rewrites are observed.
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            fixture = json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Cannot load US/HK outcome fixture {path}: {error}") from error
+    if not isinstance(fixture, dict):
+        raise ValueError("US/HK outcome fixture must be an object")
+    if fixture.get("schema_version") != US_HK_FIXTURE_SCHEMA_VERSION:
+        raise ValueError("Unsupported US/HK outcome fixture schema_version")
+    outcomes = fixture.get("outcomes")
+    if not isinstance(outcomes, dict):
+        raise ValueError("US/HK outcome fixture outcomes must be an object")
+
+    validated = {}
+    for ticker, raw in outcomes.items():
+        if not isinstance(ticker, str) or not ticker.strip() or not isinstance(raw, dict):
+            raise ValueError("US/HK fixture contains an invalid ticker outcome")
+        status = raw.get("status")
+        if status not in {"accepted", "rejected", "source_error"}:
+            raise ValueError(f"US/HK fixture {ticker} has invalid status")
+        reason = raw.get("reason", "")
+        if not isinstance(reason, str):
+            raise ValueError(f"US/HK fixture {ticker} has invalid reason")
+        row = raw.get("row")
+        if status == "accepted":
+            if not isinstance(row, dict):
+                raise ValueError(f"US/HK fixture {ticker} accepted row is missing")
+            missing = REQUIRED_ACCEPTED_COLUMNS.difference(row)
+            if missing:
+                raise ValueError(
+                    f"US/HK fixture {ticker} accepted row missing {sorted(missing)}"
+                )
+            if str(row["股票代码"]) != ticker:
+                raise ValueError(f"US/HK fixture {ticker} row ticker mismatch")
+            row = dict(row)
+        elif row is not None:
+            raise ValueError(f"US/HK fixture {ticker} non-accepted row must be null")
+        validated[ticker] = FetchOutcome(ticker, status, row=row, reason=reason)
+    return validated
+
+
+def load_outcome_fixture(path):
+    fixture_path = os.path.abspath(os.fspath(path))
+    try:
+        mtime_ns = os.stat(fixture_path).st_mtime_ns
+    except OSError as error:
+        raise ValueError(
+            f"Cannot stat US/HK outcome fixture {fixture_path}: {error}"
+        ) from error
+    return _load_outcome_fixture_cached(fixture_path, mtime_ns)
+
+
+def _fixture_outcome(ticker_symbol):
+    fixture_path = os.environ.get("US_HK_OUTCOME_FIXTURE")
+    if not fixture_path:
+        return None
+    outcomes = load_outcome_fixture(fixture_path)
+    return outcomes.get(
+        ticker_symbol,
+        FetchOutcome(
+            ticker_symbol,
+            "source_error",
+            reason="ticker_missing_from_outcome_fixture",
+        ),
+    )
 
 # FMP API request cached for 24 hours to preserve the 250 requests/day limit
 def _load_env():
@@ -40,10 +133,20 @@ def fetch_yf_quarterly_income_stmt_cached(ticker_symbol):
     return yf.Ticker(ticker_symbol).quarterly_income_stmt
 
 def fetch_yf_data(ticker_symbol, args):
+    fixture = _fixture_outcome(ticker_symbol)
+    if fixture is not None:
+        return fixture
     max_retries = 3
     for attempt in range(max_retries):
         try:
             info = fetch_yf_info_cached(ticker_symbol)
+            if not isinstance(info, dict) or not info:
+                raise ValueError("yfinance info is empty")
+            if info.get("marketCap") is None or (
+                info.get("currentPrice") is None
+                and info.get("previousClose") is None
+            ):
+                raise ValueError("yfinance info is missing market cap or price")
             
             # Calculate some missing fields or rename them
             pe = info.get("trailingPE")
@@ -114,9 +217,13 @@ def fetch_yf_data(ticker_symbol, args):
                         
             if not pass_div_precheck and not pass_gro_precheck:
                 # Skip fetching 3-year financials
-                return None
+                return FetchOutcome(
+                    ticker=ticker_symbol,
+                    status="rejected",
+                    reason="fundamental_precheck",
+                )
     
-            return {
+            return FetchOutcome(ticker=ticker_symbol, status="accepted", row={
                 "股票代码": ticker_symbol,
                 "股票简称": info.get("shortName", ticker_symbol),
                 "PE": pe,
@@ -130,34 +237,102 @@ def fetch_yf_data(ticker_symbol, args):
                 "营业总收入同比增长率": revenue_growth * 100 if revenue_growth else None,
                 "最新单季环比双增": latest_qoq_dual_growth,
                 "资产负债率": debt_to_asset,
-                "最新价": info.get("currentPrice", info.get("previousClose")),
+                "最新价": info.get("currentPrice") or info.get("previousClose"),
                 "所处行业": info.get("sector")
-            }
+            })
         except Exception as e:
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt + random.uniform(0, 1))
             else:
                 print(f"Failed to fetch {ticker_symbol} after {max_retries} attempts: {e}")
-                return None
+                return FetchOutcome(
+                    ticker=ticker_symbol,
+                    status="source_error",
+                    reason=f"{type(e).__name__}: {e}",
+                )
 
 from tqdm import tqdm
 
 def screen_us_hk(tickers, args, market_type="US"):
     frames = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(fetch_yf_data, t, args) for t in tickers]
-        for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc=f"Scanning {market_type} stocks"):
+    outcomes = []
+    tickers = list(dict.fromkeys(str(ticker) for ticker in tickers))
+    if tickers:
+        max_workers = min(
+            len(tickers), int(os.environ.get("US_HK_MAX_WORKERS", "8"))
+        )
+        deadline = float(os.environ.get("US_HK_STAGE_TIMEOUT_SECONDS", "180"))
+        if max_workers <= 0 or deadline <= 0:
+            raise ValueError("US/HK worker count and stage timeout must be positive")
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        future_to_ticker = {
+            executor.submit(fetch_yf_data, ticker, args): ticker for ticker in tickers
+        }
+        done, pending = concurrent.futures.wait(
+            future_to_ticker, timeout=deadline
+        )
+        for future in tqdm(done, total=len(tickers), desc=f"Scanning {market_type} stocks"):
             try:
-                res = future.result(timeout=60) # Increased timeout to 60s
-            except concurrent.futures.TimeoutError:
-                print(f"Timeout occurred while waiting for yfinance fetch.")
+                res = future.result()
+            except Exception as error:
+                outcomes.append(
+                    FetchOutcome(
+                        future_to_ticker[future],
+                        "source_error",
+                        reason=f"{type(error).__name__}: {error}",
+                    )
+                )
                 continue
-            if res is not None:
+            if isinstance(res, FetchOutcome):
+                outcomes.append(res)
+                if res.status == "accepted":
+                    frames.append(res.row)
+            elif isinstance(res, dict):
+                # Compatibility for injected test/provider adapters.
+                outcomes.append(FetchOutcome("unknown", "accepted", row=res))
                 frames.append(res)
-    
+            else:
+                outcomes.append(
+                    FetchOutcome(
+                        future_to_ticker[future],
+                        "source_error",
+                        reason="invalid outcome",
+                    )
+                )
+        for future in pending:
+            ticker = future_to_ticker[future]
+            future.cancel()
+            outcomes.append(FetchOutcome(ticker, "source_error", reason="stage_timeout"))
+        # Do not let a stuck provider call hold the screen function forever.
+        # Running threads cannot be force-killed, so providers still need their
+        # own request timeouts; this bounds the stage decision and fails health.
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    attempted = len(tickers)
+    evaluated = sum(
+        outcome.status in {"accepted", "rejected"} for outcome in outcomes
+    )
+    source_errors = sum(outcome.status == "source_error" for outcome in outcomes)
+    coverage = evaluated / attempted if attempted else 1.0
+    health = {
+        "market": market_type,
+        "attempted": attempted,
+        "evaluated": evaluated,
+        "accepted": len(frames),
+        "rejected": sum(outcome.status == "rejected" for outcome in outcomes),
+        "source_errors": source_errors,
+        "coverage": coverage,
+    }
+    LAST_SCREEN_HEALTH[market_type] = health
+    print(f"{market_type} data health: {health}")
+    minimum_coverage = float(os.environ.get("US_HK_MIN_DATA_COVERAGE", "0.80"))
+    if attempted and coverage < minimum_coverage:
+        raise ConnectionError(
+            f"{market_type} data coverage {coverage:.1%} is below "
+            f"the required {minimum_coverage:.1%}"
+        )
+
     if not frames:
-        if tickers:
-            raise ConnectionError(f"CRITICAL: All data fetching failed for {market_type}. Aborting pipeline to prevent empty portfolio.")
         return pd.DataFrame(), pd.DataFrame()
         
     df = pd.DataFrame(frames)

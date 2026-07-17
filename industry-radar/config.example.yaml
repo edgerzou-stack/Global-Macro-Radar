@@ -66,12 +66,29 @@ rss_feeds:
   - "https://www.jiqizhixin.com/rss" # 机器之心 (中国最硬核的AI媒体)
   - "https://www.ifanr.com/feed" # 爱范儿 (科技与生活方式)
 
+# Optional source-family gates. A daily run fails closed when a named critical
+# group loses the configured minimum healthy or fresh sources, even if the
+# aggregate RSS ratios still pass.
+rss_critical_source_groups:
+  - name: "frontier-technology"
+    sources:
+      - "https://www.technologyreview.com/feed/"
+      - "https://techcrunch.com/category/artificial-intelligence/feed/"
+      - "https://feeds.arstechnica.com/arstechnica/technology-lab"
+    min_healthy_sources: 2
+    min_fresh_sources: 2
+
 output:
   format: "markdown"
   language: "Chinese"
   min_score_to_keep: 8 # 任一维度达到 8 分即保留
   hours_back: 48 # 过去48小时
   model: "deepseek-chat" # 使用 DeepSeek 进行核心推理
+  rss_max_failure_ratio: 0.25
+  rss_min_healthy_ratio: 0.5
+  rss_min_fresh_sources: 5
+  rss_min_total_fresh_entries: 10
+  rss_min_configured_sources: 10
 
 delivery:
   enabled: true

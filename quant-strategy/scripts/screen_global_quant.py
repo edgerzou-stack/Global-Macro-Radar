@@ -4,6 +4,9 @@ import json
 import argparse
 import sys
 import sqlite3
+import hashlib
+import math
+import tempfile
 from datetime import date, datetime, timedelta
 
 from screen_a_share import (
@@ -30,6 +33,291 @@ def get_key(row, strat):
 import db_utils
 from core.portfolio import PortfolioManager
 from core.strategy import ADividendStrategy, AGrowthStrategy, USHKQuantStrategy, HotSpotStrategy
+from core.quarantine import quarantine_filter
+
+
+GLOBAL_SCREEN_FIXTURE_ENV = "GLOBAL_SCREEN_FIXTURE"
+GLOBAL_SCREEN_FIXTURE_VERSION = 1
+
+
+class GlobalScreenFixtureError(ValueError):
+    """Raised when an offline global-screen fixture violates its contract."""
+
+
+class _OfflineFixtureGateway:
+    """Fail closed if a fixture run reaches a historical market-data path."""
+
+    def get_historical_prices(self, *args, **kwargs):
+        raise GlobalScreenFixtureError(
+            "offline fixture cannot fetch historical prices; provide a fresh temporary DB "
+            "or fixture prices for positions that can be updated directly"
+        )
+
+
+def _normalise_fixture_price(symbol, value):
+    raw = value.get("最新价") if isinstance(value, dict) else value
+    try:
+        price = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise GlobalScreenFixtureError(
+            f"current_prices[{symbol!r}] must be a positive finite number or {{'最新价': number}}"
+        ) from exc
+    if not math.isfinite(price) or price <= 0:
+        raise GlobalScreenFixtureError(
+            f"current_prices[{symbol!r}] must be a positive finite number"
+        )
+    return {"最新价": price}
+
+
+def load_global_screen_fixture(path):
+    """Load and strictly validate the versioned, network-free screen fixture."""
+    fixture_path = os.path.abspath(os.path.expanduser(path))
+    try:
+        with open(fixture_path, "rb") as handle:
+            raw = handle.read()
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise GlobalScreenFixtureError(f"failed to load GLOBAL_SCREEN_FIXTURE: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise GlobalScreenFixtureError("fixture root must be a JSON object")
+    expected_keys = {"fixture_version", "snapshot_date", "results", "current_prices"}
+    actual_keys = set(payload)
+    if actual_keys != expected_keys:
+        missing = sorted(expected_keys - actual_keys)
+        unknown = sorted(actual_keys - expected_keys)
+        raise GlobalScreenFixtureError(
+            f"fixture keys must be exactly {sorted(expected_keys)}; missing={missing}, unknown={unknown}"
+        )
+    if payload["fixture_version"] != GLOBAL_SCREEN_FIXTURE_VERSION:
+        raise GlobalScreenFixtureError(
+            f"unsupported fixture_version={payload['fixture_version']!r}; "
+            f"expected {GLOBAL_SCREEN_FIXTURE_VERSION}"
+        )
+    try:
+        datetime.strptime(payload["snapshot_date"], "%Y-%m-%d")
+    except (TypeError, ValueError) as exc:
+        raise GlobalScreenFixtureError("snapshot_date must use YYYY-MM-DD") from exc
+
+    raw_results = payload["results"]
+    if not isinstance(raw_results, dict) or set(raw_results) != set(STRATEGIES):
+        raise GlobalScreenFixtureError(
+            f"results must contain exactly these strategies: {sorted(STRATEGIES)}"
+        )
+    results = {}
+    target_symbols = set()
+    for strategy in STRATEGIES:
+        rows = raw_results[strategy]
+        if not isinstance(rows, list):
+            raise GlobalScreenFixtureError(f"results[{strategy!r}] must be an array")
+        seen = set()
+        normalised_rows = []
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                raise GlobalScreenFixtureError(f"results[{strategy!r}][{index}] must be an object")
+            symbol = row.get("股票代码")
+            if not isinstance(symbol, str) or not symbol.strip():
+                raise GlobalScreenFixtureError(
+                    f"results[{strategy!r}][{index}].股票代码 must be a non-empty string"
+                )
+            symbol = symbol.strip()
+            if symbol in seen:
+                raise GlobalScreenFixtureError(
+                    f"duplicate 股票代码 {symbol!r} in results[{strategy!r}]"
+                )
+            seen.add(symbol)
+            target_symbols.add(symbol)
+            copied = dict(row)
+            copied["股票代码"] = symbol
+            normalised_rows.append(copied)
+        results[strategy] = normalised_rows
+
+    raw_prices = payload["current_prices"]
+    if not isinstance(raw_prices, dict):
+        raise GlobalScreenFixtureError("current_prices must be an object keyed by 股票代码")
+    current_prices = {
+        str(symbol): _normalise_fixture_price(str(symbol), value)
+        for symbol, value in raw_prices.items()
+    }
+    missing_prices = sorted(target_symbols - set(current_prices))
+    if missing_prices:
+        raise GlobalScreenFixtureError(
+            f"current_prices is missing target symbols: {missing_prices}"
+        )
+    for strategy, rows in results.items():
+        for row in rows:
+            row["最新价"] = current_prices[row["股票代码"]]["最新价"]
+
+    return {
+        "path": fixture_path,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "fixture_version": GLOBAL_SCREEN_FIXTURE_VERSION,
+        "snapshot_date": payload["snapshot_date"],
+        "results": results,
+        "current_prices": current_prices,
+    }
+
+
+def _persist_daily_results(results, diff, snapshot_date, *, include_empty=False, strict=False):
+    conn = None
+    try:
+        conn = db_utils.get_connection()
+        cursor = conn.cursor()
+        for strategy in STRATEGIES:
+            if include_empty or results.get(strategy):
+                result_payload = {
+                    "results": results[strategy],
+                    "diff": diff.get(strategy, {}),
+                }
+                serialized = json.dumps(
+                    result_payload, ensure_ascii=False, sort_keys=True
+                )
+                active_filter, active_parameters, _ = quarantine_filter(
+                    conn, "strategy_daily_results"
+                )
+                rows = cursor.execute(
+                    "SELECT id, result_json FROM strategy_daily_results "
+                    "WHERE result_date=? AND strategy=?" + active_filter,
+                    (snapshot_date, strategy, *active_parameters),
+                ).fetchall()
+                if len(rows) > 1:
+                    raise RuntimeError(
+                        f"multiple active daily results for {snapshot_date}/{strategy}"
+                    )
+                if rows:
+                    row_id, previous = rows[0]
+                    try:
+                        unchanged = json.loads(previous) == result_payload
+                    except (TypeError, json.JSONDecodeError):
+                        unchanged = False
+                    if not unchanged:
+                        cursor.execute(
+                            "UPDATE strategy_daily_results SET result_json=? WHERE id=?",
+                            (serialized, row_id),
+                        )
+                else:
+                    cursor.execute(
+                        "INSERT INTO strategy_daily_results "
+                        "(result_date, strategy, result_json) VALUES (?, ?, ?)",
+                        (snapshot_date, strategy, serialized),
+                    )
+        conn.commit()
+    except Exception as exc:
+        if conn is not None:
+            conn.rollback()
+        if strict:
+            raise
+        print(f"Warning: Failed to save to strategy_daily_results table: {exc}")
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _write_json_atomic(path, payload):
+    output_path = os.path.abspath(path)
+    output_dir = os.path.dirname(output_path) or os.curdir
+    os.makedirs(output_dir, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=f".{os.path.basename(output_path)}.", suffix=".tmp", dir=output_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, output_path)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _run_offline_fixture(args, fixture):
+    """Execute the real portfolio/database flow while blocking every screen/data fetch."""
+    database_path = db_utils.get_db_path()
+    database_environment = os.environ.get("QUANT_DB_ENV")
+    if (
+        database_path == db_utils.get_production_db_path()
+        or database_environment not in {"test", "backtest"}
+    ):
+        raise GlobalScreenFixtureError(
+            "GLOBAL_SCREEN_FIXTURE requires an explicit non-production SQLITE_DB_PATH "
+            "and QUANT_DB_ENV=test or QUANT_DB_ENV=backtest"
+        )
+    snapshot_date = fixture["snapshot_date"]
+    results = fixture["results"]
+    current_prices = fixture["current_prices"]
+    old_portfolio, _ = db_utils.load_portfolio_and_trades()
+
+    required_symbols = {
+        symbol
+        for strategy in STRATEGIES
+        for symbol in old_portfolio.get(strategy, {})
+    } | {
+        row["股票代码"]
+        for strategy in STRATEGIES
+        for row in results[strategy]
+    }
+    missing_prices = sorted(required_symbols - set(current_prices))
+    if missing_prices:
+        raise GlobalScreenFixtureError(
+            f"current_prices must cover existing and target positions: {missing_prices}"
+        )
+
+    strategy_targets = {
+        strategy: [get_key(row, strategy) for row in results[strategy]]
+        for strategy in STRATEGIES
+    }
+    manager = PortfolioManager(db_utils)
+
+    # Fixture prices are already execution-approved inputs. Bypass market-clock and
+    # pending-price resolution so an offline run cannot branch on wall clock or network.
+    manager.get_simulated_trade_price = lambda prices, _strategy: float(prices["最新价"])
+    manager.resolve_pending_prices = lambda: None
+    portfolio_module = sys.modules[PortfolioManager.__module__]
+    from core import diagnose as diagnose_module
+    original_gateway = portfolio_module.data_gateway
+    original_diagnose = diagnose_module.diagnose_elimination
+    portfolio_module.data_gateway = _OfflineFixtureGateway()
+    diagnose_module.diagnose_elimination = (
+        lambda _symbol, _strategy: "离线固定测试集移除"
+    )
+    try:
+        portfolio, _new_trades, diff = manager.diff_and_update(
+            strategy_targets, current_prices, snapshot_date
+        )
+    finally:
+        portfolio_module.data_gateway = original_gateway
+        diagnose_module.diagnose_elimination = original_diagnose
+    inject_portfolio_metrics(
+        results, portfolio, snapshot_date, gateway_instance=_OfflineFixtureGateway()
+    )
+
+    payload = {
+        "mode": "global_12_grid_fixture_v1",
+        "snapshot_date": snapshot_date,
+        "fixture": {
+            "version": fixture["fixture_version"],
+            "sha256": fixture["sha256"],
+            "path": fixture["path"],
+        },
+        "thresholds": threshold_payload(args),
+        "stage_counts": {strategy: len(results[strategy]) for strategy in STRATEGIES},
+        "results": results,
+        "appendix": {strategy: [] for strategy in STRATEGIES},
+        "diff": diff,
+        "portfolio": portfolio,
+        "trade_history": [],
+    }
+    _persist_daily_results(
+        results, diff, snapshot_date, include_empty=True, strict=True
+    )
+    _write_json_atomic(args.output_file, payload)
+    print(
+        "Global screening offline fixture complete! "
+        f"Saved to SQLite DB and {args.output_file}"
+    )
+    return payload
 
 def process_a_share_data(args, a_tickers, as_of_date):
     """Refactored data fetcher for A-shares, returns raw DFs to be consumed by Strategies"""
@@ -137,7 +425,7 @@ def inject_portfolio_metrics(results, portfolio, snapshot_date, gateway_instance
                 row["累计涨跌幅"] = f"{(cp / adj_ep - 1) * 100:.2f}%" if adj_ep > 0 else "0.00%"
             row["入选日期"] = ed
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Global Macro Quant Screener V2")
     parser.add_argument("--report-date", type=str)
     parser.add_argument("--valuation-formula-max", type=float, default=10.0)
@@ -155,7 +443,7 @@ def main():
     from config import PROJECT_ROOT
     parser.add_argument("--output-file", type=str, default=os.path.join(PROJECT_ROOT, "global_screen.json"))
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     from core.clock import clock
     from core.logger import get_quant_logger
 
@@ -163,6 +451,11 @@ def main():
     logger.info("="*50)
     logger.info("Starting Global Quant Screening V2 (OOP Engine)")
     logger.info("="*50)
+
+    fixture_path = os.environ.get(GLOBAL_SCREEN_FIXTURE_ENV)
+    if fixture_path:
+        logger.info("Running strict offline fixture version %s", GLOBAL_SCREEN_FIXTURE_VERSION)
+        return _run_offline_fixture(args, load_global_screen_fixture(fixture_path))
 
     snapshot_date = clock.now().strftime("%Y-%m-%d")
     as_of_date = clock.today()
@@ -351,33 +644,17 @@ Please return the selected top candidates (maximum 10) as a JSON array of their 
     }
 
     # P3.24: 将大 JSON 保存逻辑从统一的 meta_data 表迁移到按日期和策略拆分的专用表中
-    try:
-        conn = db_utils.get_connection()
-        c = conn.cursor()
-        try:
-            for strat in STRATEGIES:
-                if results.get(strat):
-                    strat_payload = {
-                        "results": results[strat],
-                        "diff": diff.get(strat, {})
-                    }
-                    c.execute("INSERT INTO strategy_daily_results (result_date, strategy, result_json) VALUES (?, ?, ?)",
-                              (snapshot_date, strat, json.dumps(strat_payload, ensure_ascii=False)))
-            conn.commit()
-        finally:
-            conn.close()
-    except Exception as e:
-        print(f"Warning: Failed to save to strategy_daily_results table: {e}")
+    _persist_daily_results(results, diff, snapshot_date)
 
     # DB save has been fully migrated to strategy_daily_results table
 
     # Save to JSON for UI / email generation backward compatibility
     payload["portfolio"] = portfolio
     payload["trade_history"] = [] # The old JSON payload requires these keys
-    with open(args.output_file, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    _write_json_atomic(args.output_file, payload)
 
     print(f"Global screening complete via V2 OOP Engine! Saved to SQLite DB and {args.output_file}")
+    return payload
 
 if __name__ == "__main__":
     main()

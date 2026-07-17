@@ -8,6 +8,8 @@ matplotlib.use('Agg') # For headless environments
 import matplotlib.pyplot as plt
 from collections import defaultdict
 
+from core.quarantine import quarantine_filter
+
 # ==========================================
 # Bright & Clean Theme (Original layout style)
 # ==========================================
@@ -26,6 +28,27 @@ STRAT_NAMES = {
     "growth_hk_stock": "港股高增",
     "hot_spot_hk_stock": "港股热点"
 }
+
+
+def load_active_nav_records(db_path):
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    try:
+        nav_filter, nav_parameters, _ = quarantine_filter(
+            conn, "strategy_nav_history"
+        )
+        rows = conn.execute(
+            "SELECT date, strategy_id, nav FROM strategy_nav_history "
+            "WHERE 1=1" + nav_filter,
+            nav_parameters,
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        {"date": row[0], "strategy_id": row[1], "nav": row[2]}
+        for row in rows
+    ]
 
 def build_timeseries_pnl(trades: list) -> pd.Series:
     """
@@ -311,19 +334,11 @@ def main():
     all_nav_records = []
     strategy_navs = defaultdict(list)
     try:
-        conn = sqlite3.connect(get_db_path())
-        c = conn.cursor()
-        c.execute("SELECT date, strategy_id, nav FROM strategy_nav_history")
-        nav_rows = c.fetchall()
-        for r in nav_rows:
-            rec = {"date": r[0], "strategy_id": r[1], "nav": r[2]}
+        for rec in load_active_nav_records(get_db_path()):
             all_nav_records.append(rec)
-            strategy_navs[r[1]].append(rec)
+            strategy_navs[rec["strategy_id"]].append(rec)
     except Exception as e:
         print(f"Failed to fetch NAV records: {e}")
-    finally:
-        if 'conn' in locals():
-            conn.close()
 
     for strat in STRAT_NAMES.keys():
         if strat in strategy_trades and strategy_trades[strat]:
@@ -344,4 +359,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

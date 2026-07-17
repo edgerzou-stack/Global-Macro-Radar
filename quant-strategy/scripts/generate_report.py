@@ -3,6 +3,7 @@ import sys
 import os
 import base64
 from core.diagnose import diagnose_elimination
+from core.quarantine import quarantine_filter
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 try:
@@ -37,6 +38,26 @@ STRAT_REASONS = {
     "hot_spot_us_stock": "热点突击 (新闻突发热度及资金流向)",
     "hot_spot_hk_stock": "热点突击 (新闻突发热度及资金流向)",
 }
+
+
+def load_active_strategy_accounts(db_path=None):
+    import sqlite3
+    from core.cash_manager import get_db_path
+
+    conn = sqlite3.connect(db_path or get_db_path())
+    try:
+        account_filter, account_parameters, _ = quarantine_filter(
+            conn, "strategy_accounts"
+        )
+        return conn.execute(
+            "SELECT strategy_id, total_capital, available_cash "
+            "FROM strategy_accounts WHERE 1=1"
+            + account_filter
+            + " ORDER BY strategy_id",
+            account_parameters,
+        ).fetchall()
+    finally:
+        conn.close()
 
 def render_table_md(items, headers):
     if len(items) == 0:
@@ -564,15 +585,7 @@ def main():
 
     def get_cash_overview_md():
         try:
-            import sqlite3
-            from core.cash_manager import get_db_path
-            conn = sqlite3.connect(get_db_path())
-            try:
-                c = conn.cursor()
-                c.execute("SELECT strategy_id, total_capital, available_cash FROM strategy_accounts ORDER BY strategy_id")
-                rows = c.fetchall()
-            finally:
-                conn.close()
+            rows = load_active_strategy_accounts()
             if not rows: return ""
 
             md = "## 🏦 全球多策略子基金台账概览 (Sandbox Benchmark Engine)\n\n"
@@ -589,15 +602,7 @@ def main():
 
     def get_cash_overview_html():
         try:
-            import sqlite3
-            from core.cash_manager import get_db_path
-            conn = sqlite3.connect(get_db_path())
-            try:
-                c = conn.cursor()
-                c.execute("SELECT strategy_id, total_capital, available_cash FROM strategy_accounts ORDER BY strategy_id")
-                rows = c.fetchall()
-            finally:
-                conn.close()
+            rows = load_active_strategy_accounts()
             if not rows: return ""
 
             html = "<h2>🏦 全球多策略子基金台账概览 (Sandbox Benchmark Engine)</h2>\n"

@@ -3,7 +3,7 @@ import os
 import json
 import tempfile
 from datetime import datetime, timedelta
-from ingest import fetch_rss_feeds
+from ingest import fetch_rss_feeds, load_rss_fixture
 from score import score_article
 from dotenv import load_dotenv
 from cache_manager import (
@@ -141,20 +141,180 @@ def save_json_atomic(path, payload):
             os.unlink(temporary_path)
 
 
-def validate_rss_health(health, max_failure_ratio=0.5):
+def validate_rss_health(
+    health,
+    max_failure_ratio=0.5,
+    *,
+    min_healthy_ratio=0.0,
+    min_fresh_sources=1,
+    min_total_fresh_entries=1,
+    min_configured_sources=1,
+    article_count=None,
+    critical_source_groups=None,
+):
+    """Validate that RSS coverage is usable, not merely reachable.
+
+    A source can be reachable yet stale or unable to produce a single recent
+    entry.  Production therefore gates on healthy sources and fresh content in
+    addition to the hard-failure ratio.
+    """
     if not health:
         raise RuntimeError("RSS health check failed: no sources were configured")
+
+    ratio_settings = {
+        "max_failure_ratio": max_failure_ratio,
+        "min_healthy_ratio": min_healthy_ratio,
+    }
+    for name, value in ratio_settings.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name} must be numeric")
+        if not 0 <= float(value) <= 1:
+            raise ValueError(f"{name} must be between 0 and 1")
+
+    minimum_settings = {
+        "min_fresh_sources": min_fresh_sources,
+        "min_total_fresh_entries": min_total_fresh_entries,
+        "min_configured_sources": min_configured_sources,
+    }
+    for name, value in minimum_settings.items():
+        if type(value) is not int or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+
     failed = [item for item in health if item.get("status") == "failed"]
+    healthy = [item for item in health if item.get("status") == "healthy"]
+    fresh = [
+        item
+        for item in health
+        if item.get("status") != "failed"
+        and int(item.get("fresh_entries") or 0) > 0
+    ]
+    total_fresh_entries = sum(int(item.get("fresh_entries") or 0) for item in health)
     failure_ratio = len(failed) / len(health)
+    healthy_ratio = len(healthy) / len(health)
+    reasons = []
+    critical_group_summaries = []
+
+    if len(health) < min_configured_sources:
+        reasons.append(
+            f"configured sources {len(health)} below minimum {min_configured_sources}"
+        )
     if failure_ratio > max_failure_ratio:
-        raise RuntimeError(
-            f"RSS health check failed: {len(failed)}/{len(health)} sources unavailable"
+        reasons.append(
+            f"failed sources {len(failed)}/{len(health)} exceed "
+            f"{max_failure_ratio:.0%}"
+        )
+    if healthy_ratio < min_healthy_ratio:
+        reasons.append(
+            f"healthy sources {len(healthy)}/{len(health)} below "
+            f"{min_healthy_ratio:.0%}"
+        )
+    if len(fresh) < min_fresh_sources:
+        reasons.append(
+            f"fresh sources {len(fresh)} below minimum {min_fresh_sources}"
+        )
+    if total_fresh_entries < min_total_fresh_entries:
+        reasons.append(
+            f"fresh entries {total_fresh_entries} below minimum "
+            f"{min_total_fresh_entries}"
+        )
+    if article_count is not None and article_count != total_fresh_entries:
+        reasons.append(
+            f"article count {article_count} does not match source total "
+            f"{total_fresh_entries}"
         )
 
-def load_config(config_path="config.yaml"):
+    if critical_source_groups is None:
+        critical_source_groups = []
+    if not isinstance(critical_source_groups, list):
+        raise ValueError("critical_source_groups must be a list")
+    health_by_url = {str(item.get("url")): item for item in health}
+    seen_group_names = set()
+    for index, group in enumerate(critical_source_groups):
+        if not isinstance(group, dict):
+            raise ValueError(f"critical_source_groups[{index}] must be an object")
+        name = group.get("name")
+        sources = group.get("sources")
+        if not isinstance(name, str) or not name.strip() or name in seen_group_names:
+            raise ValueError(
+                f"critical_source_groups[{index}] has invalid/duplicate name"
+            )
+        seen_group_names.add(name)
+        if (
+            not isinstance(sources, list)
+            or not sources
+            or any(not isinstance(url, str) or not url.strip() for url in sources)
+            or len(sources) != len(set(sources))
+        ):
+            raise ValueError(
+                f"critical source group {name} must contain unique source URLs"
+            )
+        min_group_healthy = group.get("min_healthy_sources", 1)
+        min_group_fresh = group.get("min_fresh_sources", 1)
+        for setting_name, value in (
+            ("min_healthy_sources", min_group_healthy),
+            ("min_fresh_sources", min_group_fresh),
+        ):
+            if type(value) is not int or not 0 <= value <= len(sources):
+                raise ValueError(
+                    f"critical source group {name} {setting_name} must be between "
+                    f"0 and {len(sources)}"
+                )
+
+        group_health = [health_by_url[url] for url in sources if url in health_by_url]
+        missing = [url for url in sources if url not in health_by_url]
+        group_healthy = sum(item.get("status") == "healthy" for item in group_health)
+        group_fresh = sum(
+            item.get("status") != "failed"
+            and int(item.get("fresh_entries") or 0) > 0
+            for item in group_health
+        )
+        if missing:
+            reasons.append(
+                f"critical source group {name} missing {len(missing)} configured sources"
+            )
+        if group_healthy < min_group_healthy:
+            reasons.append(
+                f"critical source group {name} healthy sources {group_healthy} below "
+                f"minimum {min_group_healthy}"
+            )
+        if group_fresh < min_group_fresh:
+            reasons.append(
+                f"critical source group {name} fresh sources {group_fresh} below "
+                f"minimum {min_group_fresh}"
+            )
+        critical_group_summaries.append(
+            {
+                "name": name,
+                "configured_sources": len(group_health),
+                "expected_sources": len(sources),
+                "healthy_sources": group_healthy,
+                "fresh_sources": group_fresh,
+            }
+        )
+    if reasons:
+        raise RuntimeError("RSS health check failed: " + "; ".join(reasons))
+
+    return {
+        "configured_sources": len(health),
+        "failed_sources": len(failed),
+        "healthy_sources": len(healthy),
+        "fresh_sources": len(fresh),
+        "total_fresh_entries": total_fresh_entries,
+        "failure_ratio": failure_ratio,
+        "healthy_ratio": healthy_ratio,
+        "critical_source_groups": critical_group_summaries,
+    }
+
+
+def load_config(config_path=None):
+    config_path = config_path or os.environ.get("RADAR_CONFIG", "config.yaml")
     # P4.1: Graceful fallback for missing config.yaml
     if not os.path.exists(config_path):
-        example_path = "config.example.yaml"
+        example_path = os.path.join(
+            os.path.dirname(os.path.abspath(config_path)), "config.example.yaml"
+        )
+        if not os.path.exists(example_path) and config_path == "config.yaml":
+            example_path = "config.example.yaml"
         if os.path.exists(example_path):
             import shutil
             shutil.copy2(example_path, config_path)
@@ -165,7 +325,82 @@ def load_config(config_path="config.yaml"):
     with open(config_path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
 
-def generate_markdown_report(scored_articles, config, output_dir="reports"):
+SCORED_ARTICLES_FIXTURE_SCHEMA_VERSION = 1
+
+
+def load_scored_articles_fixture(path, rss_articles, config):
+    """Attach validated deterministic scores to the exact ingested URL set."""
+    fixture_path = os.path.abspath(os.fspath(path))
+    try:
+        with open(fixture_path, "r", encoding="utf-8") as handle:
+            fixture = json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"Cannot load scored-articles fixture {fixture_path}: {error}"
+        ) from error
+    if not isinstance(fixture, dict):
+        raise ValueError("scored-articles fixture must be a JSON object")
+    if set(fixture) != {"schema_version", "scores"}:
+        raise ValueError("scored-articles fixture has invalid top-level fields")
+    if fixture.get("schema_version") != SCORED_ARTICLES_FIXTURE_SCHEMA_VERSION:
+        raise ValueError("unsupported scored-articles fixture schema_version")
+    scores = fixture.get("scores")
+    if not isinstance(scores, list):
+        raise ValueError("scored-articles fixture scores must be a list")
+
+    rss_by_url = {}
+    for article in rss_articles:
+        link = article.get("link")
+        if not isinstance(link, str) or not link.strip() or link in rss_by_url:
+            raise ValueError("RSS articles must have unique non-empty links")
+        rss_by_url[link] = article
+
+    score_by_url = {}
+    for index, entry in enumerate(scores):
+        if not isinstance(entry, dict) or set(entry) != {"link", "score_data"}:
+            raise ValueError(
+                f"scored-articles fixture entry {index} must contain link and score_data"
+            )
+        link = entry.get("link")
+        if not isinstance(link, str) or not link.strip() or link in score_by_url:
+            raise ValueError(
+                f"scored-articles fixture entry {index} has invalid/duplicate link"
+            )
+        score_by_url[link] = entry.get("score_data")
+
+    rss_urls = set(rss_by_url)
+    score_urls = set(score_by_url)
+    if rss_urls != score_urls:
+        missing = sorted(rss_urls - score_urls)
+        unexpected = sorted(score_urls - rss_urls)
+        raise ValueError(
+            "scored-articles fixture URL mismatch: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+
+    from score import _apply_composite_scores, _validate_score_result, _validate_weights
+
+    weights = _validate_weights(config)
+    scored_articles = []
+    for article_id, article in enumerate(rss_articles):
+        raw_score = score_by_url[article["link"]]
+        if not isinstance(raw_score, dict):
+            raise ValueError(
+                f"scored-articles fixture score_data for {article['link']} must be an object"
+            )
+        score_data = _validate_score_result(dict(raw_score))
+        score_data = _apply_composite_scores(score_data, weights)
+        scored = dict(article)
+        scored["id"] = article_id
+        scored["score_data"] = score_data
+        scored_articles.append(scored)
+    return scored_articles
+
+
+def generate_markdown_report(
+    scored_articles, config, output_dir=None, *, deduplicate=True
+):
+    output_dir = output_dir or os.environ.get("RADAR_REPORTS_DIR", "reports")
     os.makedirs(output_dir, exist_ok=True)
     date_str = datetime.now().strftime("%Y-%m-%d")
     report_path = os.path.join(output_dir, f"industry_report_{date_str}.md")
@@ -191,7 +426,7 @@ def generate_markdown_report(scored_articles, config, output_dir="reports"):
         if i_score >= min_score or t_score >= min_score:
             high_scoring.append(a)
             
-    if high_scoring:
+    if high_scoring and deduplicate:
         print(f"Deduplicating {len(high_scoring)} high-scoring articles...", flush=True)
         from score import deduplicate_articles
         high_scoring = deduplicate_articles(high_scoring, config)
@@ -416,18 +651,38 @@ def main():
     print("Starting Dual-Track Industry Intelligence Gatherer...", flush=True)
     load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env'))
     config = load_config()
+    reports_dir = os.environ.get("RADAR_REPORTS_DIR", "reports")
     
     print("Fetching articles from RSS feeds...", flush=True)
     hours_back = config.get("output", {}).get("hours_back", 48)
-    articles, rss_health = fetch_rss_feeds(
-        config.get("rss_feeds", []), hours_back=hours_back, return_health=True
-    )
-    save_json_atomic(os.path.join("reports", "rss_health.json"), rss_health)
+    rss_fixture = os.environ.get("RADAR_RSS_FIXTURE")
+    if rss_fixture:
+        print(f"Loading deterministic RSS fixture: {rss_fixture}", flush=True)
+        articles, rss_health = load_rss_fixture(rss_fixture)
+    else:
+        articles, rss_health = fetch_rss_feeds(
+            config.get("rss_feeds", []), hours_back=hours_back, return_health=True
+        )
+    save_json_atomic(os.path.join(reports_dir, "rss_health.json"), rss_health)
     validate_rss_health(
         rss_health,
         max_failure_ratio=float(
             config.get("output", {}).get("rss_max_failure_ratio", 0.5)
         ),
+        min_healthy_ratio=float(
+            config.get("output", {}).get("rss_min_healthy_ratio", 0.0)
+        ),
+        min_fresh_sources=int(
+            config.get("output", {}).get("rss_min_fresh_sources", 1)
+        ),
+        min_total_fresh_entries=int(
+            config.get("output", {}).get("rss_min_total_fresh_entries", 1)
+        ),
+        min_configured_sources=int(
+            config.get("output", {}).get("rss_min_configured_sources", 1)
+        ),
+        article_count=len(articles),
+        critical_source_groups=config.get("rss_critical_source_groups", []),
     )
     print(f"Fetched {len(articles)} articles.", flush=True)
     
@@ -444,6 +699,21 @@ def main():
     if len(unique_articles) < len(articles):
         print(f"Pre-scoring deduplication removed {len(articles) - len(unique_articles)} duplicates. {len(unique_articles)} articles remaining.", flush=True)
     articles = unique_articles
+
+    scored_fixture = os.environ.get("RADAR_SCORED_ARTICLES_FIXTURE")
+    if scored_fixture:
+        print(
+            f"Loading deterministic scored-articles fixture: {scored_fixture}",
+            flush=True,
+        )
+        scored_articles = load_scored_articles_fixture(
+            scored_fixture, articles, config
+        )
+        report_path = generate_markdown_report(
+            scored_articles, config, deduplicate=False
+        )
+        print(f"\nReport generated successfully: {report_path}", flush=True)
+        return report_path
     
     # Load incremental cache
     cache_data = load_cache()

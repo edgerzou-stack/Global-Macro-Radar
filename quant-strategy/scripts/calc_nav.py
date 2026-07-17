@@ -7,9 +7,14 @@ import db_utils
 from core.cash_manager import CashManager
 from core.clock import clock
 from core.data_gateway import DataGateway
+from core.quarantine import quarantine_filter, quarantined_primary_keys
 
 
 data_gateway = DataGateway()
+
+
+class ValuationUnavailableError(RuntimeError):
+    """Raised when a production NAV cannot be supported by exact market data."""
 
 
 def _market_for_strategy(strategy):
@@ -30,17 +35,20 @@ def _positive_finite(value):
     return number if math.isfinite(number) and number > 0 else None
 
 
-def _close_on_date(frame, date, fallback):
-    if frame is None or frame.empty or "收盘" not in frame.columns:
+def _close_on_date(frame, date):
+    """Return the exact session close; never substitute another row."""
+    if (
+        frame is None
+        or frame.empty
+        or "日期" not in frame.columns
+        or "收盘" not in frame.columns
+    ):
         return None
-    selected = frame
-    if "日期" in frame.columns:
-        dates = frame["日期"].astype(str).str.replace("-", "", regex=False).str[:8]
-        exact = frame[dates == date]
-        if not exact.empty:
-            selected = exact
-    row = selected.iloc[0] if fallback == "first" else selected.iloc[-1]
-    return _positive_finite(row.get("收盘"))
+    dates = frame["日期"].astype(str).str.replace("-", "", regex=False).str[:8]
+    exact = frame[dates == date]
+    if exact.empty:
+        return None
+    return _positive_finite(exact.iloc[-1].get("收盘"))
 
 
 def _prepare_market_data(portfolio, today):
@@ -92,82 +100,115 @@ def _prepare_market_data(portfolio, today):
     return position_dates, market_data
 
 
+def _position_multiplier(strategy, symbol, position, position_dates, market_data):
+    entry_price = _positive_finite(position.get("entry_price"))
+    if entry_price is None:
+        raise ValuationUnavailableError(
+            f"{strategy}/{symbol} has no authoritative positive entry price"
+        )
+
+    valuation_dates = position_dates.get((strategy, symbol))
+    if valuation_dates is None:
+        raise ValuationUnavailableError(
+            f"{strategy}/{symbol} has no validated valuation date range"
+        )
+
+    fetch_symbol, entry_date, end_date = valuation_dates
+    frames = market_data.get(fetch_symbol, {})
+    adjusted = frames.get("hfq", pd.DataFrame())
+    raw = frames.get("", pd.DataFrame())
+    first_adjusted = _close_on_date(adjusted, entry_date)
+    first_raw = _close_on_date(raw, entry_date)
+    last_adjusted = _close_on_date(adjusted, end_date)
+    last_raw = _close_on_date(raw, end_date)
+    required = {
+        "entry_adjusted": first_adjusted,
+        "entry_raw": first_raw,
+        "valuation_adjusted": last_adjusted,
+        "valuation_raw": last_raw,
+    }
+    missing = sorted(name for name, value in required.items() if value is None)
+    if missing:
+        raise ValuationUnavailableError(
+            f"{strategy}/{symbol} is missing exact-session valuation fields: "
+            + ", ".join(missing)
+        )
+
+    factor_entry = first_adjusted / first_raw
+    factor_exit = last_adjusted / last_raw
+    factor_drift = abs(factor_exit - factor_entry) / factor_entry
+    if not math.isfinite(factor_drift) or factor_drift > 0.2:
+        raise ValuationUnavailableError(
+            f"{strategy}/{symbol} adjusted/raw factor drift is unsafe: "
+            f"{factor_drift:.6f}"
+        )
+
+    multiplier = (last_raw * factor_exit) / (entry_price * factor_entry)
+    if not math.isfinite(multiplier) or multiplier <= 0:
+        raise ValuationUnavailableError(
+            f"{strategy}/{symbol} produced an invalid NAV multiplier"
+        )
+    return multiplier
+
+
 def calc_nav():
     old_portfolio, _ = db_utils.load_portfolio_and_trades()
     today = clock.today()
     position_dates, market_data = _prepare_market_data(old_portfolio, today)
     cash_manager = CashManager()
-    current_price_fallback = {}
 
     conn = db_utils.get_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT strategy_id, available_cash, total_capital FROM strategy_accounts")
+        account_filter, account_parameters, _ = quarantine_filter(
+            conn, "strategy_accounts"
+        )
+        cursor.execute(
+            "SELECT strategy_id, available_cash, total_capital "
+            "FROM strategy_accounts WHERE 1=1" + account_filter,
+            account_parameters,
+        )
         accounts = cursor.fetchall()
-
+        quarantined_nav_keys = quarantined_primary_keys(
+            conn, "strategy_nav_history"
+        )
+        valuations = []
         for strategy, cash, _total_capital in accounts:
-            holdings_value = 0.0
+            if (str(today), strategy) in quarantined_nav_keys:
+                raise ValuationUnavailableError(
+                    f"{strategy} NAV row for {today} is quarantined"
+                )
+            cash = _positive_finite(cash) if cash != 0 else 0.0
+            if cash is None:
+                raise ValuationUnavailableError(
+                    f"{strategy} has invalid available cash"
+                )
             positions = old_portfolio.get(strategy, {})
-
+            holding_values = []
             for symbol, position in positions.items():
-                entry_price = _positive_finite(position.get("entry_price"))
-                tranches = _positive_finite(position.get("shares", 1)) or 1.0
+                tranches = _positive_finite(position.get("shares"))
+                if tranches is None:
+                    raise ValuationUnavailableError(
+                        f"{strategy}/{symbol} has invalid tranche quantity"
+                    )
                 invested_capital = cash_manager.get_tranche_size(strategy) * tranches
-                multiplier = 1.0
+                multiplier = _position_multiplier(
+                    strategy,
+                    symbol,
+                    position,
+                    position_dates,
+                    market_data,
+                )
+                holding_values.append(invested_capital * multiplier)
 
-                valuation_dates = position_dates.get((strategy, symbol))
-                if entry_price is not None and valuation_dates:
-                    fetch_symbol, entry_date, end_date = valuation_dates
-                    frames = market_data.get(fetch_symbol, {})
-                    adjusted = frames.get("hfq", pd.DataFrame())
-                    raw = frames.get("", pd.DataFrame())
-
-                    current_price = _close_on_date(raw, end_date, "last")
-                    if current_price is None:
-                        if fetch_symbol not in current_price_fallback:
-                            try:
-                                current_price_fallback[fetch_symbol] = _positive_finite(
-                                    data_gateway.get_current_price(fetch_symbol)
-                                )
-                            except Exception as error:
-                                print(
-                                    f"Failed to fetch current price for {symbol} in "
-                                    f"{strategy} during NAV calculation: {error}"
-                                )
-                                current_price_fallback[fetch_symbol] = None
-                        current_price = current_price_fallback[fetch_symbol]
-
-                    if current_price is not None:
-                        first_adjusted = _close_on_date(adjusted, entry_date, "first")
-                        first_raw = _close_on_date(raw, entry_date, "first")
-                        last_adjusted = _close_on_date(adjusted, end_date, "last")
-                        last_raw = _close_on_date(raw, end_date, "last")
-
-                        if all(
-                            value is not None
-                            for value in (first_adjusted, first_raw, last_adjusted, last_raw)
-                        ):
-                            factor_entry = first_adjusted / first_raw
-                            factor_exit = last_adjusted / last_raw
-                            if abs(factor_exit - factor_entry) / factor_entry > 0.2:
-                                print(
-                                    f"WARNING: Data source mix detected for {symbol}. "
-                                    "Holding NAV at cost until data reconciles."
-                                )
-                            else:
-                                adjusted_entry = entry_price * factor_entry
-                                adjusted_current = current_price * factor_exit
-                                multiplier = adjusted_current / adjusted_entry
-                        else:
-                            multiplier = current_price / entry_price
-
-                if not math.isfinite(multiplier) or multiplier <= 0:
-                    multiplier = 1.0
-                holdings_value += invested_capital * multiplier
-
+            holdings_value = math.fsum(holding_values)
             total_nav = cash + holdings_value
             if not math.isfinite(total_nav):
                 raise ValueError(f"Non-finite NAV for {strategy}")
+            valuations.append((strategy, cash, holdings_value, total_nav))
+
+        cursor.execute("BEGIN TRANSACTION")
+        for strategy, cash, holdings_value, total_nav in valuations:
             print(
                 f"[NAV Tracker] {strategy} - NAV: {total_nav:,.2f} | "
                 f"Cash: {cash:,.2f} | Holdings: {holdings_value:,.2f}"
@@ -186,6 +227,15 @@ def calc_nav():
             )
 
         conn.commit()
+        return {
+            "date": str(today),
+            "strategies": len(valuations),
+            "positions": sum(len(positions) for positions in old_portfolio.values()),
+            "valuation_coverage": 1.0,
+        }
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 

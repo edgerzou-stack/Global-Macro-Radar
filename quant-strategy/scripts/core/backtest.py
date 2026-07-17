@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 import pandas as pd
 
@@ -36,6 +36,8 @@ class PointInTimeBacktest:
         initial_cash: float = 1_000_000.0,
         commission_rate: float = 0.0,
         slippage_bps: float = 0.0,
+        corporate_actions: Optional[Iterable[Mapping[str, Any]]] = None,
+        manifest_context: Optional[Mapping[str, Any]] = None,
     ):
         self.initial_cash = self._finite_non_negative(initial_cash, "initial_cash")
         if self.initial_cash <= 0:
@@ -45,11 +47,19 @@ class PointInTimeBacktest:
         )
         self.slippage_bps = self._finite_non_negative(slippage_bps, "slippage_bps")
         self.prices = self._validate_prices(prices)
+        self.corporate_actions = self._validate_corporate_actions(
+            corporate_actions or []
+        )
+        self.manifest_context = dict(manifest_context or {})
         self._dates = self.prices["date"].drop_duplicates().tolist()
         self._prices_by_date = {
             date: frame.set_index("symbol")
             for date, frame in self.prices.groupby("date", sort=True)
         }
+        self._actions_by_date = {
+            date: frame.to_dict(orient="records")
+            for date, frame in self.corporate_actions.groupby("date", sort=True)
+        } if not self.corporate_actions.empty else {}
 
     @staticmethod
     def _finite_non_negative(value: Any, name: str) -> float:
@@ -69,7 +79,8 @@ class PointInTimeBacktest:
         if missing:
             raise BacktestDataError(f"prices missing columns: {', '.join(missing)}")
 
-        result = prices.loc[:, cls.PRICE_COLUMNS].copy()
+        optional = [column for column in ("fx_to_base", "delisted") if column in prices]
+        result = prices.loc[:, list(cls.PRICE_COLUMNS) + optional].copy()
         parsed_dates = pd.to_datetime(result["date"], errors="coerce")
         if parsed_dates.isna().any():
             raise BacktestDataError("prices contain invalid dates")
@@ -88,7 +99,60 @@ class PointInTimeBacktest:
             if not valid.all():
                 raise BacktestDataError(f"prices contain invalid {column} values")
 
+        if "fx_to_base" not in result:
+            result["fx_to_base"] = 1.0
+        result["fx_to_base"] = pd.to_numeric(result["fx_to_base"], errors="coerce")
+        valid_fx = result["fx_to_base"].map(
+            lambda value: math.isfinite(float(value)) and float(value) > 0
+        )
+        if not valid_fx.all():
+            raise BacktestDataError("prices contain invalid fx_to_base values")
+        if "delisted" not in result:
+            result["delisted"] = False
+        if not result["delisted"].map(lambda value: type(value) is bool).all():
+            raise BacktestDataError("prices.delisted must be boolean")
+
         return result.sort_values(["date", "symbol"], kind="stable").reset_index(drop=True)
+
+    @classmethod
+    def _validate_corporate_actions(cls, actions):
+        columns = ["date", "symbol", "type", "value"]
+        if not actions:
+            return pd.DataFrame(columns=columns)
+        frame = pd.DataFrame(list(actions))
+        missing = [column for column in columns if column not in frame]
+        if missing:
+            raise BacktestDataError(
+                f"corporate actions missing columns: {', '.join(missing)}"
+            )
+        frame = frame.loc[:, columns].copy()
+        parsed_dates = pd.to_datetime(frame["date"], errors="coerce")
+        if parsed_dates.isna().any():
+            raise BacktestDataError("corporate actions contain invalid dates")
+        frame["date"] = parsed_dates.dt.strftime("%Y-%m-%d")
+        frame["symbol"] = frame["symbol"].astype(str).str.strip()
+        if frame["symbol"].eq("").any():
+            raise BacktestDataError("corporate actions contain an empty symbol")
+        if not frame["type"].isin({"split", "cash_dividend"}).all():
+            raise BacktestDataError("unsupported corporate action type")
+        frame["value"] = pd.to_numeric(frame["value"], errors="coerce")
+        valid = frame["value"].map(
+            lambda value: math.isfinite(float(value)) and float(value) >= 0
+        )
+        if not valid.all() or (
+            (frame["type"] == "split") & (frame["value"] <= 0)
+        ).any():
+            raise BacktestDataError("invalid corporate action value")
+        if frame.duplicated(["date", "symbol", "type"]).any():
+            raise BacktestDataError("duplicate corporate action")
+        # A same-session split changes the share count on which a declared
+        # per-share cash distribution is based.  Make that ordering explicit.
+        frame["_type_order"] = frame["type"].map({"split": 0, "cash_dividend": 1})
+        return (
+            frame.sort_values(["date", "symbol", "_type_order"], kind="stable")
+            .drop(columns="_type_order")
+            .reset_index(drop=True)
+        )
 
     @staticmethod
     def _validate_signals(signals: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -129,11 +193,13 @@ class PointInTimeBacktest:
 
     def _manifest_hash(self, signals: List[Dict[str, Any]]) -> str:
         payload = {
-            "engine": "point-in-time-v1",
+            "engine": "point-in-time-v2",
             "initial_cash": self.initial_cash,
             "commission_rate": self.commission_rate,
             "slippage_bps": self.slippage_bps,
             "prices": self.prices.to_dict(orient="records"),
+            "corporate_actions": self.corporate_actions.to_dict(orient="records"),
+            "context": self.manifest_context,
             "signals": [
                 {"date": item["date"], "weights": item["weights"]}
                 for item in signals
@@ -141,6 +207,41 @@ class PointInTimeBacktest:
         }
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _base_price(day, symbol, column):
+        return float(day.at[symbol, column]) * float(day.at[symbol, "fx_to_base"])
+
+    def _apply_corporate_actions(self, date, day, cash, quantities, fill_rows):
+        for action in self._actions_by_date.get(date, []):
+            symbol = action["symbol"]
+            quantity = quantities.get(symbol, 0.0)
+            if quantity <= 1e-12:
+                continue
+            if symbol not in day.index:
+                raise BacktestDataError(
+                    f"missing FX/price row for corporate action on {date}: {symbol}"
+                )
+            if action["type"] == "split":
+                quantities[symbol] = quantity * float(action["value"])
+            else:
+                cash_amount = (
+                    quantity
+                    * float(action["value"])
+                    * float(day.at[symbol, "fx_to_base"])
+                )
+                cash += cash_amount
+                self._record_fill(
+                    fill_rows,
+                    date,
+                    date,
+                    symbol,
+                    "DIVIDEND",
+                    quantity,
+                    float(action["value"]) * float(day.at[symbol, "fx_to_base"]),
+                    0.0,
+                )
+        return cash
 
     def run(self, signals: Iterable[Dict[str, Any]]) -> BacktestResult:
         clean_signals = self._validate_signals(signals)
@@ -151,6 +252,10 @@ class PointInTimeBacktest:
         next_signal = 0
 
         for date in self._dates:
+            day = self._prices_by_date[date]
+            cash = self._apply_corporate_actions(
+                date, day, cash, quantities, fill_rows
+            )
             eligible = []
             while (
                 next_signal < len(clean_signals)
@@ -171,14 +276,27 @@ class PointInTimeBacktest:
                     fill_rows,
                 )
 
-            day = self._prices_by_date[date]
             missing_marks = sorted(set(quantities) - set(day.index))
             if missing_marks:
                 raise BacktestDataError(
                     f"missing close marks on {date}: {', '.join(missing_marks)}"
                 )
+            delisted_symbols = sorted(
+                symbol
+                for symbol in quantities
+                if bool(day.at[symbol, "delisted"])
+            )
+            for symbol in delisted_symbols:
+                quantity = quantities.pop(symbol)
+                price = self._base_price(day, symbol, "close")
+                notional = quantity * price
+                fee = notional * self.commission_rate
+                cash += notional - fee
+                self._record_fill(
+                    fill_rows, date, date, symbol, "DELIST", quantity, price, fee
+                )
             holdings_value = sum(
-                quantity * float(day.at[symbol, "close"])
+                quantity * self._base_price(day, symbol, "close")
                 for symbol, quantity in quantities.items()
             )
             nav = cash + holdings_value
@@ -221,11 +339,11 @@ class PointInTimeBacktest:
             )
 
         nav_open = cash + sum(
-            quantity * float(day.at[symbol, "open"])
+            quantity * self._base_price(day, symbol, "open")
             for symbol, quantity in quantities.items()
         )
         desired = {
-            symbol: nav_open * weight / float(day.at[symbol, "open"])
+            symbol: nav_open * weight / self._base_price(day, symbol, "open")
             for symbol, weight in signal["weights"].items()
         }
 
@@ -236,7 +354,7 @@ class PointInTimeBacktest:
             if target_quantity >= current_quantity - 1e-12:
                 continue
             quantity = current_quantity - target_quantity
-            price = float(day.at[symbol, "open"]) * (1 - self.slippage_bps / 10_000)
+            price = self._base_price(day, symbol, "open") * (1 - self.slippage_bps / 10_000)
             notional = quantity * price
             fee = notional * self.commission_rate
             cash += notional - fee
@@ -251,7 +369,7 @@ class PointInTimeBacktest:
             requested = desired[symbol] - current_quantity
             if requested <= 1e-12:
                 continue
-            price = float(day.at[symbol, "open"]) * (1 + self.slippage_bps / 10_000)
+            price = self._base_price(day, symbol, "open") * (1 + self.slippage_bps / 10_000)
             unit_cost = price * (1 + self.commission_rate)
             quantity = min(requested, cash / unit_cost)
             if quantity <= 1e-12:

@@ -14,7 +14,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 
 def main():
-    config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
+    config_path = os.environ.get(
+        "RADAR_CONFIG", os.path.join(os.path.dirname(__file__), "config.yaml")
+    )
     if not os.path.exists(config_path):
         logging.error("Config file not found: %s", config_path)
         return 1
@@ -22,17 +24,34 @@ def main():
         config = yaml.safe_load(handle) or {}
     feeds = config.get("rss_feeds", [])
     hours_back = config.get("output", {}).get("hours_back", 48)
-    _, health = fetch_rss_feeds(
+    articles, health = fetch_rss_feeds(
         feeds, hours_back=hours_back, return_health=True
     )
-    artifact = os.path.join(os.path.dirname(__file__), "reports", "rss_health.json")
+    reports_dir = os.environ.get(
+        "RADAR_REPORTS_DIR", os.path.join(os.path.dirname(__file__), "reports")
+    )
+    artifact = os.path.join(reports_dir, "rss_health.json")
     save_json_atomic(artifact, health)
     try:
         validate_rss_health(
             health,
             float(config.get("output", {}).get("rss_max_failure_ratio", 0.5)),
+            min_healthy_ratio=float(
+                config.get("output", {}).get("rss_min_healthy_ratio", 0.0)
+            ),
+            min_fresh_sources=int(
+                config.get("output", {}).get("rss_min_fresh_sources", 1)
+            ),
+            min_total_fresh_entries=int(
+                config.get("output", {}).get("rss_min_total_fresh_entries", 1)
+            ),
+            min_configured_sources=int(
+                config.get("output", {}).get("rss_min_configured_sources", 1)
+            ),
+            article_count=len(articles),
+            critical_source_groups=config.get("rss_critical_source_groups", []),
         )
-    except RuntimeError as error:
+    except (RuntimeError, ValueError) as error:
         logging.error("%s", error)
         return 1
     logging.info("RSS health passed; artifact written to %s", artifact)
