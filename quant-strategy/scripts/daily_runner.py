@@ -361,10 +361,12 @@ def _run_pipeline_inner(context, checkpoint_path=None, popen_factory=subprocess.
         ],
         PROJECT_DIR,
     )
-    run_cmd(
-        quant_python + [os.path.join(SCRIPTS_DIR, "send_unified_email.py")],
-        PROJECT_DIR,
-    )
+    delivery_command = quant_python + [
+        os.path.join(SCRIPTS_DIR, "send_unified_email.py")
+    ]
+    if context.delivery_mode is DeliveryMode.LIVE:
+        delivery_command.append("--confirm-live-delivery")
+    run_cmd(delivery_command, PROJECT_DIR)
 
     manifest_path = context.artifact_root / context.run_id / "run-manifest.json"
     write_artifact_envelope(
