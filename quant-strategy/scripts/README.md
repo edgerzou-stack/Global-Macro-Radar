@@ -71,5 +71,7 @@ python3 quant-strategy/scripts/production_release.py \
 - `live-shadow` 不等于 `shadow_runner --allow-live-api`。
 - 非 production 强制禁真实订单；所有模式 delivery 默认 sink。
 - 真实 SMTP 需要 production + 双重显式确认。
+- 邮件 CLI 自身再次要求 `--confirm-live-delivery`；审核后的 HTML 可配合
+  `--html-file` 和 `--expected-html-sha256` 单独发送，不触发数据库写入。
 - scheduler 默认关闭，持久运行需 `--enable-scheduler`。
 - 成功以 durable run manifest 和 delivery journal 为准，不只看进程退出码。

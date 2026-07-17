@@ -28,7 +28,7 @@ Global Macro Radar 是一个把实时产业新闻、全球多市场筛选、模�
 | `live-shadow` | 隔离 test DB | 禁用 | sink | 不提供时使用真实源 |
 | `production` | canonical production DB | 受显式确认与 fence 保护 | 默认 sink | 可选 |
 
-所有入口都要求显式 mode/database。production 还要求 canonical path 和二次写入确认；真实 SMTP 需要额外的 `--delivery-mode live --confirm-live-delivery`。scheduler 默认关闭。
+所有入口都要求显式 mode/database。production 还要求 canonical path 和二次写入确认；真实 SMTP 需要额外的 `--delivery-mode live --confirm-live-delivery`，邮件发送器本身也会再次校验该确认。scheduler 默认关闭。
 
 运行时使用 SQLite Online Backup、writer fence、run identity、原子 checkpoint/resume 和 durable manifest。异常 legacy 数据只允许 quarantine，不猜测价格、成本或 PnL。
 
@@ -86,6 +86,11 @@ python3 -c 'import db_utils; connection=db_utils.init_db(); connection.close()'
 ```
 
 成功不能只看退出码：同时核对 release/run manifest、delivery journal、数据库完整性和生产库前后哈希。完整的恢复、调度、Docker 与维护窗口协议见 [OPERATIONS.md](OPERATIONS.md)。
+
+已审核的 sink HTML 可以通过邮件 CLI 的 `--html-file`、
+`--expected-html-sha256` 与 `--confirm-live-delivery` 参数单独投递，不需要重跑
+策略或改写数据库。发送器默认加载仓库根目录 `.env`，并将 data URI 图表转换
+为 CID inline parts；具体 canary 和失败恢复流程见 [OPERATIONS.md](OPERATIONS.md)。
 
 ## 可靠性边界
 

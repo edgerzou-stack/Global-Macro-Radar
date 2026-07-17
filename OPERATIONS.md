@@ -182,6 +182,34 @@ sink and live delivery. A live delivery journal left in `sending` state is
 ambiguous and must be reconciled with the SMTP provider; never delete it to
 force an automatic retry.
 
+The sender loads the repository `.env` by default. Use `--env-file` or
+`RADAR_ENV` only when the credential file lives elsewhere. The low-level sender
+also enforces `--confirm-live-delivery`; invoking it directly cannot bypass the
+second acknowledgement used by the unified runner.
+
+To send an exact HTML artifact that has already been reviewed, calculate its
+SHA-256 and give the delivery a new run ID. This path performs no database or
+strategy work:
+
+```bash
+sha256sum /absolute/artifacts/reviewed-report.html
+
+python3 quant-strategy/scripts/send_unified_email.py \
+  --mode live \
+  --confirm-live-delivery \
+  --run-id unique-mail-canary \
+  --artifact-dir /absolute/artifacts/mail-canary \
+  --html-file /absolute/artifacts/reviewed-report.html \
+  --expected-html-sha256 64_HEX_DIGEST
+```
+
+Live delivery converts base64 data images to related CID parts for broader mail
+client compatibility. A connection, TLS or login failure is recorded as
+`failed_pre_send` and may be retried with the same run ID. A failure after the
+journal enters `sending` remains ambiguous and must never be automatically
+retried. A successful journal must end in `delivered` and record the intended
+recipient, HTML hash and inline image count.
+
 Before a production run, verify the database backup destination, delivery
 recipients, API credentials, market date and that no release or other writer
 holds the database fence. Do not set `FORCE_RUN=1` in routine production.
