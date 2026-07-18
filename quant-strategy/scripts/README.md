@@ -60,7 +60,11 @@ python3 quant-strategy/scripts/production_release.py \
 | 报告 | `plot_pnl.py`, `generate_report.py`, `send_unified_email.py` | 图表、HTML/Markdown 和 outbox |
 | 验收 | `shadow_runner.py` | 隔离 shadow 与只读 live probes |
 | 迁移 | `production_release.py`, `migrations/` | v6、quarantine、copy/restore 演练 |
+| 审计恢复 | `rebuild_dividend_ledger.py` | 从版本化事件清单重建红利账本的新数据库副本 |
 | 回测 | `backtest_engine.py`, `core/backtest.py` | PIT 执行和审计 |
+
+`repair_db_prices.py` 是永久停用的兼容入口。成交价必须保留原始价格，任何历史恢复都
+不得以前/后复权收盘价覆盖成交字段。
 
 目录中的 `test_*.py` 诊断脚本不是专有回归套件；正式测试位于 private Core 的 `quant-strategy/tests`、`industry-radar/tests` 和根 `tests`，public 仓库不发布这些专有 tests/CI。
 

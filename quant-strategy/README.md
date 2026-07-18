@@ -33,6 +33,24 @@ legacy `portfolio`、`trade_history`、`strategy_accounts` 仍是统一日流程
 - NAV 使用各市场最近已完成交易日的精确收盘；异常 open 字段可被隔离，但 close 仍必须位于 high/low 内
 - NAV 任一仓位不可权威估值时整笔事务回滚
 
+### 红利旧账恢复
+
+`dividend_a_stock` 的 2026-07 历史账本曾被后复权收盘价污染。禁止用复权价回写
+`portfolio.entry_price` 或 `trade_history` 的成交字段；`repair_db_prices.py` 已永久停用。
+恢复必须使用版本化事件清单和只写新副本的工具：
+
+```bash
+PYTHONPATH=quant-strategy/scripts python3 \
+  quant-strategy/scripts/rebuild_dividend_ledger.py \
+  --source-db /absolute/path/to/quant_system.db \
+  --output-db /absolute/path/to/new-dividend-ledger.db \
+  --report /absolute/path/to/reconciliation.json
+```
+
+该命令校验双源原始 OHLC、事件顺序、现金/NAV 闭合、其他策略逐行摘要以及
+`strategy_daily_results` 整表摘要，并把输出固定为无 WAL 依赖的独立数据库。它不会
+原地修改源库；生产替换仍受 writer fence、备份和维护窗口约束。
+
 ## 回测正确性
 
 PIT 回测合同要求：
