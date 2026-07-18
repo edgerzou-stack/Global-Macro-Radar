@@ -31,6 +31,8 @@ Industry Radar 负责采集产业新闻、执行 RSS 健康闸门、去重、LLM
 
 Provider 顺序由配置决定，只有具备凭证且被启用的 provider 才参与。不是固定的 Gemini → OpenAI → DeepSeek 链。缓存键绑定正文、prompt、模型和评分配置版本，使用原子替换；缓存命中不会重新计费，内容或评分合同改变会自动失效。
 
+当前项目策略显式设置 `gemini.enabled: false`，并从 provider 顺序中移除 Gemini；即使本机仍存在 `GEMINI_API_KEY`，也不会创建 Gemini 客户端或发送请求。新闻阶段优先使用 DeepSeek，量化模块使用同一禁用策略。
+
 去重分两层：本地字符串/事件分组和 LLM 高分事件合并。Deep Dive 只在阈值触发时运行；网页正文不可得时会明确降级，不能声称总能定位独立原始来源。
 
 ## 运行

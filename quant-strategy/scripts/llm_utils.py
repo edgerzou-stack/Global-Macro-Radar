@@ -27,6 +27,21 @@ except ImportError as e:
     _call_llm_with_fallback = None
     print(f"Failed to import llm_router from {radar_root}: {e}")
 
+
+# The quant pipeline must never infer Gemini availability merely from a key in
+# the parent process.  Gemini is explicitly disabled; DeepSeek is the primary
+# provider and OpenAI remains an optional configured fallback.
+QUANT_LLM_CONFIG = {
+    "llm": {
+        "order": ["deepseek", "openai"],
+        "providers": {
+            "gemini": {"enabled": False},
+            "deepseek": {"enabled": True},
+            "openai": {"enabled": True},
+        },
+    }
+}
+
 def call_llm(prompt, require_json=False):
     """
     Systematically routes all LLM calls through industry-radar's Triple-Tier Cascade Router.
@@ -36,10 +51,11 @@ def call_llm(prompt, require_json=False):
         return {} if require_json else "LLM Router not found."
     
     try:
-        # We pass a generic system prompt. The router will automatically fallback through Gemini -> OpenAI -> DeepSeek
+        # Use the project-wide provider policy; Gemini remains disabled even if
+        # the invoking agent exports a GEMINI_API_KEY.
         res = _call_llm_with_fallback(
             prompt=prompt,
-            config=None,
+            config=QUANT_LLM_CONFIG,
             system_prompt="You are a helpful assistant designed to output JSON.",
             title_context="Quant Strategy Call"
         )

@@ -90,5 +90,7 @@
 - 数据库完整性、NAV、后市账本检查、图表、报告及邮件交付阶段全部通过。
 - 邮件以 `sink` 模式生成给 `1048292136@qq.com` 的完整 HTML，没有执行真实 SMTP。
 - Gemini 免费额度返回 429 后按设计降级到 DeepSeek；该降级没有影响红利量化筛选和账本。
+- 验收后已在本机运行配置与提交模板中显式设置 `gemini.enabled: false`，并让量化 LLM
+  路由固定从 DeepSeek 开始；后续运行即使环境仍存在 Gemini key 也不会创建 Gemini 客户端。
 - 生产数据库 SHA-256 仍为
   `eb3e442787f136d6cbae5161b43170dfd70eedf8514dbf9d3437d2fd3825c5c0`。

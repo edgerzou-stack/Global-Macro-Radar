@@ -78,6 +78,19 @@ rss_critical_source_groups:
     min_healthy_sources: 2
     min_fresh_sources: 2
 
+# Gemini is intentionally disabled.  Its key may remain present locally, but
+# the router will neither construct a Gemini client nor send Gemini requests.
+llm:
+  order: ["deepseek", "openai"]
+  providers:
+    gemini:
+      enabled: false
+    deepseek:
+      enabled: true
+      model: "deepseek-chat"
+    openai:
+      enabled: false
+
 output:
   format: "markdown"
   language: "Chinese"
