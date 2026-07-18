@@ -31,6 +31,7 @@ legacy `portfolio`、`trade_history`、`strategy_accounts` 仍是统一日流程
 - 无退出价时保持持仓，不用猜测价格强行成交
 - quarantine 只隔离审计指定的原始行，不删除或推测修复
 - NAV 使用各市场最近已完成交易日的精确收盘；异常 open 字段可被隔离，但 close 仍必须位于 high/low 内
+- 只有与已认证活跃会话完全匹配的当日新仓可暂按权威成本估值；会话不明或未来日期继续 fail closed
 - NAV 任一仓位不可权威估值时整笔事务回滚
 
 ### 红利旧账恢复

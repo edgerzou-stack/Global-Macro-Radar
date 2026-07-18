@@ -49,12 +49,14 @@
 
 - 专项重建测试：4 passed。
 - 账本、交易完整性、NAV、执行账本、writer fence、生产发布回归：55 passed。
-- private Core 全量 quant-strategy 测试：297 passed，1 deselected。
+- private Core 最新 `main` 全量 quant-strategy 测试：301 passed，1 deselected。
 - SQLite `PRAGMA integrity_check`：`ok`。
 - SQLite `PRAGMA foreign_key_check`：0 项。
 - `check_db_integrity.py`：通过。
 - `check_ledger_sanity.py --effective-date 2026-07-17`：通过。
 - 重建重复运行输出数据库 SHA-256 一致。
+- 当日新仓 NAV 接口已统一为显式未结算持仓集合：只有启用会话身份校验且成交日与
+  活跃会话一致时按成本乘数 1.0 估值；会话不明、不匹配或未来日期均拒绝并回滚。
 
 ## 产物与哈希
 

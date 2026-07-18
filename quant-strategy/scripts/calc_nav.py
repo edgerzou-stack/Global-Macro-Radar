@@ -67,9 +67,10 @@ def _adjustment_factor_drift(frames, start_date, end_date):
 
 
 def _prepare_market_data(portfolio, today):
-    """Fetch each symbol/adjust pair once for the complete valuation range."""
+    """Prepare exact-session prices and explicitly track active-session entries."""
     requirements = {}
     position_dates = {}
+    unsettled_positions = set()
     for strategy, positions in portfolio.items():
         market = _market_for_strategy(strategy)
         end_raw = datetime.datetime.strptime(
@@ -100,11 +101,7 @@ def _prepare_market_data(portfolio, today):
                     # A position executed in the currently active session has
                     # no official close yet.  Until that session completes,
                     # value only that exact position at authoritative cost.
-                    position_dates[(strategy, symbol)] = (
-                        None,
-                        entry_date,
-                        end_date,
-                    )
+                    unsettled_positions.add((strategy, symbol))
                     continue
                 raise ValuationUnavailableError(
                     f"{strategy}/{symbol} entry session {entry_date} is later "
@@ -153,25 +150,34 @@ def _prepare_market_data(portfolio, today):
                 print(f"Failed to refresh mismatched valuation series for {symbol}: {error}")
         market_data[symbol] = frames
 
-    return position_dates, market_data
+    return position_dates, market_data, unsettled_positions
 
 
-def _position_multiplier(strategy, symbol, position, position_dates, market_data):
+def _position_multiplier(
+    strategy,
+    symbol,
+    position,
+    position_dates,
+    market_data,
+    unsettled_positions,
+):
     entry_price = _positive_finite(position.get("entry_price"))
     if entry_price is None:
         raise ValuationUnavailableError(
             f"{strategy}/{symbol} has no authoritative positive entry price"
         )
 
-    valuation_dates = position_dates.get((strategy, symbol))
+    position_key = (strategy, symbol)
+    if position_key in unsettled_positions:
+        return 1.0
+
+    valuation_dates = position_dates.get(position_key)
     if valuation_dates is None:
         raise ValuationUnavailableError(
             f"{strategy}/{symbol} has no validated valuation date range"
         )
 
     fetch_symbol, entry_date, end_date = valuation_dates
-    if fetch_symbol is None:
-        return 1.0
     frames = market_data.get(fetch_symbol, {})
     adjusted = frames.get("hfq", pd.DataFrame())
     raw = frames.get("", pd.DataFrame())
@@ -212,7 +218,9 @@ def _position_multiplier(strategy, symbol, position, position_dates, market_data
 def calc_nav():
     old_portfolio, _ = db_utils.load_portfolio_and_trades()
     today = clock.today()
-    position_dates, market_data = _prepare_market_data(old_portfolio, today)
+    position_dates, market_data, unsettled_positions = _prepare_market_data(
+        old_portfolio, today
+    )
     cash_manager = CashManager()
 
     conn = db_utils.get_connection()
@@ -257,6 +265,7 @@ def calc_nav():
                     position,
                     position_dates,
                     market_data,
+                    unsettled_positions,
                 )
                 holding_values.append(invested_capital * multiplier)
 
