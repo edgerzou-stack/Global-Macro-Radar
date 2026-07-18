@@ -250,10 +250,6 @@ def _run_pipeline_inner(context, checkpoint_path=None, popen_factory=subprocess.
 
     def run_cmd(cmd, cwd):
         command_key = shlex.join(cmd)
-        if command_key in checkpoint_data["completed_steps"]:
-            logger.info(f"Skipping already completed step: {command_key}")
-            return
-
         logger.info(f"Running: {command_key}")
 
         env = os.environ.copy()

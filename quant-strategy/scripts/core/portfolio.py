@@ -1,5 +1,6 @@
 import datetime
 import math
+import os
 import pytz
 import yfinance as yf
 import akshare as ak
@@ -64,6 +65,26 @@ class PortfolioManager:
             # Execution must fail closed if the calendar cannot be evaluated.
             return 0.0
 
+    @staticmethod
+    def _snapshot_matches_market_session(market_type: str, snapshot_date: str) -> bool:
+        if os.environ.get("PIPELINE_ENFORCE_SESSION_IDENTITY") != "1":
+            return True
+        from core.market import AShareMarket, HKMarket, USMarket
+
+        if "_us_" in market_type:
+            market = USMarket()
+        elif "_hk_" in market_type:
+            market = HKMarket()
+        else:
+            market = AShareMarket()
+        try:
+            return (
+                str(snapshot_date)[:10]
+                == market.get_current_time().date().isoformat()
+            )
+        except Exception:
+            return False
+
     def resolve_pending_prices(self):
         """
         Scans portfolio and trade_history for 0.0 (Pending) prices.
@@ -111,6 +132,11 @@ class PortfolioManager:
                 FROM portfolio
                 WHERE (entry_price IS NULL OR entry_price <= 0.0)
                 """ + portfolio_exclusion
+                + (
+                    " AND strategy NOT LIKE 'test\\_%' ESCAPE '\\'"
+                    if os.environ.get("PIPELINE_EXCLUDE_TEST_STRATEGIES") == "1"
+                    else ""
+                )
             )
             portfolio_pending = cursor.fetchall()
 
@@ -122,6 +148,11 @@ class PortfolioManager:
                 WHERE (entry_price IS NULL OR entry_price <= 0.0
                    OR exit_price IS NULL OR exit_price <= 0.0)
                 """ + trade_exclusion
+                + (
+                    " AND strategy NOT LIKE 'test\\_%' ESCAPE '\\'"
+                    if os.environ.get("PIPELINE_EXCLUDE_TEST_STRATEGIES") == "1"
+                    else ""
+                )
             )
             trade_pending = cursor.fetchall()
 
@@ -272,31 +303,15 @@ class PortfolioManager:
         try:
             cursor.execute("BEGIN TRANSACTION")
 
+            def execution_price(prices, strategy):
+                if not self._snapshot_matches_market_session(strategy, snapshot_date):
+                    return 0.0
+                return self.get_simulated_trade_price(prices, strategy)
+
             for strat, target_keys in strategy_targets.items():
                 cash_mgr.initialize_strategy(strat, cursor=cursor)
                 target_keys_set = set(target_keys)
                 old_keys = set(old_portfolio.get(strat, {}).keys())
-
-                # --- Pre-process Hard Stop-Loss (Overrides LLM recommendations) ---
-                hard_stop_keys = set()
-                for key in old_keys:
-                    old_pos = old_portfolio[strat][key]
-                    ep = old_pos.get("entry_price", 0)
-                    shares = old_pos.get("shares", 1)
-                    cp = self.get_simulated_trade_price(current_prices.get(key, {}), strat)
-
-                    # Hard stop loss: drops -25% AND has max tranches (3)
-                    if ep > 0 and shares >= 3 and cp > 0 and cp <= ep * 0.75:
-                        print(f"HARD STOP-LOSS: {key} in {strat} dropped -25% from cost {ep:.2f}. Forcing liquidation.")
-                        hard_stop_keys.add(key)
-                        if key in target_keys_set:
-                            target_keys_set.remove(key)
-
-                added = target_keys_set - old_keys
-                removed = (old_keys - target_keys_set) | hard_stop_keys
-
-                # Track stocks sold today to enforce T+0 re-entry guard
-                sold_today_keys = set()
 
                 # --- Pre-fetch prices concurrently to populate cache ---
                 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -313,14 +328,57 @@ class PortfolioManager:
                         import logging
                         logging.warning(f"Prefetch error for {key}: {e}")
 
-                if removed:
-                    with ThreadPoolExecutor(max_workers=10) as executor:
-                        futures = [
-                            executor.submit(_prefetch_data, k, strat, old_portfolio[strat][k].get("entry_date", "未知"))
-                            for k in removed
-                        ]
-                        for _ in as_completed(futures):
+                with ThreadPoolExecutor(max_workers=10) as executor:
+                    futures = [
+                        executor.submit(_prefetch_data, k, strat, old_portfolio[strat][k].get("entry_date", "未知"))
+                        for k in old_keys
+                    ]
+                    for _ in as_completed(futures):
+                        pass
+
+                # --- Pre-process Hard Stop-Loss (Overrides LLM recommendations) ---
+                hard_stop_keys = set()
+                for key in old_keys:
+                    old_pos = old_portfolio[strat][key]
+                    ep = old_pos.get("entry_price", 0)
+                    shares = old_pos.get("shares", 1)
+                    cp = execution_price(current_prices.get(key, {}), strat)
+
+                    # Hard stop loss: drops -25% AND has max tranches (3)
+                    if ep > 0 and shares >= 3 and cp > 0:
+                        true_adj_ep = ep
+                        true_adj_cp = cp
+                        try:
+                            start_date = old_pos.get("entry_date", snapshot_date).replace('-','')[:8]
+                            end_date = snapshot_date.replace('-','')[:8]
+                            key_fetch = f"{key}.HK" if '_hk_' in strat and not key.upper().endswith('.HK') else key
+                            df_adj = data_gateway.get_historical_prices(key_fetch, start_date, end_date, adjust="hfq")
+                            df_unadj = data_gateway.get_historical_prices(key_fetch, start_date, end_date, adjust="")
+                            if not df_adj.empty and not df_unadj.empty and len(df_adj) >= 1 and len(df_unadj) >= 1:
+                                first_adj = float(df_adj.iloc[0]['收盘'])
+                                first_unadj = float(df_unadj.iloc[0]['收盘'])
+                                last_adj = float(df_adj.iloc[-1]['收盘'])
+                                last_unadj = float(df_unadj.iloc[-1]['收盘'])
+                                factor_entry = first_adj / first_unadj if first_unadj > 0 else 1.0
+                                factor_exit = last_adj / last_unadj if last_unadj > 0 else 1.0
+                                true_adj_ep = ep * factor_entry
+                                true_adj_cp = cp * factor_exit
+                        except Exception:
                             pass
+
+                        if true_adj_cp <= true_adj_ep * 0.75:
+                            print(f"HARD STOP-LOSS: {key} in {strat} dropped -25% from cost. Forcing liquidation.")
+                            hard_stop_keys.add(key)
+                            if key in target_keys_set:
+                                target_keys_set.remove(key)
+
+                added = target_keys_set - old_keys
+                removed = (old_keys - target_keys_set) | hard_stop_keys
+
+                # Track stocks sold today to enforce T+0 re-entry guard
+                sold_today_keys = set()
+
+
 
                 # --- Process REMOVED first (so we know what was sold today and release cash) ---
                 for key in removed:
@@ -349,7 +407,7 @@ class PortfolioManager:
                             print(f"T+1 BLOCK: Cannot hard stop-loss {key} today as it was bought today or is still pending execution.")
                         continue
 
-                    cp = self.get_simulated_trade_price(current_prices.get(key, {}), strat)
+                    cp = execution_price(current_prices.get(key, {}), strat)
                     if cp <= 0:
                         import logging
                         logging.warning(f"WARNING: Could not fetch exit price for {key}. Keeping position open (PENDING_EXIT).")
@@ -439,7 +497,7 @@ class PortfolioManager:
                     new_portfolio[strat][key] = old_pos
 
                     if ep > 0 and shares < 3:
-                        cp = self.get_simulated_trade_price(current_prices.get(key, {}), strat)
+                        cp = execution_price(current_prices.get(key, {}), strat)
 
                         # Validate integrity before averaging down!
                         true_adj_ep = ep
@@ -474,9 +532,10 @@ class PortfolioManager:
                         if is_data_corrupted:
                             continue
 
-                        if true_adj_cp > 0 and true_adj_cp <= true_adj_ep * 0.90:  # -10% threshold on HFQ prices!
+                        threshold = 0.90 if shares == 1 else 0.845
+                        if true_adj_cp > 0 and true_adj_cp <= true_adj_ep * threshold:
                             if cash_mgr.allocate(strat, cursor=cursor): # Try to lock funds!
-                                print(f"POSITION AVERAGING: {key} in {strat} dropped -10% from true cost {true_adj_ep:.2f} to {true_adj_cp:.2f}. Adding tranche {shares + 1}/3.")
+                                print(f"POSITION AVERAGING: {key} in {strat} dropped past threshold from true cost {true_adj_ep:.2f} to {true_adj_cp:.2f}. Adding tranche {shares + 1}/3.")
                                 new_ep = calculate_harmonic_average_cost(shares, ep, 1, cp)
                                 new_portfolio[strat][key]["entry_price"] = new_ep
                                 new_portfolio[strat][key]["shares"] = shares + 1
@@ -490,7 +549,7 @@ class PortfolioManager:
                         print(f"T+0 GUARD: Skipping re-entry of {key} in {strat} (sold today)")
                         continue
 
-                    price = self.get_simulated_trade_price(current_prices.get(key, {}), strat)
+                    price = execution_price(current_prices.get(key, {}), strat)
                     if price <= 0:
                         # A target is not an execution.  Missing, stale, malformed,
                         # or out-of-session quotes must not reserve cash or create a

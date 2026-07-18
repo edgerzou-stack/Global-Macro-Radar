@@ -1,4 +1,5 @@
 import datetime
+import os
 import threading
 
 class GlobalClock:
@@ -15,18 +16,6 @@ class GlobalClock:
                 cls._instance = super().__new__(cls)
                 cls._instance._mock_time = None
                 cls._instance._time_lock = threading.Lock()
-                
-                # Check for MOCK_DATE environment variable
-                import os
-                mock_env = os.environ.get("MOCK_DATE")
-                if mock_env:
-                    try:
-                        # Parse 'YYYY-MM-DD'
-                        dt = datetime.datetime.strptime(mock_env, "%Y-%m-%d")
-                        cls._instance._mock_time = dt
-                        print(f"[GlobalClock] MOCK_DATE env var detected. System time locked to: {dt.date()}")
-                    except ValueError:
-                        print(f"[GlobalClock] WARNING: Invalid MOCK_DATE format '{mock_env}'. Expected YYYY-MM-DD.")
                         
         return cls._instance
         
@@ -40,33 +29,80 @@ class GlobalClock:
         with self._time_lock:
             self._mock_time = None
         
-    def _get_mock_time(self):
+    def _get_explicit_mock_time(self):
         with self._time_lock:
             if self._mock_time:
                 return self._mock_time
-        import os
+        return None
+
+    @staticmethod
+    def _get_environment_mock_date():
         mock_env = os.environ.get("MOCK_DATE")
         if mock_env:
             try:
-                return datetime.datetime.strptime(mock_env, "%Y-%m-%d")
+                return datetime.date.fromisoformat(mock_env)
             except ValueError:
-                pass
+                raise ValueError(
+                    f"Invalid MOCK_DATE {mock_env!r}; expected YYYY-MM-DD"
+                )
         return None
+
+    @staticmethod
+    def _get_environment_mock_instant():
+        mock_env = os.environ.get("MOCK_NOW_UTC")
+        if not mock_env:
+            return None
+        try:
+            instant = datetime.datetime.fromisoformat(mock_env.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError(
+                f"Invalid MOCK_NOW_UTC {mock_env!r}; expected timezone-aware ISO-8601"
+            ) from error
+        if instant.tzinfo is None:
+            raise ValueError("MOCK_NOW_UTC must include an explicit timezone")
+        return instant.astimezone(datetime.timezone.utc)
+
+    @staticmethod
+    def _localize_wall_time(value, tz):
+        if tz is None:
+            return value
+        localize = getattr(tz, "localize", None)
+        if callable(localize):
+            return localize(value)
+        return value.replace(tzinfo=tz)
 
     def now(self, tz=None) -> datetime.datetime:
         """Returns the current simulated or real datetime."""
-        mock = self._get_mock_time()
-        if mock:
-            if tz:
-                return mock.astimezone(tz)
-            return mock
+        explicit = self._get_explicit_mock_time()
+        if explicit is not None:
+            if explicit.tzinfo is not None:
+                return explicit.astimezone(tz) if tz else explicit
+            return self._localize_wall_time(explicit, tz)
+
+        instant = self._get_environment_mock_instant()
+        if instant is not None:
+            return instant.astimezone(tz) if tz else instant
+
+        mock_date = self._get_environment_mock_date()
+        if mock_date is not None:
+            # Date-only fixtures represent a completed logical session, not a
+            # physical midnight in the host timezone.  Localizing the same wall
+            # date avoids silently shifting US markets to the previous day.
+            wall_time = datetime.datetime.combine(mock_date, datetime.time.max)
+            return self._localize_wall_time(wall_time, tz)
         return datetime.datetime.now(tz)
         
     def today(self) -> datetime.date:
         """Returns the current simulated or real date."""
-        mock = self._get_mock_time()
-        if mock:
-            return mock.date()
+        mock_date = self._get_environment_mock_date()
+        if mock_date is not None:
+            return mock_date
+        explicit = self._get_explicit_mock_time()
+        if explicit is not None:
+            return explicit.date()
+        instant = self._get_environment_mock_instant()
+        if instant is not None:
+            return instant.date()
         return datetime.date.today()
 
 # Global singleton instance

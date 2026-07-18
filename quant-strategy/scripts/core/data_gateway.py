@@ -21,6 +21,11 @@ class DataIntegrityError(Exception):
     """Raised when fetched data fails integrity checks (e.g., price <= 0)."""
     pass
 
+
+class InvalidMarketDataRequest(DataIntegrityError):
+    """Raised for a locally invalid range before any provider is contacted."""
+    pass
+
 class CircuitBreakerError(Exception):
     """Raised when a data source triggers a circuit breaker."""
     pass
@@ -311,6 +316,25 @@ class DataGateway:
                     PRIMARY KEY (symbol, date, adjust)
                 )
             """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS quarantined_daily_prices (
+                    quarantine_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    open REAL,
+                    close REAL,
+                    high REAL,
+                    low REAL,
+                    volume REAL,
+                    adjust TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    quarantined_at TEXT NOT NULL
+                )
+            """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_quarantined_daily_prices_lookup
+                ON quarantined_daily_prices (symbol, adjust, date)
+            """)
             conn.commit()
 
     def _to_yf_symbol(self, symbol: str) -> str:
@@ -392,9 +416,129 @@ class DataGateway:
             df = pd.read_sql_query(query, conn, params=(symbol, adjust, start_date, end_date))
         return df
 
+    def _quarantine_cached_prices(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        adjust: str,
+        reason: str,
+    ) -> int:
+        """Atomically retain corrupt cache evidence and remove it from active use."""
+        return self._quarantine_cached_price_series(
+            symbol,
+            start_date,
+            end_date,
+            (adjust,),
+            reason,
+        )
+
+    def _quarantine_cached_price_series(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        adjustments,
+        reason: str,
+    ) -> int:
+        """Atomically quarantine related adjustment series for one symbol.
+
+        A cached OHLC series can be internally valid while belonging to a stale
+        corporate-action scale.  Raw and adjusted valuation series therefore
+        have to be invalidated together before a consistency retry.
+        """
+        if self.db_path is None:
+            raise DataIntegrityError("Cannot quarantine prices without a cache database")
+
+        adjustments = tuple(dict.fromkeys(str(value) for value in adjustments))
+        if not adjustments:
+            return 0
+
+        row_count = 0
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("BEGIN IMMEDIATE")
+            for adjust in adjustments:
+                parameters = (symbol, adjust, start_date, end_date)
+                series_count = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM daily_prices
+                    WHERE symbol = ? AND adjust = ? AND date >= ? AND date <= ?
+                    """,
+                    parameters,
+                ).fetchone()[0]
+                row_count += series_count
+                if series_count:
+                    conn.execute(
+                        """
+                        INSERT INTO quarantined_daily_prices (
+                            symbol, date, open, close, high, low, volume, adjust,
+                            reason, quarantined_at
+                        )
+                        SELECT
+                            symbol, date, open, close, high, low, volume, adjust,
+                            ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                        FROM daily_prices
+                        WHERE symbol = ? AND adjust = ? AND date >= ? AND date <= ?
+                        """,
+                        (str(reason), *parameters),
+                    )
+                    conn.execute(
+                        """
+                        DELETE FROM daily_prices
+                        WHERE symbol = ? AND adjust = ? AND date >= ? AND date <= ?
+                        """,
+                        parameters,
+                    )
+            conn.commit()
+        return int(row_count)
+
+    def refresh_valuation_closes(
+        self, symbol: str, start_date: str, end_date: str, reason: str
+    ):
+        """Discard a mismatched raw/HFQ cache pair and fetch both series anew."""
+        quarantined = self._quarantine_cached_price_series(
+            symbol,
+            start_date,
+            end_date,
+            ("", "hfq"),
+            reason,
+        )
+        logger.error(
+            "DataGateway: quarantined %s cross-adjustment rows for %s in "
+            "%s-%s: %s",
+            quarantined,
+            symbol,
+            start_date,
+            end_date,
+            reason,
+        )
+        return {
+            adjust: self.get_historical_closes(
+                symbol, start_date, end_date, adjust=adjust
+            )
+            for adjust in ("hfq", "")
+        }
+
+    def _fetch_validated_source(self, source: str, fetch, symbol: str, *args):
+        """Fetch from one source and reject it before fallback/cache on bad OHLC."""
+        try:
+            frame = self._call_source(source, fetch, symbol, *args)
+            return self._validate_prices(frame, symbol)
+        except DataIntegrityError:
+            # Fetch adapters record transport success before returning.  A payload
+            # that fails integrity is still a source failure for breaker purposes.
+            self.breakers[source].record_failure()
+            raise
+
     def _save_to_cache(self, symbol: str, df: pd.DataFrame, adjust: str):
         if df is None or df.empty:
             return
+
+        # Defense in depth: only a fully validated OHLC frame may become active
+        # cache state, even if a future caller bypasses get_historical_prices().
+        df = self._validate_prices(df, symbol)
             
         if '日期' in df.columns:
             date_series = df['日期'].astype(str).str.replace('-', '').str.slice(0, 8)
@@ -549,14 +693,14 @@ class DataGateway:
         if not re.fullmatch(r"\d{8}", start_date) or not re.fullmatch(
             r"\d{8}", end_date
         ) or start_date > end_date:
-            raise DataIntegrityError(
+            raise InvalidMarketDataRequest(
                 f"Invalid historical price range {start_date}-{end_date}"
             )
         try:
             datetime.datetime.strptime(start_date, "%Y%m%d")
             datetime.datetime.strptime(end_date, "%Y%m%d")
         except ValueError as error:
-            raise DataIntegrityError(
+            raise InvalidMarketDataRequest(
                 f"Invalid historical price range {start_date}-{end_date}"
             ) from error
         if self.historical_fixture_path:
@@ -567,7 +711,29 @@ class DataGateway:
         df_cache = self._get_from_cache(symbol, start_date, end_date, adjust)
         
         if not df_cache.empty:
-            df_cache = self._validate_prices(df_cache, symbol)
+            try:
+                df_cache = self._validate_prices(df_cache, symbol)
+            except DataIntegrityError as error:
+                quarantined = self._quarantine_cached_prices(
+                    symbol,
+                    start_date,
+                    end_date,
+                    adjust,
+                    str(error),
+                )
+                logger.error(
+                    "DataGateway: quarantined %s corrupt cached rows for "
+                    "%s/%s in %s-%s: %s",
+                    quarantined,
+                    symbol,
+                    adjust or "raw",
+                    start_date,
+                    end_date,
+                    error,
+                )
+                df_cache = pd.DataFrame()
+
+        if not df_cache.empty:
             cache_min = str(df_cache['日期'].min()).replace('-', '')[:8]
             cache_max = str(df_cache['日期'].max()).replace('-', '')[:8]
             if cache_min <= start_date and cache_max >= end_date:
@@ -579,14 +745,14 @@ class DataGateway:
         if is_a_share:
             # Multi-level Failover Strategy for A-Shares
             try:
-                df_new = self._call_source(
+                df_new = self._fetch_validated_source(
                     "baostock", self._fetch_from_baostock,
                     symbol, start_date, end_date, adjust
                 )
             except Exception as e_bs:
                 logger.warning(f"DataGateway: baostock failed for {symbol}: {e_bs}. Falling back to Sina.")
                 try:
-                    df_new = self._call_source(
+                    df_new = self._fetch_validated_source(
                         "sina", self._fetch_from_sina,
                         symbol, start_date, end_date, adjust
                     )
@@ -596,7 +762,7 @@ class DataGateway:
                         logger.error(f"DataGateway: Cannot use YFinance for A-Share HFQ data for {symbol}. It returns unadjusted prices and causes cache poisoning.")
                         raise FatalSystemError(f"A-Share HFQ data unavailable for {symbol} (Baostock/Sina failed). Aborting pipeline to prevent severe PnL corruption.")
                     try:
-                        df_new = self._call_source(
+                        df_new = self._fetch_validated_source(
                             "yfinance", self._fetch_from_yfinance,
                             symbol, start_date, end_date, adjust
                         )
@@ -608,10 +774,14 @@ class DataGateway:
         else:
             # Non-A shares (US/HK)
             try:
-                df_new = self._call_source(
+                df_new = self._fetch_validated_source(
                     "yfinance", self._fetch_from_yfinance,
                     symbol, start_date, end_date, adjust
                 )
+            except DataIntegrityError:
+                # Preserve the integrity error type for callers which may apply
+                # an explicitly narrower close-only valuation policy.
+                raise
             except Exception as e:
                 logger.error(f"DataGateway: YFinance failed for {symbol}: {e}.")
                 raise FatalSystemError(
@@ -619,18 +789,17 @@ class DataGateway:
                 ) from e
                 
         if not df_new.empty:
-            df_new = self._validate_prices(df_new, symbol)
-            self._save_to_cache(symbol, df_new, adjust)
-            
             if not df_cache.empty:
                 df_new = pd.concat([df_cache, df_new]).drop_duplicates(subset=['日期']).sort_values('日期')
-                
+                df_new = self._validate_prices(df_new, symbol)
+
             df_new['日期'] = df_new['日期'].astype(str).str.replace('-', '').str[:8]
             df_new = df_new[(df_new['日期'] >= start_date) & (df_new['日期'] <= end_date)]
             if df_new.empty:
                 raise DataIntegrityError(
                     f"No market data for {symbol} in requested range {start_date}-{end_date}"
                 )
+            self._save_to_cache(symbol, df_new, adjust)
             return df_new
             
         return df_cache
@@ -647,7 +816,9 @@ class DataGateway:
         try:
             frame = self.get_historical_prices(symbol, start_date, end_date, adjust)
             return frame[["日期", "收盘"]].copy()
-        except (DataIntegrityError, FatalSystemError) as original_error:
+        except InvalidMarketDataRequest:
+            raise
+        except DataIntegrityError as original_error:
             if self.historical_fixture_path or (len(symbol) == 6 and symbol.isdigit()):
                 raise
             logger.warning(

@@ -9,16 +9,18 @@ import math
 import tempfile
 from datetime import date, datetime, timedelta
 
+import pandas as pd
+
 from screen_a_share import (
     build_quote_table,
     attach_latest_financial_fields,
     attach_dynamic_cagr_fields,
     filter_dividend_strategy,
+    filter_dividend_quality,
     filter_growth_strategy,
     attach_ttm_dividend_yield,
     output_columns,
     CYCLICAL_GROWTH_INDUSTRIES,
-    DEFENSIVE_INDUSTRIES,
     threshold_payload,
     number_or_none,
     string_or_none
@@ -158,7 +160,7 @@ def load_global_screen_fixture(path):
     }
 
 
-def _persist_daily_results(results, diff, snapshot_date, *, include_empty=False, strict=False):
+def _persist_daily_results(results, diff, snapshot_date, appendix=None, *, include_empty=False, strict=False):
     conn = None
     try:
         conn = db_utils.get_connection()
@@ -168,6 +170,7 @@ def _persist_daily_results(results, diff, snapshot_date, *, include_empty=False,
                 result_payload = {
                     "results": results[strategy],
                     "diff": diff.get(strategy, {}),
+                    "appendix": appendix.get(strategy, []) if appendix else [],
                 }
                 serialized = json.dumps(
                     result_payload, ensure_ascii=False, sort_keys=True
@@ -310,7 +313,7 @@ def _run_offline_fixture(args, fixture):
         "trade_history": [],
     }
     _persist_daily_results(
-        results, diff, snapshot_date, include_empty=True, strict=True
+        results, diff, snapshot_date, appendix=payload["appendix"], include_empty=True, strict=True
     )
     _write_json_atomic(args.output_file, payload)
     print(
@@ -319,11 +322,31 @@ def _run_offline_fixture(args, fixture):
     )
     return payload
 
+def _quote_coverage_metrics(quote_df):
+    """Separate provider transport health from factor eligibility."""
+    if quote_df is None or quote_df.empty:
+        return 0.0, 0.0
+    prices = pd.to_numeric(quote_df.get("最新价"), errors="coerce")
+    market_caps = pd.to_numeric(quote_df.get("总市值"), errors="coerce")
+    pe = pd.to_numeric(quote_df.get("PE"), errors="coerce")
+    pb = pd.to_numeric(quote_df.get("PB"), errors="coerce")
+    transported = (prices > 0) & (market_caps > 0)
+    factors = transported & (pe > 0) & (pb > 0)
+    return float(transported.mean()), float(factors.mean())
+
+
 def process_a_share_data(args, a_tickers, as_of_date):
     """Refactored data fetcher for A-shares, returns raw DFs to be consumed by Strategies"""
     import pandas as pd
     print("Fetching A-share quotes...", flush=True)
     quote_df = build_quote_table(target_codes=a_tickers)
+
+    quote_coverage, quote_factor_coverage = _quote_coverage_metrics(quote_df)
+    quote_min_coverage = getattr(args, "quote_min_coverage", 0.99)
+    if quote_coverage < quote_min_coverage:
+        raise RuntimeError(
+            f"A-share quote coverage {quote_coverage:.2%} below required {quote_min_coverage:.2%}"
+        )
 
     a_prices = {}
     if not quote_df.empty:
@@ -333,9 +356,16 @@ def process_a_share_data(args, a_tickers, as_of_date):
     with_financial, _, _ = attach_latest_financial_fields(
         quote_df, as_of_date=as_of_date, report_date=args.report_date
     )
+    financial_coverage = float(with_financial["财务报告期"].notna().mean()) if len(with_financial) else 0.0
+    financial_min_coverage = getattr(args, "financial_min_coverage", 0.90)
+    if financial_coverage < financial_min_coverage:
+        raise RuntimeError(
+            f"A-share financial coverage {financial_coverage:.2%} below required {financial_min_coverage:.2%}"
+        )
 
     div_pre_mask = (
-        with_financial["所处行业"].isin(DEFENSIVE_INDUSTRIES)
+        with_financial["PE"].notna() & (with_financial["PE"] > 0)
+        & with_financial["PB"].notna() & (with_financial["PB"] > 0)
         & with_financial["估值公式值"].notna() & (with_financial["估值公式值"] < args.valuation_formula_max)
         & with_financial["总市值"].notna() & (with_financial["总市值"] > args.market_cap_min_yi * 1e8)
     )
@@ -347,9 +377,18 @@ def process_a_share_data(args, a_tickers, as_of_date):
     )
     gro_pre = with_financial[gro_pre_mask].copy()
 
+    dividend_coverage = 1.0
     if not div_pre.empty:
         div_pre = attach_ttm_dividend_yield(div_pre, as_of_date)
-        div_pre = div_pre[div_pre["TTM股息率"].notna() & (div_pre["TTM股息率"] > args.dividend_yield_min)].copy()
+        evaluated = div_pre["分红数据状态"].isin(["ok", "confirmed_no_dividend"])
+        dividend_coverage = float(evaluated.mean())
+        minimum_coverage = getattr(args, "dividend_min_data_coverage", 0.95)
+        if dividend_coverage < minimum_coverage:
+            errors = div_pre.loc[~evaluated, "分红数据状态"].value_counts().to_dict()
+            raise RuntimeError(
+                f"A-share dividend coverage {dividend_coverage:.2%} below required "
+                f"{minimum_coverage:.2%}; errors={errors}"
+            )
 
     combined_codes = list(set(div_pre["股票代码"].tolist() + gro_pre["股票代码"].tolist()))
     if not combined_codes:
@@ -367,10 +406,17 @@ def process_a_share_data(args, a_tickers, as_of_date):
     merged_df = merged_df.rename(columns={k: v for k, v in col_rename_map.items() if k in merged_df.columns})
 
     div_df, gro_df = pd.DataFrame(), pd.DataFrame()
+    dividend_fundamental_count = 0
     if not div_pre.empty:
         div_final_pool = merged_df[merged_df["股票代码"].isin(div_pre["股票代码"])].copy()
-        div_final_pool = div_final_pool.merge(div_pre[["股票代码", "TTM股息率"]], on="股票代码", how="left")
+        dividend_columns = [
+            "股票代码", "TTM股息率", "分红数据状态", "分红数据错误",
+            "近5年分红年份数", "连续3年分红", "最近年度分红变动率",
+        ]
+        div_final_pool = div_final_pool.merge(div_pre[dividend_columns], on="股票代码", how="left")
         div_df = filter_dividend_strategy(div_final_pool, args)
+        dividend_fundamental_count = len(div_df)
+        div_df = filter_dividend_quality(div_df, args)
 
     if not gro_pre.empty:
         gro_final_pool = merged_df[merged_df["股票代码"].isin(gro_pre["股票代码"])].copy()
@@ -379,6 +425,16 @@ def process_a_share_data(args, a_tickers, as_of_date):
     div_df = output_columns(div_df) if not div_df.empty else pd.DataFrame()
     gro_df = output_columns(gro_df) if not gro_df.empty else pd.DataFrame()
 
+    print(
+        "A-share data health: "
+        f"quote_transport={quote_coverage:.2%}, "
+        f"quote_factors={quote_factor_coverage:.2%}, "
+        f"financials={financial_coverage:.2%}, "
+        f"dividends={dividend_coverage:.2%}, dividend_prefilter={len(div_pre)}, "
+        f"dividend_fundamentals={dividend_fundamental_count}, "
+        f"dividend_selected={len(div_df)} (quality gates + industry cap; no score)",
+        flush=True,
+    )
     return div_df, gro_df, a_prices
 
 def inject_portfolio_metrics(results, portfolio, snapshot_date, gateway_instance=None):
@@ -432,13 +488,26 @@ def main(argv=None):
     parser.add_argument("--dividend-yield-min", type=float, default=3.0)
     parser.add_argument("--market-cap-min-yi", type=float, default=100.0)
     parser.add_argument("--avg-net-profit-margin-min", type=float, default=10.0)
-    parser.add_argument("--require-continuous-growth", action="store_true", help="Require multiple periods of YoY growth")
+    parser.add_argument(
+        "--require-continuous-growth",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Require revenue and net profit YoY growth in each of the latest 3 annual reports",
+    )
     parser.add_argument("--peg-max", type=float, default=1.0)
     parser.add_argument("--profit-cagr-min", type=float, default=5.0)
     parser.add_argument("--dividend-roe-min", type=float, default=10.0)
     parser.add_argument("--growth-roe-min", type=float, default=10.0)
     parser.add_argument("--growth-yoy-min", type=float, default=30.0)
     parser.add_argument("--max-stocks", type=int, default=10)
+    parser.add_argument("--cash-profit-coverage-min", type=float, default=0.8)
+    parser.add_argument("--dividend-min-years", type=int, default=4)
+    parser.add_argument("--dividend-max-cut-pct", type=float, default=30.0)
+    parser.add_argument("--dividend-max-per-industry", type=int, default=3)
+    parser.add_argument("--dividend-max-results", type=int, default=50)
+    parser.add_argument("--quote-min-coverage", type=float, default=0.99)
+    parser.add_argument("--financial-min-coverage", type=float, default=0.90)
+    parser.add_argument("--dividend-min-data-coverage", type=float, default=0.95)
     parser.add_argument("--disable-llm", action="store_true", help="Disable LLM secondary filtering")
     from config import PROJECT_ROOT
     parser.add_argument("--output-file", type=str, default=os.path.join(PROJECT_ROOT, "global_screen.json"))
@@ -462,7 +531,7 @@ def main(argv=None):
 
     # Init Strategy classes
     strategies = {
-        "dividend_a_stock": ADividendStrategy(args.max_stocks),
+        "dividend_a_stock": ADividendStrategy(args.dividend_max_results),
         "growth_a_stock": AGrowthStrategy(args.max_stocks),
         "dividend_us_stock": USHKQuantStrategy("dividend_us_stock", args.max_stocks),
         "growth_us_stock": USHKQuantStrategy("growth_us_stock", args.max_stocks),
@@ -510,7 +579,17 @@ def main(argv=None):
 
     # A-Share number parsing fix (from original screen_global_quant.py)
     for k in ["dividend_a_stock", "growth_a_stock"]:
-        results[k] = [{key: number_or_none(v) if key not in ["股票代码", "股票简称", "财务报告期", "CAGR终点年报", "CAGR起点年报", "所处行业"] else string_or_none(v) for key, v in row.items()} for row in results[k]]
+        string_fields = [
+            "股票代码", "股票简称", "财务报告期", "CAGR终点年报",
+            "CAGR起点年报", "所处行业", "分红数据状态",
+        ]
+        results[k] = [
+            {
+                key: number_or_none(v) if key not in string_fields else string_or_none(v)
+                for key, v in row.items()
+            }
+            for row in results[k]
+        ]
 
     # LLM Secondary Filtering for Growth Strategies
     try:
@@ -588,6 +667,17 @@ Please return the selected top candidates (maximum 10) as a JSON array of their 
                 appendix[strat] = results[strat][10:]
                 results[strat] = results[strat][:10]
 
+    final_limits = {strategy: 10 for strategy in STRATEGIES}
+    final_limits["dividend_a_stock"] = args.dividend_max_results
+    for strat in STRATEGIES:
+        limit = final_limits[strat]
+        if len(results[strat]) > limit:
+            if not appendix.get(strat):
+                appendix[strat] = results[strat][limit:]
+            else:
+                appendix[strat].extend(results[strat][limit:])
+            results[strat] = results[strat][:limit]
+
     # Phase 2: Transactional Portfolio Update via PortfolioManager
     pm = PortfolioManager(db_utils)
 
@@ -644,7 +734,7 @@ Please return the selected top candidates (maximum 10) as a JSON array of their 
     }
 
     # P3.24: 将大 JSON 保存逻辑从统一的 meta_data 表迁移到按日期和策略拆分的专用表中
-    _persist_daily_results(results, diff, snapshot_date)
+    _persist_daily_results(results, diff, snapshot_date, appendix=appendix)
 
     # DB save has been fully migrated to strategy_daily_results table
 

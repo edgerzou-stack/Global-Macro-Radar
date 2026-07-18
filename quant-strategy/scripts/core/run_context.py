@@ -281,18 +281,31 @@ class RunContext:
             "QUANT_DB_ENV": database_environment,
             "DELIVERY_MODE": self.delivery_mode.value,
         }
-        if self.mode in {RunMode.OFFLINE, RunMode.SHADOW}:
-            # Fixture-backed runs need a deterministic clock.  A date-only
-            # MOCK_DATE must never leak into live modes: converting its naive
-            # midnight between market time zones can fabricate an open session
-            # on the previous day and admit prices outside the real session.
+        if self.mode is RunMode.OFFLINE:
+            # Offline fixtures represent a completed end-of-day snapshot.  Four
+            # UTC hours into the following date is after the effective session
+            # has closed in every supported market.
             values["MOCK_DATE"] = self.effective_date.isoformat()
+            values["MOCK_NOW_UTC"] = dt.datetime.combine(
+                self.effective_date + dt.timedelta(days=1),
+                dt.time(4, 0),
+                tzinfo=dt.timezone.utc,
+            ).isoformat()
+        elif self.mode is RunMode.SHADOW:
+            # Shadow uses the logical effective date for artifacts but the
+            # timezone-aware creation instant for market-open/close decisions.
+            # A date-only midnight would shift New York to the previous day.
+            values["MOCK_DATE"] = self.effective_date.isoformat()
+            values["MOCK_NOW_UTC"] = dt.datetime.combine(self.effective_date, dt.time(12, 0), tzinfo=dt.timezone.utc).isoformat()
         if self.mode is not RunMode.PRODUCTION:
             values.update(
                 {
                     "DISABLE_REAL_ORDERS": "1",
                 }
             )
+        if self.mode in {RunMode.SHADOW, RunMode.LIVE_SHADOW, RunMode.PRODUCTION}:
+            values["PIPELINE_EXCLUDE_TEST_STRATEGIES"] = "1"
+            values["PIPELINE_ENFORCE_SESSION_IDENTITY"] = "1"
         values.update(dict(self.fixture_paths))
         return values
 

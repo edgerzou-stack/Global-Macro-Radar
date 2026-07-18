@@ -83,6 +83,8 @@ def a_share_to_yf(code: str) -> str:
     code = str(code).zfill(6)
     if code.startswith(("600", "601", "603", "605", "688", "689")):
         return f"{code}.SS"
+    if code.startswith(("4", "8", "9")):
+        return f"{code}.BJ"
     return f"{code}.SZ"
 
 def yf_to_a_share(yf_sym: str) -> str:

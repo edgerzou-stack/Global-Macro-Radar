@@ -28,7 +28,11 @@ class ADividendStrategy(Strategy):
         previous_holdings = kwargs.get("previous_holdings", [])
         
         # Buffer zone logic to prevent flapping
-        df = df.sort_values(by="TTM股息率", ascending=False)
+        has_composite_score = (
+            "红利综合评分" in df.columns and df["红利综合评分"].notna().any()
+        )
+        rank_column = "红利综合评分" if has_composite_score else "TTM股息率"
+        df = df.sort_values(by=rank_column, ascending=False)
         if previous_holdings:
             buffer_n = self.top_n * 2
             top_buffer_df = df.head(buffer_n)
@@ -36,16 +40,20 @@ class ADividendStrategy(Strategy):
             kept_df = top_buffer_df[kept_mask]
             
             if len(kept_df) >= self.top_n:
-                df = kept_df.head(self.top_n)
+                selected_df = kept_df.head(self.top_n)
             else:
                 needed = self.top_n - len(kept_df)
                 remaining_df = df[~df["股票代码"].isin(previous_holdings)]
                 new_df = remaining_df.head(needed)
                 import pandas as pd
-                df = pd.concat([kept_df, new_df]).sort_values(by="TTM股息率", ascending=False)
-        else:
-            df = df.head(self.top_n)
-            
+                selected_df = pd.concat([kept_df, new_df]).sort_values(
+                    by=rank_column, ascending=False
+                )
+
+            unselected_df = df[~df["股票代码"].isin(selected_df["股票代码"])]
+            import pandas as pd
+            df = pd.concat([selected_df, unselected_df])
+
         return df.to_dict('records')
 
 class AGrowthStrategy(Strategy):
@@ -81,19 +89,19 @@ class USHKQuantStrategy(Strategy):
                     top_buffer_df = df.head(buffer_n)
                     kept_mask = top_buffer_df["股票代码"].isin(previous_holdings)
                     kept_df = top_buffer_df[kept_mask]
-                    
+
                     if len(kept_df) >= self.top_n:
-                        df = kept_df.head(self.top_n)
+                        selected_df = kept_df.head(self.top_n)
                     else:
                         needed = self.top_n - len(kept_df)
                         remaining_df = df[~df["股票代码"].isin(previous_holdings)]
                         new_df = remaining_df.head(needed)
                         import pandas as pd
-                        df = pd.concat([kept_df, new_df]).sort_values(by="TTM股息率", ascending=False)
-                else:
-                    df = df.head(self.top_n)
-            else:
-                df = df.head(self.top_n)
+                        selected_df = pd.concat([kept_df, new_df]).sort_values(by="TTM股息率", ascending=False)
+
+                    unselected_df = df[~df["股票代码"].isin(selected_df["股票代码"])]
+                    import pandas as pd
+                    df = pd.concat([selected_df, unselected_df])
         elif 'growth' in self.strat_id:
             if "净利润同比增长率" in df.columns:
                 df = df.sort_values(by="净利润同比增长率", ascending=False)

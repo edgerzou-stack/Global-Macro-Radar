@@ -24,6 +24,94 @@ QUARTER_ENDS = ((3, 31), (6, 30), (9, 30), (12, 31))
 ANNUAL_REPORT_LOOKBACK = 8
 LONG_TERM_CAGR_YEARS = 3
 DIVIDEND_TTM_DAYS = 365
+DIVIDEND_HISTORY_YEARS = 5
+
+
+def _empty_dividend_metrics(symbol: str, status: str, error: Optional[str] = None) -> dict:
+    return {
+        "股票代码": symbol,
+        "分红数据状态": status,
+        "分红数据错误": error,
+        "TTM股息率": None,
+        "近5年分红年份数": 0,
+        "连续3年分红": False,
+        "最近年度分红变动率": None,
+    }
+
+
+def calculate_dividend_metrics_for_code(
+    symbol: str, as_of_date: date, latest_price: Optional[float]
+) -> dict:
+    """Return auditable dividend metrics without conflating provider errors with no dividend."""
+    if latest_price is None or pd.isna(latest_price) or float(latest_price) <= 0:
+        return _empty_dividend_metrics(symbol, "invalid_price")
+
+    try:
+        dividend_df = stock_dividend_cninfo_cached(symbol=symbol)
+    except Exception as exc:
+        return _empty_dividend_metrics(symbol, "source_error", str(exc))
+
+    if dividend_df.empty:
+        return _empty_dividend_metrics(symbol, "confirmed_no_dividend")
+
+    required = {"派息日", "除权日", "派息比例"}
+    missing = sorted(required - set(dividend_df.columns))
+    if missing:
+        return _empty_dividend_metrics(
+            symbol, "schema_error", f"missing columns: {', '.join(missing)}"
+        )
+
+    dividend_df = dividend_df.copy()
+    dividend_df["派息日"] = pd.to_datetime(dividend_df["派息日"], errors="coerce").dt.date
+    dividend_df["除权日"] = pd.to_datetime(dividend_df["除权日"], errors="coerce").dt.date
+    dividend_df["派息比例"] = pd.to_numeric(dividend_df["派息比例"], errors="coerce")
+    dividend_df["生效日期"] = dividend_df["派息日"].where(
+        dividend_df["派息日"].notna(), dividend_df["除权日"]
+    )
+
+    if "分红类型" in dividend_df.columns:
+        special = dividend_df["分红类型"].astype(str).str.contains("特别", na=False)
+        dividend_df = dividend_df[~special].copy()
+
+    implemented = dividend_df[
+        dividend_df["生效日期"].notna()
+        & (dividend_df["生效日期"] <= as_of_date)
+        & dividend_df["派息比例"].notna()
+        & (dividend_df["派息比例"] > 0)
+    ].copy()
+    cutoff_date = as_of_date - timedelta(days=DIVIDEND_TTM_DAYS)
+    ttm = implemented[implemented["生效日期"] > cutoff_date]
+    ttm_yield = float(ttm["派息比例"].sum() / 10.0 / float(latest_price) * 100.0)
+
+    report_year = pd.Series(pd.NA, index=implemented.index, dtype="Int64")
+    if "报告时间" in implemented.columns:
+        extracted = implemented["报告时间"].astype(str).str.extract(r"((?:19|20)\d{2})")[0]
+        report_year = pd.to_numeric(extracted, errors="coerce").astype("Int64")
+    effective_year = implemented["生效日期"].map(lambda value: value.year).astype("Int64")
+    implemented["报告年份"] = report_year.fillna(effective_year)
+    annual_cash = implemented.groupby("报告年份")["派息比例"].sum() / 10.0
+
+    last_complete_year = as_of_date.year - 1
+    history_years = list(
+        range(last_complete_year - DIVIDEND_HISTORY_YEARS + 1, last_complete_year + 1)
+    )
+    dividend_year_count = sum(float(annual_cash.get(year, 0.0)) > 0 for year in history_years)
+    continuous_three = all(
+        float(annual_cash.get(year, 0.0)) > 0 for year in history_years[-3:]
+    )
+    latest_cash = float(annual_cash.get(last_complete_year, 0.0))
+    previous_cash = float(annual_cash.get(last_complete_year - 1, 0.0))
+    change_pct = None if previous_cash <= 0 else (latest_cash / previous_cash - 1.0) * 100.0
+
+    return {
+        "股票代码": symbol,
+        "分红数据状态": "ok",
+        "分红数据错误": None,
+        "TTM股息率": ttm_yield,
+        "近5年分红年份数": int(dividend_year_count),
+        "连续3年分红": bool(continuous_three),
+        "最近年度分红变动率": change_pct,
+    }
 
 
 
@@ -31,44 +119,10 @@ DIVIDEND_TTM_DAYS = 365
 def calculate_ttm_dividend_yield_for_code(
     symbol: str, as_of_date: date, latest_price: Optional[float]
 ) -> Optional[float]:
-    if latest_price is None or pd.isna(latest_price):
+    metrics = calculate_dividend_metrics_for_code(symbol, as_of_date, latest_price)
+    if metrics["分红数据状态"] != "ok":
         return None
-    latest_price = float(latest_price)
-    if latest_price <= 0:
-        return None
-
-    try:
-        dividend_df = stock_dividend_cninfo_cached(symbol=symbol)
-    except Exception as e:
-        import logging
-        logging.warning(f"Failed to fetch dividend data for {symbol} (possibly no dividend history).")
-        return None
-
-    if dividend_df.empty:
-        return None
-
-    cutoff_date = as_of_date - timedelta(days=DIVIDEND_TTM_DAYS)
-    dividend_df = dividend_df.copy()
-    dividend_df["派息日"] = pd.to_datetime(dividend_df["派息日"], errors="coerce").dt.date
-    dividend_df["除权日"] = pd.to_datetime(dividend_df["除权日"], errors="coerce").dt.date
-    dividend_df["派息比例"] = pd.to_numeric(dividend_df["派息比例"], errors="coerce")
-
-    effective_date = dividend_df["派息日"].where(dividend_df["派息日"].notna(), dividend_df["除权日"])
-    dividend_df = dividend_df.assign(生效日期=effective_date)
-    dividend_df = dividend_df[
-        dividend_df["生效日期"].notna()
-        & (dividend_df["生效日期"] <= as_of_date)
-        & (dividend_df["生效日期"] > cutoff_date)
-        & dividend_df["派息比例"].notna()
-        & (dividend_df["派息比例"] > 0)
-    ].copy()
-
-    if dividend_df.empty:
-        return None
-
-    # `派息比例` is cash dividend per 10 shares in CNY.
-    dividend_per_share = dividend_df["派息比例"].sum() / 10.0
-    return dividend_per_share / latest_price * 100.0
+    return metrics["TTM股息率"]
 
 
 def load_ttm_dividend_yield_table(
@@ -77,7 +131,7 @@ def load_ttm_dividend_yield_table(
     target_codes: Optional[list[str]] = None,
 ) -> pd.DataFrame:
     if quote_df.empty:
-        return pd.DataFrame(columns=["股票代码", "TTM股息率"])
+        return pd.DataFrame(columns=list(_empty_dividend_metrics("", "").keys()))
 
     base = quote_df[["股票代码", "最新价"]].copy()
     if target_codes is not None:
@@ -89,26 +143,25 @@ def load_ttm_dividend_yield_table(
 
     def fetch_dividend(row):
         time.sleep(random.uniform(0.01, 0.1))
-        return {
-            "股票代码": row["股票代码"],
-            "TTM股息率": calculate_ttm_dividend_yield_for_code(
-                symbol=row["股票代码"],
-                as_of_date=as_of_date,
-                latest_price=row["最新价"],
-            ),
-        }
+        return calculate_dividend_metrics_for_code(
+            symbol=row["股票代码"],
+            as_of_date=as_of_date,
+            latest_price=row["最新价"],
+        )
 
     rows = []
     from tqdm import tqdm
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(fetch_dividend, row): row for _, row in base.iterrows()}
         for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc=f"Fetching dividend yield for {len(base)} candidates"):
             try:
                 res = future.result()
                 rows.append(res)
-            except Exception as e:
-                # Silently skip or log errors for individual stocks
-                pass
+            except Exception as exc:
+                row = futures[future]
+                rows.append(
+                    _empty_dividend_metrics(row["股票代码"], "source_error", str(exc))
+                )
                 
     return pd.DataFrame(rows)
 
@@ -214,6 +267,7 @@ def load_dynamic_cagr_table(
                 "净利润-同比增长",
                 "净资产收益率",
                 "每股经营现金流量",
+                "每股收益",
                 "最新公告日期",
             ]
         ].copy()
@@ -229,6 +283,7 @@ def load_dynamic_cagr_table(
         yjbb["净利润-同比增长"] = pd.to_numeric(yjbb["净利润-同比增长"], errors="coerce")
         yjbb["净资产收益率"] = pd.to_numeric(yjbb["净资产收益率"], errors="coerce")
         yjbb["每股经营现金流量"] = pd.to_numeric(yjbb["每股经营现金流量"], errors="coerce")
+        yjbb["每股收益"] = pd.to_numeric(yjbb["每股收益"], errors="coerce")
 
         if target_codes is not None:
             yjbb = yjbb[yjbb["股票代码"].isin(target_codes)].copy()
@@ -271,6 +326,7 @@ def load_dynamic_cagr_table(
                 "3年平均净资产收益率",
                 "3年平均净利率",
                 "3年经营现金流平均增速",
+                "3年平均现金流利润覆盖",
                 "3年营收CAGR",
                 "3年净利润CAGR",
             ]
@@ -324,6 +380,8 @@ def load_dynamic_cagr_table(
 
         avg_net_margin = None
         avg_roe = None
+        avg_cash_profit_coverage = None
+        avg_cash_growth = None
         continuous_growth = False
         revenue_growth_positive = False
         profit_growth_positive = False
@@ -351,7 +409,6 @@ def load_dynamic_cagr_table(
                 if revenue_growth_positive and profit_growth_positive:
                     continuous_growth = True
 
-            avg_cash_growth = None
             cash_flow = annual_window_grp["每股经营现金流量"]
             if cash_flow.notna().all():
                 cash_flow_asc = cash_flow.iloc[::-1]
@@ -360,6 +417,11 @@ def load_dynamic_cagr_table(
                 cash_yoy = cash_diff / prev_cash_abs
                 if cash_yoy.notna().any():
                     avg_cash_growth = float(cash_yoy.dropna().mean() * 100.0)
+
+            eps = annual_window_grp["每股收益"]
+            valid_coverage = cash_flow.notna() & eps.notna() & (eps > 0)
+            if valid_coverage.all():
+                avg_cash_profit_coverage = float((cash_flow / eps).mean())
 
         rows.append(
             {
@@ -372,6 +434,7 @@ def load_dynamic_cagr_table(
                 "3年平均净资产收益率": avg_roe,
                 "3年平均净利率": avg_net_margin,
                 "3年经营现金流平均增速": avg_cash_growth,
+                "3年平均现金流利润覆盖": avg_cash_profit_coverage,
                 "3年营收CAGR": revenue_cagr,
                 "3年净利润CAGR": profit_cagr,
             }
@@ -485,7 +548,16 @@ def load_financial_table_as_of(
             
         return (prof_qoq > 0).all() and (rev_qoq > 0).all()
 
-    accel_flags = financial.groupby("股票代码").apply(check_acceleration).reset_index(name="3个季度连续加速增长")
+    acceleration_columns = [
+        "财务报告期_dt",
+        "净利润-季度环比增长",
+        "营业总收入-季度环比增长",
+    ]
+    accel_flags = (
+        financial.groupby("股票代码")[acceleration_columns]
+        .apply(check_acceleration)
+        .reset_index(name="3个季度连续加速增长")
+    )
     financial = financial.merge(accel_flags, on="股票代码", how="left")
     
     financial = financial.drop_duplicates("股票代码", keep="first")
@@ -565,6 +637,7 @@ def attach_dynamic_cagr_fields(df: pd.DataFrame, as_of_date: date) -> pd.DataFra
             "3年平均净资产收益率",
             "3年平均净利率",
             "3年经营现金流平均增速",
+            "3年平均现金流利润覆盖",
             "3年营收CAGR",
             "3年净利润CAGR",
         ]:
@@ -587,6 +660,7 @@ def attach_dynamic_cagr_fields(df: pd.DataFrame, as_of_date: date) -> pd.DataFra
                 "3年平均净资产收益率",
                 "3年平均净利率",
                 "3年经营现金流平均增速",
+                "3年平均现金流利润覆盖",
                 "3年营收CAGR",
                 "3年净利润CAGR",
             ]
@@ -692,14 +766,47 @@ def filter_dividend_strategy(df: pd.DataFrame, args: argparse.Namespace) -> pd.D
     roe_series = df.get("3年平均净资产收益率", df.get("净资产收益率"))
     net_margin_series = df.get("3年平均净利率", df.get("销售净利率"))
     mask = (
-        df["估值公式值"].notna() & (df["估值公式值"] < args.valuation_formula_max)
+        df["PE"].notna() & (df["PE"] > 0)
+        & df["PB"].notna() & (df["PB"] > 0)
+        & df["估值公式值"].notna() & (df["估值公式值"] < args.valuation_formula_max)
         & df["3年经营现金流平均增速"].notna() & (df["3年经营现金流平均增速"] > 0)
         & df["总市值"].notna() & (df["总市值"] > args.market_cap_min_yi * 1e8)
         & net_margin_series.notna() & (net_margin_series > args.avg_net_profit_margin_min)
         & df["3年净利润CAGR"].notna() & (df["3年净利润CAGR"] > args.profit_cagr_min)
         & roe_series.notna() & (roe_series > args.dividend_roe_min)
+        & df["3年平均现金流利润覆盖"].notna()
+        & (df["3年平均现金流利润覆盖"] >= getattr(args, "cash_profit_coverage_min", 0.8))
     )
+    if getattr(args, "require_continuous_growth", True):
+        mask &= df["3年连续双增长"].fillna(False).astype(bool)
     return df[mask].copy()
+
+
+def filter_dividend_quality(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+    """Apply dividend-quality gates and a per-industry cap without composite scoring."""
+    if df.empty:
+        return df.copy()
+
+    minimum_years = getattr(args, "dividend_min_years", 4)
+    maximum_cut = getattr(args, "dividend_max_cut_pct", 30.0)
+    mask = (
+        df["分红数据状态"].eq("ok")
+        & df["TTM股息率"].notna()
+        & (df["TTM股息率"] > args.dividend_yield_min)
+        & df["近5年分红年份数"].notna()
+        & (df["近5年分红年份数"] >= minimum_years)
+        & df["连续3年分红"].fillna(False).astype(bool)
+        & df["最近年度分红变动率"].notna()
+        & (df["最近年度分红变动率"] >= -maximum_cut)
+    )
+    qualified = df[mask].copy().sort_values(
+        ["TTM股息率", "股票代码"], ascending=[False, True]
+    )
+    max_per_industry = getattr(args, "dividend_max_per_industry", 3)
+    if max_per_industry > 0 and not qualified.empty:
+        industry = qualified["所处行业"].fillna("未知行业")
+        qualified = qualified[industry.groupby(industry).cumcount() < max_per_industry]
+    return qualified.copy()
 
 # 成长股强周期底池
 CYCLICAL_GROWTH_INDUSTRIES = [
@@ -743,6 +850,7 @@ def attach_ttm_dividend_yield(
     if df.empty:
         result = df.copy()
         result["TTM股息率"] = pd.Series(dtype="float64")
+        result["分红数据状态"] = pd.Series(dtype="object")
         return result
 
     dividend_ttm = load_ttm_dividend_yield_table(
@@ -760,6 +868,16 @@ def threshold_payload(args: argparse.Namespace) -> dict:
         "valuation_formula_equivalent": "PE * (PB - 1) / PB",
         "dividend_yield_min": args.dividend_yield_min,
         "dividend_yield_basis": "TTM_dividend_yield_from_last_12_months_cash_dividend",
+        "dividend_yield_is_hard_filter": True,
+        "dividend_special_cash_excluded": True,
+        "dividend_quality_is_hard_filter": True,
+        "dividend_history_metrics_display_only": False,
+        "dividend_min_years_in_last_5": getattr(args, "dividend_min_years", 4),
+        "dividend_max_cut_pct": getattr(args, "dividend_max_cut_pct", 30.0),
+        "cash_profit_coverage_min": getattr(args, "cash_profit_coverage_min", 0.8),
+        "dividend_max_per_industry": getattr(args, "dividend_max_per_industry", 3),
+        "dividend_max_results": getattr(args, "dividend_max_results", 50),
+        "debt_ratio_is_hard_filter": False,
         "market_cap_min_yi": args.market_cap_min_yi,
         "avg_net_profit_margin_min": args.avg_net_profit_margin_min,
         "revenue_yoy_positive_years": LONG_TERM_CAGR_YEARS,
@@ -782,6 +900,10 @@ def output_columns(df: pd.DataFrame) -> pd.DataFrame:
         "PB",
         "估值公式值",
         "TTM股息率",
+        "分红数据状态",
+        "近5年分红年份数",
+        "连续3年分红",
+        "最近年度分红变动率",
         "总市值(亿元)",
         "CAGR终点年报",
         "CAGR起点年报",
@@ -793,6 +915,8 @@ def output_columns(df: pd.DataFrame) -> pd.DataFrame:
         "净利润同比增长率",
         "营业总收入同比增长率",
         "3年经营现金流平均增速",
+        "3年平均现金流利润覆盖",
+        "红利综合评分",
         "所处行业",
         "3年营收CAGR",
         "3年净利润CAGR",
@@ -803,7 +927,13 @@ def output_columns(df: pd.DataFrame) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = pd.NA
             
-    return df[cols].sort_values(["PB", "TTM股息率"], ascending=[True, False])
+    result = df[cols]
+    if result["红利综合评分"].notna().any():
+        return result.sort_values(
+            ["红利综合评分", "TTM股息率", "股票代码"],
+            ascending=[False, False, True],
+        )
+    return result.sort_values(["PB", "TTM股息率"], ascending=[True, False])
 
 
 def number_or_none(value) -> Optional[float]:
@@ -931,7 +1061,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dividend-yield-min", type=float, default=3.0)
     parser.add_argument("--market-cap-min-yi", type=float, default=100.0)
     parser.add_argument("--avg-net-profit-margin-min", type=float, default=10.0)
-    parser.add_argument("--require-continuous-growth", action="store_true", default=False)
+    parser.add_argument(
+        "--require-continuous-growth",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Require revenue and net profit YoY growth in each of the latest 3 annual reports",
+    )
     parser.add_argument("--profit-cagr-min", type=float, default=5.0)
     # 1-year explosive growth thresholds
     parser.add_argument("--growth-yoy-min", type=float, default=30.0)
@@ -939,6 +1074,12 @@ def build_parser() -> argparse.ArgumentParser:
     # Dividend thresholds
     parser.add_argument("--dividend-roe-min", type=float, default=10.0,
                         help="Minimum 3-year avg ROE for dividend strategy (default: 10%%)")
+    parser.add_argument("--cash-profit-coverage-min", type=float, default=0.8)
+    parser.add_argument("--dividend-min-years", type=int, default=4)
+    parser.add_argument("--dividend-max-cut-pct", type=float, default=30.0)
+    parser.add_argument("--dividend-max-per-industry", type=int, default=3)
+    parser.add_argument("--dividend-max-results", type=int, default=50)
+    parser.add_argument("--dividend-min-data-coverage", type=float, default=0.95)
     parser.add_argument(
         "--output-file",
         help="Optional JSON output file path. If omitted, print to stdout.",
@@ -1098,7 +1239,19 @@ def main() -> int:
         # Apply dividend filter for dividend strategy
         final_dividend = with_dividend[with_dividend["股票代码"].isin(dividend_candidates["股票代码"])].copy()
         if not final_dividend.empty:
-            final_dividend = final_dividend[final_dividend["TTM股息率"].notna() & (final_dividend["TTM股息率"] > args.dividend_yield_min)].copy()
+            evaluated = final_dividend["分红数据状态"].isin(
+                ["ok", "confirmed_no_dividend"]
+            )
+            coverage = float(evaluated.mean())
+            if coverage < args.dividend_min_data_coverage:
+                errors = final_dividend.loc[
+                    ~evaluated, "分红数据状态"
+                ].value_counts().to_dict()
+                raise RuntimeError(
+                    f"Dividend data coverage {coverage:.2%} below required "
+                    f"{args.dividend_min_data_coverage:.2%}; errors={errors}"
+                )
+            final_dividend = filter_dividend_quality(final_dividend, args)
             
         final_growth = with_dividend[with_dividend["股票代码"].isin(growth_candidates["股票代码"])].copy()
         

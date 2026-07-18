@@ -11,6 +11,12 @@ import requests
 
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".cache")
 DEFAULT_EXPIRE_HOURS = 12
+LIVE_QUOTE_MODES = {"shadow", "live-shadow", "production"}
+QUOTE_CACHE_SCHEMA_VERSION = 2
+
+
+class QuoteSnapshotModeError(RuntimeError):
+    """Raised when a quote request conflicts with the explicit run context."""
 
 def clear_cache():
     if not os.path.exists(CACHE_DIR):
@@ -39,7 +45,13 @@ def with_retry(max_retries=3, delay=2):
         return wrapper
     return decorator
 
-def disk_cache(expire_hours=DEFAULT_EXPIRE_HOURS):
+def disk_cache(
+    expire_hours=DEFAULT_EXPIRE_HOURS,
+    *,
+    context_keys=(),
+    schema_version=1,
+    validator=None,
+):
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
@@ -47,8 +59,16 @@ def disk_cache(expire_hours=DEFAULT_EXPIRE_HOURS):
             
             if not os.path.exists(CACHE_DIR):
                 os.makedirs(CACHE_DIR, exist_ok=True)
-            
-            key_str = f"{func.__name__}_{args}_{kwargs}"
+
+            context = tuple((key, os.environ.get(key)) for key in context_keys)
+            if schema_version == 1 and not context:
+                # Preserve existing keys for unrelated financial/universe
+                # caches; only explicitly versioned adapters invalidate data.
+                key_str = f"{func.__name__}_{args}_{kwargs}"
+            else:
+                key_str = (
+                    f"v{schema_version}_{func.__name__}_{args}_{kwargs}_{context}"
+                )
             key_hash = hashlib.md5(key_str.encode("utf-8")).hexdigest()
             cache_file = os.path.join(CACHE_DIR, f"{key_hash}.pkl")
             
@@ -58,12 +78,38 @@ def disk_cache(expire_hours=DEFAULT_EXPIRE_HOURS):
                 if clock.now().timestamp() - mtime < expire_hours * 3600:
                     try:
                         with open(cache_file, "rb") as f:
-                            return pickle.load(f)
+                            cached = pickle.load(f)
+                        return (
+                            validator(cached, *args, **kwargs)
+                            if validator
+                            else cached
+                        )
                     except Exception as e:
                         import logging
-                        logging.error(f"Failed to read cache {cache_file}: {e}")
-            
+                        quarantine_dir = os.path.join(CACHE_DIR, "quarantine")
+                        os.makedirs(quarantine_dir, exist_ok=True)
+                        quarantine_name = (
+                            os.path.basename(cache_file)
+                            + f".invalid-{int(time.time())}"
+                        )
+                        quarantine_path = os.path.join(
+                            quarantine_dir, quarantine_name
+                        )
+                        try:
+                            os.replace(cache_file, quarantine_path)
+                        except OSError as quarantine_error:
+                            logging.error(
+                                "Failed to quarantine cache %s: %s",
+                                cache_file,
+                                quarantine_error,
+                            )
+                        logging.error(
+                            "Rejected cached value %s: %s", cache_file, e
+                        )
+
             result = func(*args, **kwargs)
+            if validator:
+                result = validator(result, *args, **kwargs)
             
             try:
                 if not os.path.exists(CACHE_DIR):
@@ -77,6 +123,75 @@ def disk_cache(expire_hours=DEFAULT_EXPIRE_HOURS):
             return result
         return wrapper
     return decorator
+
+
+def _quote_snapshot_mode():
+    """Resolve quote routing from run identity, never from calendar-day gaps."""
+    pipeline_mode = os.environ.get("PIPELINE_MODE")
+    if pipeline_mode in LIVE_QUOTE_MODES:
+        effective_date = os.environ.get("PIPELINE_EFFECTIVE_DATE") or os.environ.get(
+            "EFFECTIVE_DATE"
+        )
+        if effective_date:
+            from core.market import AShareMarket
+
+            market_session = AShareMarket().get_effective_trading_date()
+            if effective_date != market_session:
+                raise QuoteSnapshotModeError(
+                    f"{pipeline_mode} effective date {effective_date} does not match "
+                    f"the A-share market session {market_session}; use an offline "
+                    "point-in-time fixture for historical screening"
+                )
+        return "live"
+    if pipeline_mode == "offline":
+        raise QuoteSnapshotModeError(
+            "offline screening must use GLOBAL_SCREEN_FIXTURE; live quote adapters "
+            "and synthetic historical fundamentals are forbidden"
+        )
+    if pipeline_mode:
+        raise QuoteSnapshotModeError(f"unsupported PIPELINE_MODE: {pipeline_mode!r}")
+
+    # Compatibility for standalone historical callers.  Pipeline runs always
+    # export PIPELINE_MODE and therefore never enter this implicit branch.
+    from core.clock import clock
+    import datetime
+
+    return "historical" if clock.today() < datetime.date.today() else "live"
+
+
+def _validate_live_quote_snapshot(frame, codes):
+    if frame is None or frame.empty:
+        raise ValueError("A-share live quote snapshot is empty")
+    required = {"股票代码", "最新价", "总市值"}
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise ValueError(
+            "A-share live quote snapshot is missing columns: " + ", ".join(missing)
+        )
+
+    requested = {str(code).zfill(6) for code in codes}
+    if not requested:
+        return frame
+    symbols = frame["股票代码"].astype(str).str.zfill(6)
+    prices = pd.to_numeric(frame["最新价"], errors="coerce")
+    market_caps = pd.to_numeric(frame["总市值"], errors="coerce")
+    valid_symbols = set(
+        symbols[(prices > 0) & (market_caps > 0) & symbols.isin(requested)]
+    )
+    coverage = len(valid_symbols) / len(requested)
+    minimum = float(os.environ.get("A_SHARE_QUOTE_MIN_COVERAGE", "0.99"))
+    if coverage < minimum:
+        raise ValueError(
+            f"A-share live quote transport coverage {coverage:.2%} below "
+            f"required {minimum:.2%}"
+        )
+    return frame
+
+
+def _validate_quote_cache_value(frame, codes):
+    if _quote_snapshot_mode() == "live":
+        return _validate_live_quote_snapshot(frame, codes)
+    return frame
 
 def to_secid(code: str) -> str:
     if code.startswith(("600", "601", "603", "605", "688", "689")):
@@ -114,17 +229,21 @@ async def _fetch_quote_snapshot_async(codes):
         for r in results: rows.extend(r)
         return rows
 
-@disk_cache(expire_hours=2)
+@disk_cache(
+    expire_hours=2,
+    context_keys=("PIPELINE_MODE", "PIPELINE_EFFECTIVE_DATE", "EFFECTIVE_DATE"),
+    schema_version=QUOTE_CACHE_SCHEMA_VERSION,
+    validator=_validate_quote_cache_value,
+)
 @with_retry(max_retries=3, delay=2)
 def fetch_quote_snapshot_cached(codes: list[str]) -> pd.DataFrame:
     if not codes:
         return pd.DataFrame(columns=["股票代码", "股票简称", "最新价", "PE", "PB", "总市值"])
     
-    from core.clock import clock
-    import datetime
-    real_today = datetime.date.today()
-    
-    if clock.today() < real_today:
+    quote_mode = _quote_snapshot_mode()
+
+    if quote_mode == "historical":
+        from core.clock import clock
         from core.historical_price import get_historical_closes_bulk, a_share_to_yf
         yf_symbols = [a_share_to_yf(c) for c in codes]
         all_prices = {}
@@ -178,7 +297,8 @@ def fetch_quote_snapshot_cached(codes: list[str]) -> pd.DataFrame:
     df["PB"] = pd.to_numeric(df["PB_raw"], errors="coerce")
     df["PB"] = df["PB"].where(~((df["PB"].abs() >= 20) & (df["PB"] % 1 == 0)), df["PB"] / 100)
     df["总市值"] = pd.to_numeric(df["总市值"], errors="coerce")
-    return df[["股票代码", "股票简称", "最新价", "今开", "昨收", "PE", "PB", "总市值"]]
+    result = df[["股票代码", "股票简称", "最新价", "今开", "昨收", "PE", "PB", "总市值"]]
+    return _validate_live_quote_snapshot(result, codes)
 
 import asyncio
 import aiohttp
@@ -233,7 +353,7 @@ async def _fetch_em_report_async(date, report_name):
         for r in results: all_data.extend(r)
         return all_data
 
-@disk_cache(expire_hours=24*30)
+@disk_cache(expire_hours=24)
 @with_retry(max_retries=3, delay=2)
 def stock_yjbb_em_cached(date: str) -> pd.DataFrame:
     rows = asyncio.run(_fetch_em_report_async(date, "RPT_LICO_FN_CPD"))
@@ -257,7 +377,7 @@ def stock_yjbb_em_cached(date: str) -> pd.DataFrame:
             df[col] = None
     return df
 
-@disk_cache(expire_hours=24*30)
+@disk_cache(expire_hours=24)
 @with_retry(max_retries=3, delay=2)
 def stock_zcfz_em_cached(date: str) -> pd.DataFrame:
     rows = asyncio.run(_fetch_em_report_async(date, "RPT_DMSK_FN_BALANCE"))
@@ -277,7 +397,7 @@ def stock_zcfz_em_cached(date: str) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = None
     return df
-@disk_cache(expire_hours=24*30)
+@disk_cache(expire_hours=24)
 @with_retry(max_retries=3, delay=2)
 def stock_dividend_cninfo_cached(symbol: str) -> pd.DataFrame:
     import concurrent.futures

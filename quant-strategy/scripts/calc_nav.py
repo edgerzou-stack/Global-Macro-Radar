@@ -1,5 +1,6 @@
 import datetime
 import math
+import os
 
 import pandas as pd
 
@@ -51,11 +52,24 @@ def _close_on_date(frame, date):
     return _positive_finite(exact.iloc[-1].get("收盘"))
 
 
+def _adjustment_factor_drift(frames, start_date, end_date):
+    adjusted = frames.get("hfq", pd.DataFrame())
+    raw = frames.get("", pd.DataFrame())
+    first_adjusted = _close_on_date(adjusted, start_date)
+    first_raw = _close_on_date(raw, start_date)
+    last_adjusted = _close_on_date(adjusted, end_date)
+    last_raw = _close_on_date(raw, end_date)
+    if None in (first_adjusted, first_raw, last_adjusted, last_raw):
+        return None
+    factor_entry = first_adjusted / first_raw
+    factor_exit = last_adjusted / last_raw
+    return abs(factor_exit - factor_entry) / factor_entry
+
+
 def _prepare_market_data(portfolio, today):
     """Fetch each symbol/adjust pair once for the complete valuation range."""
     requirements = {}
     position_dates = {}
-
     for strategy, positions in portfolio.items():
         market = _market_for_strategy(strategy)
         end_raw = datetime.datetime.strptime(
@@ -72,6 +86,31 @@ def _prepare_market_data(portfolio, today):
             except (TypeError, ValueError):
                 entry_raw = today
             entry_date = market.get_most_recent_trading_day(entry_raw).strftime("%Y%m%d")
+            if entry_date > end_date:
+                try:
+                    effective_session = market.get_effective_trading_date().replace(
+                        "-", ""
+                    )
+                except (AttributeError, RuntimeError, ValueError):
+                    effective_session = None
+                if (
+                    os.environ.get("PIPELINE_ENFORCE_SESSION_IDENTITY") == "1"
+                    and entry_date == effective_session
+                ):
+                    # A position executed in the currently active session has
+                    # no official close yet.  Until that session completes,
+                    # value only that exact position at authoritative cost.
+                    position_dates[(strategy, symbol)] = (
+                        None,
+                        entry_date,
+                        end_date,
+                    )
+                    continue
+                raise ValuationUnavailableError(
+                    f"{strategy}/{symbol} entry session {entry_date} is later "
+                    f"than latest completed valuation session {end_date} and "
+                    f"does not match active market session {effective_session or 'unknown'}"
+                )
             fetch_symbol = (
                 f"{symbol}.HK"
                 if "_hk_" in strategy and not symbol.upper().endswith(".HK")
@@ -95,6 +134,23 @@ def _prepare_market_data(portfolio, today):
             except Exception as error:
                 print(f"Failed to fetch {adjust or 'raw'} valuation range for {symbol}: {error}")
                 frames[adjust] = pd.DataFrame()
+
+        factor_drift = _adjustment_factor_drift(
+            frames, bounds["start"], bounds["end"]
+        )
+        if factor_drift is not None and (
+            not math.isfinite(factor_drift) or factor_drift > 0.2
+        ):
+            reason = (
+                "adjusted/raw factor drift requires a clean paired refresh: "
+                f"{factor_drift:.6f}"
+            )
+            try:
+                frames = data_gateway.refresh_valuation_closes(
+                    symbol, bounds["start"], bounds["end"], reason
+                )
+            except Exception as error:
+                print(f"Failed to refresh mismatched valuation series for {symbol}: {error}")
         market_data[symbol] = frames
 
     return position_dates, market_data
@@ -114,6 +170,8 @@ def _position_multiplier(strategy, symbol, position, position_dates, market_data
         )
 
     fetch_symbol, entry_date, end_date = valuation_dates
+    if fetch_symbol is None:
+        return 1.0
     frames = market_data.get(fetch_symbol, {})
     adjusted = frames.get("hfq", pd.DataFrame())
     raw = frames.get("", pd.DataFrame())
@@ -163,10 +221,11 @@ def calc_nav():
         account_filter, account_parameters, _ = quarantine_filter(
             conn, "strategy_accounts"
         )
+        test_filter, test_parameters = db_utils.test_strategy_filter("strategy_id")
         cursor.execute(
             "SELECT strategy_id, available_cash, total_capital "
-            "FROM strategy_accounts WHERE 1=1" + account_filter,
-            account_parameters,
+            "FROM strategy_accounts WHERE 1=1" + account_filter + test_filter,
+            account_parameters + test_parameters,
         )
         accounts = cursor.fetchall()
         quarantined_nav_keys = quarantined_primary_keys(

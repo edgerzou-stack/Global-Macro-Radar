@@ -6,6 +6,7 @@ import datetime
 import math
 import pandas as pd
 from core.data_gateway import DataGateway
+from core.market import AShareMarket, USMarket
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("StockAPIHealthCheck")
@@ -136,8 +137,12 @@ def main():
 
     # Check A-share API (Cross-validation between Baostock and Sina)
     try:
-        # Use a recent trading date. We just fetch the last 7 days and take the most recent overlapping day.
-        end_dt = clock.today()
+        # Closing-bar health must stop at the latest completed market session.
+        # During trading hours, requesting the logical run date would bypass a
+        # valid prior-session cache and needlessly hit the live provider.
+        end_dt = datetime.date.fromisoformat(
+            AShareMarket().get_latest_completed_trading_date()
+        )
         start_dt = end_dt - datetime.timedelta(days=7)
         start_str = start_dt.strftime("%Y%m%d")
         end_str = end_dt.strftime("%Y%m%d")
@@ -162,13 +167,18 @@ def main():
 
     # Check US/HK API (YFinance)
     try:
-        end_dt = clock.today()
-        start_dt = end_dt - datetime.timedelta(days=10)
+        end_dt = datetime.date.fromisoformat(
+            USMarket().get_latest_completed_trading_date()
+        )
+        session = end_dt.strftime("%Y%m%d")
+        # A health probe needs one authoritative completed close, not an
+        # arbitrary ten-day range.  This maximizes safe cache reuse and only
+        # contacts Yahoo when the completed-session row is genuinely absent.
         df_us = dg.get_historical_prices(
-            "AAPL", start_dt.strftime("%Y%m%d"), end_dt.strftime("%Y%m%d")
+            "AAPL", session, session
         )
         validate_price_frame_fresh(df_us, end_dt)
-        logger.info("US-share API is healthy.")
+        logger.info("US-share market-data path is healthy through %s.", session)
     except Exception as e:
         logger.error(f"US-share API failed: {e}")
         sys.exit(1)

@@ -10,6 +10,19 @@ DATABASE_ENV_KEY = "database_environment"
 ALLOWED_DATABASE_ENVIRONMENTS = {"production", "test", "backtest"}
 
 
+def exclude_test_strategies():
+    """Return whether pipeline reads must isolate legacy test strategy rows."""
+    return os.environ.get("PIPELINE_EXCLUDE_TEST_STRATEGIES") == "1"
+
+
+def test_strategy_filter(column="strategy"):
+    if column not in {"strategy", "strategy_id"}:
+        raise ValueError(f"Unsupported strategy filter column: {column!r}")
+    if not exclude_test_strategies():
+        return "", ()
+    return f" AND {column} NOT LIKE ? ESCAPE '\\'", ("test\\_%",)
+
+
 def normalize_db_path(path):
     if not path:
         raise ValueError("A database path is required")
@@ -222,9 +235,11 @@ def load_portfolio_and_trades():
     c = conn.cursor()
 
     portfolio_exclusion, _ = quarantine_exclusion(conn, "portfolio")
+    portfolio_test_filter, portfolio_test_parameters = test_strategy_filter("strategy")
     c.execute(
         "SELECT id, strategy, name_or_code, entry_date, entry_price, shares "
-        f"FROM portfolio WHERE 1=1{portfolio_exclusion}"
+        f"FROM portfolio WHERE 1=1{portfolio_exclusion}{portfolio_test_filter}",
+        portfolio_test_parameters,
     )
     portfolio = {}
     for row in c.fetchall():
@@ -235,10 +250,12 @@ def load_portfolio_and_trades():
         portfolio[strategy][name_or_code] = {"entry_date": entry_date, "entry_price": entry_price, "shares": max(1, shares)}
 
     trade_exclusion, _ = quarantine_exclusion(conn, "trade_history")
+    trade_test_filter, trade_test_parameters = test_strategy_filter("strategy")
     c.execute(
         "SELECT id, strategy, name_or_code, entry_date, entry_price, "
         "exit_date, exit_price, pnl, reason "
-        f"FROM trade_history WHERE 1=1{trade_exclusion}"
+        f"FROM trade_history WHERE 1=1{trade_exclusion}{trade_test_filter}",
+        trade_test_parameters,
     )
     trade_history = []
     for row in c.fetchall():
@@ -325,7 +342,14 @@ def update_portfolio_and_trades(portfolio_dict, trades_list, snapshot_date=None,
 
 def _execute_portfolio_updates(c, portfolio_dict, trades_list, snapshot_date):
     # --- State Machine Sanity Guards ---
-    c.execute("SELECT COUNT(*) FROM portfolio")
+    strategy_ids = list(portfolio_dict)
+    if not strategy_ids:
+        return
+    placeholders = ",".join("?" for _ in strategy_ids)
+    c.execute(
+        f"SELECT COUNT(*) FROM portfolio WHERE strategy IN ({placeholders})",
+        strategy_ids,
+    )
     old_total = c.fetchone()[0]
     new_total = sum(len(holdings) for holdings in portfolio_dict.values())
     
@@ -431,6 +455,9 @@ def load_latest_daily_results():
             payload["results"][strategy] = strat_data.get("results", [])
             payload["diff"][strategy] = strat_data.get("diff", {})
             payload["stage_counts"][strategy] = len(payload["results"][strategy])
+            if "appendix" not in payload:
+                payload["appendix"] = {}
+            payload["appendix"][strategy] = strat_data.get("appendix", [])
         except Exception as e:
             print(f"Error parsing json for strategy {strategy}: {e}")
             
