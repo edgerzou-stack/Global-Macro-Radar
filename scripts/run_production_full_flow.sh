@@ -75,7 +75,7 @@ RUN_ID="production-fullflow-${RUN_SUFFIX}"
 RUN_DIR="$ARTIFACT_ROOT/$RUN_ID"
 MANIFEST="$RUN_DIR/run-manifest.json"
 JOURNAL="$RUN_DIR/delivery/$RUN_ID.json"
-REPORT_HTML="$ROOT_DIR/quant-strategy/reports/screening_results.html"
+PREPARED_MANIFEST="$RUN_DIR/prepared-report.json"
 
 echo "Starting one production run: $RUN_ID"
 "$ROOT_DIR/run_all.sh" \
@@ -88,48 +88,8 @@ echo "Starting one production run: $RUN_ID"
     --delivery-mode live \
     --confirm-live-delivery
 
-"$PYTHON" - "$MANIFEST" "$JOURNAL" "$DATABASE" "$REPORT_HTML" <<'PY'
-import hashlib
-import json
-import sys
-from pathlib import Path
-
-manifest_path, journal_path, database_path, report_html = map(Path, sys.argv[1:])
-manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-if manifest.get("payload", {}).get("status") != "completed":
-    raise SystemExit(f"Run manifest is not completed: {manifest_path}")
-journal = json.loads(journal_path.read_text(encoding="utf-8"))
-if journal.get("state") != "accepted_by_smtp":
-    raise SystemExit(
-        f"SMTP was not accepted; journal state={journal.get('state')!r}"
-    )
-if not journal.get("recipient"):
-    raise SystemExit("Delivery journal has no recipient")
-if not report_html.is_file():
-    raise SystemExit(f"Generated report HTML is missing: {report_html}")
-html_sha = hashlib.sha256(report_html.read_bytes()).hexdigest()
-if html_sha != journal.get("html_sha256"):
-    raise SystemExit("Generated report HTML SHA does not match delivery journal")
-database_sha = hashlib.sha256(database_path.read_bytes()).hexdigest()
-print(
-    json.dumps(
-        {
-            "run_id": journal["run_id"],
-            "manifest": str(manifest_path),
-            "database_sha256": database_sha,
-            "delivery_journal": str(journal_path),
-            "delivery_state": journal["state"],
-            "recipient": journal["recipient"],
-            "report_html": str(report_html),
-            "html_sha256": html_sha,
-            "note": (
-                "accepted_by_smtp confirms SMTP acceptance only; "
-                "it does not prove inbox receipt"
-            ),
-        },
-        ensure_ascii=False,
-        indent=2,
-        sort_keys=True,
-    )
-)
-PY
+"$PYTHON" "$ROOT_DIR/quant-strategy/scripts/verify_production_full_flow.py" \
+    "$MANIFEST" \
+    "$JOURNAL" \
+    "$PREPARED_MANIFEST" \
+    "$DATABASE"

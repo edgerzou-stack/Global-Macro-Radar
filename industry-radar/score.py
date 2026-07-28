@@ -1,17 +1,140 @@
 import os
 import json
 import math
+import re
 from dotenv import load_dotenv
 from llm_router import _call_llm_with_fallback
 from run_date import logical_date_text
 
 load_dotenv()
 
-SCORING_PROMPT_VERSION = "dual-track-v2"
+SCORING_PROMPT_VERSION = "dual-track-v3-industry-events"
+
+INDUSTRIAL_EVENT_TYPES = {
+    "technical_breakthrough",
+    "product_launch",
+    "capacity_capex",
+    "supply_chain",
+    "industrial_policy",
+    "funding_with_use",
+    "commercial_deployment",
+    "mixed_industrial_market",
+    "other_industrial",
+}
+NON_INDUSTRIAL_EVENT_TYPES = {"market_only", "non_industrial"}
+EVENT_TYPES = INDUSTRIAL_EVENT_TYPES | NON_INDUSTRIAL_EVENT_TYPES
+
+_MARKET_ONLY_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"股价",
+        r"股票.{0,8}(?:上涨|下跌|大涨|暴涨|暴跌)",
+        r"(?:首日|盘中|收盘).{0,8}(?:上涨|下跌|大涨|暴涨|收涨|收跌)",
+        r"涨停|跌停|市值|成交额|换手率|大盘走势|券商评级|目标价",
+        r"融资余额|资金流向|北向资金",
+        r"\bstock price\b|\bmarket cap\b|\btrading volume\b|\btrading debut\b",
+        r"\bshares?\b.{0,30}\b(?:jump|surge|rise|fall|drop|gain|lose)s?\b",
+    )
+)
+_INDUSTRIAL_ACTION_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"技术突破|工艺升级|研发|量产|投产|扩产|产能|产线|新建.{0,8}(?:工厂|厂)",
+        r"产品发布|推出.{0,20}(?:产品|平台|模型|芯片|设备)|交付|订单|客户验证",
+        r"获(?:得)?批准|获(?:得)?认证|临床试验|供应链|产业政策|监管新规|国家标准",
+        r"并购|收购|商业部署|商业化|开源",
+        r"融资.{0,20}(?:用于|投向)|募集资金.{0,20}(?:用于|投向)|资本开支|设备采购",
+        r"\btechnical breakthrough\b|\br&d\b|\bresearch and development\b",
+        r"\bmass production\b|\bproduction line\b|\bcapacity expansion\b|\bcapex\b",
+        r"\bfactory\b|\bproduct launch\b|\bcommercial deployment\b",
+        r"\bsupply chain\b|\bregulation\b|\bindustrial policy\b",
+        r"\bfunding\b.{0,30}\b(?:used|for|to build|to expand|to develop)\b",
+    )
+)
+_LOCAL_REJECTION_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bmorning brief\b|\bweekly digest\b|\bnews roundup\b",
+        r"早报|晚报|晨报|新闻汇总|氪星晚报|点1氪",
+        r"\bblack friday\b|\bprime day\b|\bsave \$?\d+",
+        r"购物指南|优惠精选|限时优惠",
+    )
+)
 
 
 class ScoreValidationError(ValueError):
     """Raised when scoring configuration or LLM output violates the contract."""
+
+
+def _article_policy_text(article):
+    return " ".join(
+        str(article.get(field) or "")
+        for field in ("title", "summary", "content")
+    )[:4000]
+
+
+def local_article_route(article):
+    """Return a deterministic coarse route without replacing semantic scoring.
+
+    The local layer only handles high-confidence boundaries. Concrete industrial
+    actions bypass the lossy fast LLM pre-filter and proceed to detailed scoring.
+    Clear market-only items fail closed. Ambiguous articles remain LLM-routed.
+    """
+
+    text = _article_policy_text(article)
+    if any(pattern.search(text) for pattern in _LOCAL_REJECTION_PATTERNS):
+        return "reject"
+    has_market_signal = any(
+        pattern.search(text) for pattern in _MARKET_ONLY_PATTERNS
+    )
+    has_industrial_action = any(
+        pattern.search(text) for pattern in _INDUSTRIAL_ACTION_PATTERNS
+    )
+    if has_market_signal and not has_industrial_action:
+        return "market_only"
+    if has_industrial_action:
+        return "industry_candidate"
+    return "llm"
+
+
+def apply_industry_relevance_gate(article, score_data):
+    """Enforce the industry-news boundary on fresh and cached score payloads."""
+
+    gated = dict(score_data or {})
+    event_type = gated.get("event_type")
+    industrial_claims = gated.get("industrial_claims")
+    explicit_industrial = (
+        event_type in INDUSTRIAL_EVENT_TYPES
+        and isinstance(industrial_claims, list)
+        and any(str(claim).strip() for claim in industrial_claims)
+    )
+    explicit_non_industrial = event_type in NON_INDUSTRIAL_EVENT_TYPES
+    local_route = local_article_route(article)
+
+    rejection = gated.get("industry_policy_rejection")
+    if rejection:
+        pass
+    elif explicit_non_industrial:
+        rejection = event_type
+    elif event_type in INDUSTRIAL_EVENT_TYPES and not explicit_industrial:
+        rejection = "missing_industrial_claim"
+    elif not explicit_industrial and local_route in {"market_only", "reject"}:
+        rejection = local_route
+
+    if rejection:
+        gated["is_relevant"] = False
+        for field in ("tech_score", "commercial_score", "hype_score", "macro_score"):
+            if isinstance(gated.get(field), (int, float)):
+                gated[field] = min(gated[field], 40)
+        for field in ("innovation_score", "traffic_score"):
+            if isinstance(gated.get(field), (int, float)):
+                gated[field] = min(float(gated[field]), 4.0)
+        gated["industry_policy_rejection"] = rejection
+        gated["justification"] = (
+            "REJECTED: no independently useful industrial event remains after "
+            "removing market-price, trading-volume, and valuation claims."
+        )
+    return gated
 
 
 def _current_date_text():
@@ -99,10 +222,39 @@ def _validate_score_result(result, expected_id=None, require_id=False):
     ):
         if not isinstance(result.get(field), str):
             raise ScoreValidationError(f"{field} must be a string")
-    if len(result["translated_summary"]) > 50:
-        raise ScoreValidationError("translated_summary must not exceed 50 characters")
-
     validated = dict(result)
+    if len(validated["translated_summary"]) > 50:
+        validated["translated_summary"] = validated["translated_summary"][:50]
+    event_type = validated.get("event_type")
+    if event_type not in EVENT_TYPES:
+        raise ScoreValidationError(
+            f"event_type must be one of {sorted(EVENT_TYPES)}"
+        )
+    for field in ("industrial_claims", "market_only_claims"):
+        claims = validated.get(field)
+        if not isinstance(claims, list) or any(
+            not isinstance(claim, str) or not claim.strip() for claim in claims
+        ):
+            raise ScoreValidationError(f"{field} must be a list of non-empty strings")
+    if event_type in INDUSTRIAL_EVENT_TYPES and not validated["industrial_claims"]:
+        validated["event_type"] = "non_industrial"
+        validated["is_relevant"] = False
+        validated["industry_policy_rejection"] = "invalid_event_contract"
+        validated["justification"] = (
+            "REJECTED: industrial event type was returned without a concrete "
+            "industrial claim."
+        )
+    elif (
+        event_type in NON_INDUSTRIAL_EVENT_TYPES
+        and validated["industrial_claims"]
+    ):
+        validated["industrial_claims"] = []
+        validated["is_relevant"] = False
+        validated["industry_policy_rejection"] = "invalid_event_contract"
+        validated["justification"] = (
+            "REJECTED: model returned contradictory industrial and "
+            "non-industrial classifications."
+        )
     if validated["is_vague_or_roundup"]:
         validated["is_relevant"] = False
         validated["justification"] = (
@@ -142,32 +294,48 @@ def score_article(article, config):
     {rubric}
     
     Tasks:
-    1. Determine if this article is relevant to the tech industry (True/False). 
+    1. Classify the article's primary event as exactly one of:
+       technical_breakthrough, product_launch, capacity_capex, supply_chain,
+       industrial_policy, funding_with_use, commercial_deployment,
+       mixed_industrial_market, other_industrial, market_only, non_industrial.
+       Extract `industrial_claims` that remain useful after removing all stock
+       price, market-cap, trading-volume, valuation, analyst-rating and fund-flow
+       claims. Extract those removed claims separately as `market_only_claims`.
+       An IPO/funding story is industrial only when it states a concrete use of
+       proceeds, capacity project, R&D program, product/customer validation, or
+       supply-chain effect. A technology-company name alone is not an industrial
+       event.
+    2. Determine if this article is relevant to the tech industry (True/False).
        **CRITICAL REJECTION RULES: You MUST set is_relevant to False if the article is:**
        - A news roundup, summary, or digest (e.g., "Top 10 news", "Morning brief", "Weekly digest", "8点1氪", "氪星晚报", "晚报").
        - A shopping deal, discount, or advertisement (e.g., "Prime Day deals", "Black Friday", "Save $50 on...", "优惠精选", "购物指南").
        - Re-hashed old news or an old event being re-reported as new (e.g., "炒冷饭" - a breakthrough or event that actually happened months or years prior to the Current Date). If you recognize the event as historical relative to the Current Date, YOU MUST REJECT IT by setting is_relevant to False.
        - Vague, generic, or purely macro-level commentary lacking specific technical details, quantitative data, or concrete innovations (e.g., "market is growing", "competition intensifies", or "many companies are releasing models" without specifying unique technical specs).
-    2. Explicitly determine if this article is a vague roundup, digest, or macro-level commentary without concrete technical data. Set `is_vague_or_roundup` to True if it is.
-    3. Output 4 core sub-scores (0-100 integers): 'tech_score', 'commercial_score', 'hype_score', 'macro_score'.
+       - Pure stock-price, trading-volume, market-cap, index, analyst-rating, or
+         fund-flow news without a separate concrete industrial claim.
+    3. Explicitly determine if this article is a vague roundup, digest, or macro-level commentary without concrete technical data. Set `is_vague_or_roundup` to True if it is.
+    4. Output 4 core sub-scores (0-100 integers): 'tech_score', 'commercial_score', 'hype_score', 'macro_score'.
        **CRITICAL SCORING ANCHORS - YOU MUST STRICTLY FOLLOW THESE RUBRICS:**
        - **90-100**: Global paradigm shift or absolute breakthrough (e.g., AGI achieved, TSMC 1nm success, cure for cancer). Will fundamentally change the world immediately.
        - **70-89**: Major industry milestone, highly impactful VC funding (> $100M), critical product launch by a tech giant (e.g., Apple Vision Pro, GPT-4), or a massive structural policy change.
        - **40-69**: Routine product updates, moderate funding rounds ($10M-$50M), steady earnings reports, or incremental technical improvements.
        - **0-39**: Trivial gossip, extremely minor updates, generic executive PR talk, or things with no real-world impact.
-    4. Provide structured reasoning before scoring. You must explicitly evaluate:
+    5. Provide structured reasoning before scoring. You must explicitly evaluate:
        - 'barrier_to_entry': How hard is this to replicate?
        - 'market_size': Is the target market massive or niche?
        - 'immediacy': Is the impact happening right now, or years in the future?
-    5. Output a 'reasoning_chain' summarizing the structured reasoning.
-    6. Provide a concise 1-sentence justification explaining the scores in {config.get('output', {}).get('language', 'Chinese')}.
-    7. Provide the translation of the 'Article Title' into {config.get('output', {}).get('language', 'Chinese')}.
-    8. Provide a HIGHLY CONDENSED summary of the article content. **CRITICAL RULE: The translated_summary MUST be ONE SINGLE SENTENCE and MUST NOT exceed 50 Chinese characters. Be extremely brief.**
+    6. Output a 'reasoning_chain' summarizing the structured reasoning.
+    7. Provide a concise 1-sentence justification explaining the scores in {config.get('output', {}).get('language', 'Chinese')}.
+    8. Provide the translation of the 'Article Title' into {config.get('output', {}).get('language', 'Chinese')}. For a mixed article, title the industrial event rather than its stock-price reaction.
+    9. Provide a HIGHLY CONDENSED summary of the article content. **CRITICAL RULE: The translated_summary MUST be ONE SINGLE SENTENCE and MUST NOT exceed 50 Chinese characters. Be extremely brief.**
     
     You must output strictly in JSON format matching this schema:
     {{
       "is_relevant": boolean,
       "is_vague_or_roundup": boolean,
+      "event_type": string,
+      "industrial_claims": [string],
+      "market_only_claims": [string],
       "barrier_to_entry": string,
       "market_size": string,
       "immediacy": string,
@@ -193,7 +361,8 @@ def score_article(article, config):
         "trusted" if article.get("source") in config.get("trusted_sources", []) else "standard"
     )
     result["prompt_version"] = SCORING_PROMPT_VERSION
-    return _apply_composite_scores(result, weights)
+    _apply_composite_scores(result, weights)
+    return apply_industry_relevance_gate(article, result)
 
 def deduplicate_articles(articles, config):
     if len(articles) <= 1:
@@ -429,6 +598,13 @@ def pre_filter_articles_batch(articles_batch, config):
     1. A news roundup/digest (e.g. "Morning brief", "晚报").
     2. A shopping deal, discount, ad (e.g. "Black Friday", "Save $50", "促销").
     3. Re-hashed old news or gossip.
+    4. Pure stock-price, trading-volume, market-cap, index, analyst-rating, or
+       fund-flow news with no concrete technology, product, capacity, R&D,
+       deployment, supply-chain, regulatory, or use-of-funds claim.
+
+    A concrete industrial policy, product launch, production/capacity project,
+    customer deployment, clinical milestone, or funding with a stated industrial
+    use MUST survive this fast filter and proceed to detailed scoring.
     
     Input JSON:
     {json.dumps(payload, ensure_ascii=False)}
@@ -496,13 +672,22 @@ def score_articles_batch(articles_batch, config):
     {json.dumps(payload, ensure_ascii=False)}
     
     For EACH article in the input, provide:
-    1. 'is_relevant' and 'is_vague_or_roundup' booleans.
-    2. 'barrier_to_entry', 'market_size', and 'immediacy' structured assessments.
-    3. 'reasoning_chain': A short paragraph explaining the logic BEFORE scoring.
-    4. 4 sub-scores (0-100 integers): 'tech_score', 'commercial_score', 'hype_score', 'macro_score'.
-    5. 'justification': 1-sentence explanation of scores in {config.get('output', {}).get('language', 'Chinese')}
-    6. 'translated_title': Translate title to {config.get('output', {}).get('language', 'Chinese')}
-    7. 'translated_summary': HIGHLY CONDENSED summary (MAX 50 Chinese characters)
+    1. Classify `event_type` as exactly one of: technical_breakthrough,
+       product_launch, capacity_capex, supply_chain, industrial_policy,
+       funding_with_use, commercial_deployment, mixed_industrial_market,
+       other_industrial, market_only, non_industrial.
+    2. Extract `industrial_claims` that remain useful after removing stock-price,
+       trading-volume, market-cap, valuation, analyst-rating and fund-flow claims;
+       put removed claims in `market_only_claims`.
+    3. 'is_relevant' and 'is_vague_or_roundup' booleans. `market_only` and
+       `non_industrial` MUST set is_relevant=false. A technology-company name
+       alone is not an industrial event.
+    4. 'barrier_to_entry', 'market_size', and 'immediacy' structured assessments.
+    5. 'reasoning_chain': A short paragraph explaining the logic BEFORE scoring.
+    6. 4 sub-scores (0-100 integers): 'tech_score', 'commercial_score', 'hype_score', 'macro_score'.
+    7. 'justification': 1-sentence explanation of scores in {config.get('output', {}).get('language', 'Chinese')}
+    8. 'translated_title': Translate title to {config.get('output', {}).get('language', 'Chinese')}. For mixed articles, title the industrial event, not the price reaction.
+    9. 'translated_summary': HIGHLY CONDENSED summary (MAX 50 Chinese characters)
     
     Return STRICTLY a JSON object matching this schema exactly:
     {{
@@ -511,6 +696,9 @@ def score_articles_batch(articles_batch, config):
           "id": integer,
           "is_relevant": boolean,
           "is_vague_or_roundup": boolean,
+          "event_type": string,
+          "industrial_claims": [string],
+          "market_only_claims": [string],
           "barrier_to_entry": string,
           "market_size": string,
           "immediacy": string,
@@ -559,6 +747,7 @@ def score_articles_batch(articles_batch, config):
         res_item = _validate_score_result(raw_item, expected_id=article_id, require_id=True)
         _apply_composite_scores(res_item, weights)
         original_a = article_by_id[article_id]
+        res_item = apply_industry_relevance_gate(original_a, res_item)
         res_item["source_confidence"] = (
             "trusted" if original_a.get("source") in trusted_sources else "standard"
         )

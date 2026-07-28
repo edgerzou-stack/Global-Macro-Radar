@@ -81,6 +81,12 @@ python3 quant-strategy/scripts/production_release.py \
 - `live-shadow` 不等于 `shadow_runner --allow-live-api`。
 - `live-shadow` 必须携带准备隔离副本时记录的 `--expected-source-sha256`；手工只改 `database_environment=test` 的副本会被拒绝。
 - HTML 中实际持仓、研究候选、v7 待交割、legacy 平仓和 v6 成交必须分开，校验器失败时禁止进入邮件阶段。
+- 报告阶段生成两份绑定产物：完整审计 HTML 保留全部账本历史、行情来源和证据
+  SHA，并由数据库校验器逐项复核；收件人 HTML 只展示报告日期、账户/NAV、
+  本次交割、产业事件、当前持仓、策略候选、待交割和每策略最近 10 笔交割。
+  运行 ID、UTC 调试时间、内部表版本、provider 状态和证据哈希不得出现在邮件正文。
+  两份文件及各自 SHA-256 同时记录在 prepared manifest 中，SMTP 只消费已锁定的
+  收件人 HTML。
 - `execute_pending_intents.py` 把报告日期作为截止日，逐条读取 intent 原始
   `eligible_session` 的 raw open，并按 run ID 持久化各市场的成交、待交割、尚未
   到期和阻断数量；周末或延迟数日运行不会改变 intent 的成交会话；

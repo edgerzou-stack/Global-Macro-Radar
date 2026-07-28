@@ -30,6 +30,7 @@ from pathlib import Path
 
 import markdown
 import yaml
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 
@@ -41,6 +42,30 @@ DATA_IMAGE_PATTERN = re.compile(
     r"data:image/(?P<subtype>[A-Za-z0-9.+-]+);base64,"
     r"(?P<payload>[A-Za-z0-9+/=\s]+)"
 )
+RECIPIENT_HISTORY_LIMIT = 10
+RECIPIENT_DEBUG_TERMS = (
+    "运行 ID",
+    "报告生成时间（UTC）",
+    "Sandbox Benchmark Engine",
+    "legacy portfolio",
+    "v7 trade_intents",
+    "v8 evidence",
+    "证据SHA-256",
+    "行情来源",
+    "来源运行=",
+    "prompt_version",
+    "llm_provider",
+    "llm_degraded",
+)
+RECIPIENT_STRATEGY_NAMES = {
+    "dividend_a_stock": "A股核心红利精选",
+    "growth_a_stock": "A股高增成长精选",
+    "growth_us_stock": "美股高增成长精选",
+    "growth_hk_stock": "港股高增成长精选",
+    "hot_spot_a_stock": "A股热点突击",
+    "hot_spot_us_stock": "美股热点突击",
+    "hot_spot_hk_stock": "港股热点突击",
+}
 
 
 class DeliveryError(RuntimeError):
@@ -135,6 +160,24 @@ def _load_runtime_environment(env_path=None):
     return None
 
 
+def _strip_existing_radar_sections(html_content):
+    """Make radar injection idempotent when a prior unified file is reused."""
+    soup = BeautifulSoup(html_content, "html.parser")
+    for heading in list(
+        soup.find_all(
+            "h2", string=lambda value: value and "全球前沿产业雷达" in value
+        )
+    ):
+        radar = heading.find_next_sibling("div")
+        divider = radar.find_next_sibling("hr") if radar is not None else None
+        heading.extract()
+        if radar is not None:
+            radar.extract()
+        if divider is not None:
+            divider.extract()
+    return str(soup)
+
+
 def load_approved_html(path, expected_sha256=None):
     html_path = Path(path).expanduser().resolve()
     if not html_path.is_file():
@@ -174,6 +217,7 @@ def build_unified_html(project_root=None, radar_report=None, effective_date=None
 
     if quant_html.exists():
         html_content = quant_html.read_text(encoding="utf-8")
+        html_content = _strip_existing_radar_sections(html_content)
         if radar_html:
             html_content = html_content.replace(
                 "<h1>每日全球策略量化报告</h1>",
@@ -186,6 +230,236 @@ def build_unified_html(project_root=None, radar_report=None, effective_date=None
         f"{radar_html}<p>No quant report found.</p>"
         "</div></body></html>"
     )
+
+
+def _remove_sibling_section(heading):
+    """Remove one heading and its direct siblings up to the next heading."""
+    current = heading.next_sibling
+    while current is not None:
+        following = current.next_sibling
+        if getattr(current, "name", None) in {"h1", "h2", "h3", "h4"}:
+            break
+        current.extract()
+        current = following
+    heading.extract()
+
+
+def _keep_table_columns(table, keep_headers):
+    headers = table.select("thead th")
+    indexes = [
+        index
+        for index, header in enumerate(headers)
+        if header.get_text(" ", strip=True) in keep_headers
+    ]
+    if not indexes:
+        return
+    for row in table.select("tr"):
+        cells = row.find_all(["th", "td"], recursive=False)
+        for index in reversed(range(len(cells))):
+            if index not in indexes:
+                cells[index].extract()
+
+
+def _remove_radar_deep_dive(radar_container):
+    deep_heading = radar_container.find(
+        "h2", string=lambda value: value and "深度研报" in value
+    )
+    if deep_heading is not None:
+        current = deep_heading.next_sibling
+        while current is not None:
+            following = current.next_sibling
+            if (
+                getattr(current, "name", None) == "h2"
+                and any(
+                    marker in current.get_text(" ", strip=True)
+                    for marker in ("顶流硬核", "科技硬核创新", "产业焦点")
+                )
+            ):
+                break
+            current.extract()
+            current = following
+        deep_heading.extract()
+
+    title = radar_container.find(
+        "h1", string=lambda value: value and "科技产业情报雷达" in value
+    )
+    if title is not None:
+        title.extract()
+    for article_heading in radar_container.find_all("h3"):
+        candidate = article_heading.find_next_sibling()
+        if candidate is not None and candidate.name == "p" and candidate.find("em"):
+            candidate.extract()
+
+
+def build_recipient_html(full_html):
+    """Create a decision-focused email while preserving the full audit report."""
+    soup = BeautifulSoup(full_html, "html.parser")
+    container = soup.select_one(".container") or soup.body
+    if container is None:
+        raise DeliveryError("Full report has no HTML body")
+
+    main_title = container.find("h1", recursive=False) or container.find("h1")
+    metadata = soup.find(id="report-metadata")
+    report_date = ""
+    if metadata is not None:
+        report_date = str(metadata.get("data-signal-date") or "")
+        metadata.clear()
+        summary = soup.new_tag("p")
+        summary["class"] = "recipient-report-date"
+        summary.string = f"报告日期：{report_date or '未提供'}"
+        metadata.append(summary)
+        metadata.attrs = {
+            "id": "report-metadata",
+            "data-signal-date": report_date,
+        }
+    if main_title is not None:
+        intro = soup.new_tag("p")
+        intro["class"] = "recipient-summary"
+        intro.string = (
+            "本邮件依次展示账户净值、本次交割、产业事件、当前持仓与策略候选；"
+            "完整历史和执行证据保留在本地审计报告中。"
+        )
+        main_title.insert_after(intro)
+
+    nav_heading = soup.find(
+        "h2", string=lambda value: value and "台账概览" in value
+    )
+    if nav_heading is not None:
+        nav_heading.string = "🏦 账户与净值概览"
+        nav_table = nav_heading.find_next("table")
+        if nav_table is not None:
+            _keep_table_columns(
+                nav_table,
+                {
+                    "策略沙盒 (Strategy)",
+                    "当前可用现金",
+                    "认证 NAV",
+                    "账本资金占用率",
+                    "NAV 状态",
+                },
+            )
+            first_header = nav_table.find("th")
+            if first_header is not None:
+                first_header.string = "策略"
+            for row in nav_table.select("tbody tr"):
+                first_cell = row.find("td")
+                if first_cell is None:
+                    continue
+                strategy_id = row.get("data-strategy") or first_cell.get_text(
+                    " ", strip=True
+                )
+                first_cell.string = RECIPIENT_STRATEGY_NAMES.get(
+                    strategy_id, strategy_id
+                )
+        alert = nav_heading.find_next(
+            class_=lambda value: value and "alert" in str(value).split()
+        )
+        if (
+            alert is not None
+            and nav_table is not None
+            and "沿用最近认证快照"
+            not in nav_table.get_text(" ", strip=True)
+        ):
+            alert.extract()
+
+    heading_replacements = {
+        "实际持仓（legacy portfolio）": "当前持仓",
+        "本次筛选候选（研究池，未必已成交）": "本次策略候选（未成交）",
+        "待交割指令（v7 trade_intents）": "待交割指令",
+        "交易执行与历史成交明细（v7 trade_intents + v8 evidence + legacy）": (
+            "最近交割记录（最多10笔）"
+        ),
+    }
+    for heading in soup.find_all("h4"):
+        original = heading.get_text(" ", strip=True)
+        replacement = heading_replacements.get(original)
+        if replacement is not None:
+            heading.string = replacement
+        if replacement == "待交割指令":
+            table = heading.find_next_sibling("table")
+            if table is not None:
+                for cell in table.find_all("td"):
+                    cleaned = re.sub(
+                        r"(?:[；;]\s*)?来源运行=[^；;]+", "", cell.get_text()
+                    ).strip("；; ")
+                    if cleaned != cell.get_text():
+                        cell.string = cleaned or "-"
+        if replacement == "最近交割记录（最多10笔）":
+            table = heading.find_next_sibling("table")
+            if table is not None:
+                _keep_table_columns(
+                    table,
+                    {
+                        "操作",
+                        "股票代码",
+                        "股票名称",
+                        "成交日",
+                        "成交价格",
+                        "离场盈亏率",
+                        "投入份数",
+                    },
+                )
+                for row in table.select("tbody tr")[RECIPIENT_HISTORY_LIMIT:]:
+                    row.extract()
+
+    for chart_heading in list(
+        soup.find_all("h4", string=lambda value: value and "资金净值曲线图" in value)
+    ):
+        _remove_sibling_section(chart_heading)
+
+    radar_heading = soup.find(
+        "h2", string=lambda value: value and "全球前沿产业雷达" in value
+    )
+    if radar_heading is not None:
+        radar_container = radar_heading.find_next_sibling("div")
+        if radar_container is not None:
+            _remove_radar_deep_dive(radar_container)
+        radar_nodes = [radar_heading]
+        if radar_container is not None:
+            radar_nodes.append(radar_container)
+            divider = radar_container.find_next_sibling("hr")
+            if divider is not None:
+                radar_nodes.append(divider)
+        first_strategy = soup.find(
+            "h2",
+            string=lambda value: value
+            and any(
+                marker in value
+                for marker in ("稳健红利策略", "高增成长策略", "产业热点战法")
+            ),
+        )
+        if first_strategy is not None:
+            for node in radar_nodes:
+                first_strategy.insert_before(node.extract())
+
+    compact = str(soup)
+    validate_recipient_html(compact)
+    return compact
+
+
+def validate_recipient_html(html_content):
+    soup = BeautifulSoup(html_content, "html.parser")
+    visible_text = soup.get_text(" ", strip=True)
+    leaked = [term for term in RECIPIENT_DEBUG_TERMS if term in visible_text]
+    if leaked:
+        raise DeliveryError(
+            "Recipient report contains debug-only material: " + ", ".join(leaked)
+        )
+    required = ("报告日期：", "账户与净值概览", "本次交割状态")
+    missing = [term for term in required if term not in visible_text]
+    if missing:
+        raise DeliveryError(
+            "Recipient report is missing decision content: " + ", ".join(missing)
+        )
+    if "深度研报" in visible_text:
+        raise DeliveryError("Recipient report contains duplicated Deep Dive content")
+    for heading in soup.find_all(
+        "h4", string="最近交割记录（最多10笔）"
+    ):
+        table = heading.find_next_sibling("table")
+        if table is not None and len(table.select("tbody tr")) > RECIPIENT_HISTORY_LIMIT:
+            raise DeliveryError("Recipient report contains excessive trade history")
+    return True
 
 
 def _load_existing_journal(path: Path, content_hash: str):
@@ -538,6 +812,10 @@ def build_parser():
     parser.add_argument("--prepared-manifest")
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--prepared-html")
+    parser.add_argument(
+        "--prepared-audit-html",
+        help="Full unified report retained for database-backed validation",
+    )
     parser.add_argument("--expected-html-sha256")
     parser.add_argument(
         "--effective-date",
@@ -574,24 +852,34 @@ def main(argv=None):
     )
     report_html_path = project_root / "reports" / "screening_results.html"
     if args.prepare_only:
-        if not args.prepared_html or not args.prepared_manifest:
+        if (
+            not args.prepared_html
+            or not args.prepared_audit_html
+            or not args.prepared_manifest
+        ):
             raise DeliveryError(
-                "--prepare-only requires --prepared-html and --prepared-manifest"
+                "--prepare-only requires --prepared-html, --prepared-audit-html "
+                "and --prepared-manifest"
             )
-        html_content = build_unified_html(
+        audit_html = build_unified_html(
             project_root=project_root,
             effective_date=args.effective_date,
         )
+        html_content = build_recipient_html(audit_html)
         prepared_path = Path(args.prepared_html).expanduser().resolve()
+        audit_path = Path(args.prepared_audit_html).expanduser().resolve()
         manifest_path = Path(args.prepared_manifest).expanduser().resolve()
         digest = hashlib.sha256(html_content.encode("utf-8")).hexdigest()
+        audit_digest = hashlib.sha256(audit_html.encode("utf-8")).hexdigest()
         _atomic_write(prepared_path, html_content)
-        _atomic_write(report_html_path, html_content)
+        _atomic_write(audit_path, audit_html)
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "html_path": str(prepared_path),
             "canonical_report_path": str(report_html_path.resolve()),
             "html_sha256": digest,
+            "audit_html_path": str(audit_path),
+            "audit_html_sha256": audit_digest,
         }
         _atomic_write(
             manifest_path,
@@ -641,7 +929,7 @@ def main(argv=None):
             raise DeliveryError(
                 f"Unable to read prepared HTML manifest: {manifest_path}"
             ) from error
-        if prepared.get("schema_version") != 1:
+        if prepared.get("schema_version") not in {1, 2}:
             raise DeliveryError("Unsupported prepared HTML manifest schema")
         html_content, _ = load_approved_html(
             prepared.get("html_path", ""),

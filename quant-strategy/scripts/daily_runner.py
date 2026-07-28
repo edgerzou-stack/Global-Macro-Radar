@@ -590,6 +590,9 @@ def _run_pipeline_inner(context, checkpoint_path=None, popen_factory=subprocess.
     prepared_html = (
         context.artifact_root / context.run_id / "prepared-report.html"
     )
+    prepared_audit_html = (
+        context.artifact_root / context.run_id / "prepared-audit-report.html"
+    )
     prepared_manifest = (
         context.artifact_root / context.run_id / "prepared-report.json"
     )
@@ -600,6 +603,8 @@ def _run_pipeline_inner(context, checkpoint_path=None, popen_factory=subprocess.
             "--prepare-only",
             "--prepared-html",
             str(prepared_html),
+            "--prepared-audit-html",
+            str(prepared_audit_html),
             "--prepared-manifest",
             str(prepared_manifest),
             "--effective-date",
@@ -612,7 +617,7 @@ def _run_pipeline_inner(context, checkpoint_path=None, popen_factory=subprocess.
         + [
             os.path.join(SCRIPTS_DIR, "validate_report_html.py"),
             "--html",
-            str(prepared_html),
+            str(prepared_audit_html),
             "--database",
             str(context.database_path),
         ],

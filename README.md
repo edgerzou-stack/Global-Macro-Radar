@@ -21,7 +21,8 @@ Global Macro Radar 是一个把实时产业新闻、全球多市场筛选、模�
 `dividend_hk_stock`、`dividend_us_stock` 已退役，其历史空壳与重复日结果仅通过
 quarantine 排除，不删除原始审计证据。新闻层先输出四个 0–100 整数子分，再按配置
 聚合为 Innovation/Traffic 两条 0–10 composite；来源可信度作为独立元数据，不会
-自动给内容分加分。
+自动给内容分加分。每篇新闻还必须提供可验证的产业事件类型与产业事实；纯股价、
+市值、成交额、评级和资金流向不能被高 Traffic 分单独救活。
 
 ## 安全模型
 
@@ -35,7 +36,9 @@ quarantine 排除，不删除原始审计证据。新闻层先输出四个 0–1
 所有入口都要求显式 mode/database。production 还要求 canonical path 和二次写入确认。
 完整流水线中的真实 SMTP 只能由 production 模式配合
 `--delivery-mode live --confirm-live-delivery` 启用；已经通过 sink 与数据库一致性审核的
-HTML，也可以由邮件 CLI 在不重跑策略、不写生产库的情况下单独发送。两条路径都由
+HTML，也可以由邮件 CLI 在不重跑策略、不写生产库的情况下单独发送。完整审计 HTML
+与精简收件人 HTML 分开保存：前者保留数据库交叉校验所需的历史和证据，后者优先
+展示本次交割、NAV、持仓、候选和产业事件，不包含运行日志及证据哈希。两条路径都由
 邮件发送器再次校验显式确认。scheduler 默认关闭。
 
 运行时使用 SQLite Online Backup、writer fence、run identity、原子 checkpoint/resume 和 durable manifest。异常 legacy 数据只允许 quarantine，不猜测价格、成本或 PnL。

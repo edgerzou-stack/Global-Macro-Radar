@@ -19,6 +19,15 @@ import markdown
 from run_date import logical_date_text, logical_today
 
 
+def is_verified_deep_dive(deep_dive):
+    return (
+        isinstance(deep_dive, dict)
+        and deep_dive.get("evidence_mode") == "verified_primary"
+        and bool(deep_dive.get("primary_url"))
+        and bool(deep_dive.get("report_content"))
+    )
+
+
 def _aware_utc_timestamp(value, field_name):
     if isinstance(value, datetime):
         parsed = value
@@ -524,6 +533,8 @@ def load_scored_articles_fixture(path, rss_articles, config):
 def generate_markdown_report(
     scored_articles, config, output_dir=None, *, deduplicate=True
 ):
+    from score import apply_industry_relevance_gate
+
     output_dir = output_dir or os.environ.get("RADAR_REPORTS_DIR", "reports")
     os.makedirs(output_dir, exist_ok=True)
     report_date = logical_today()
@@ -541,7 +552,8 @@ def generate_markdown_report(
         if pub_date and (pub_date < cutoff_date_str or pub_date > date_str):
             continue
             
-        sd = a.get('score_data', {})
+        sd = apply_industry_relevance_gate(a, a.get('score_data', {}))
+        a['score_data'] = sd
         if not sd.get('is_relevant'):
             continue
             
@@ -568,7 +580,7 @@ def generate_markdown_report(
         t_score = sd.get('traffic_score', 0)
         
         if (i_score + t_score) >= 18:
-            if 'deep_dive' in a:
+            if is_verified_deep_dive(a.get("deep_dive")):
                 deep_dives.append(a)
         
         if i_score >= min_score and t_score >= min_score:
@@ -865,7 +877,13 @@ def main():
         print("Scoring articles using Dual-Track LLM...", flush=True)
         
         import concurrent.futures
-        from score import pre_filter_articles_batch, score_articles_batch
+        from score import (
+            SCORING_PROMPT_VERSION,
+            apply_industry_relevance_gate,
+            local_article_route,
+            pre_filter_articles_batch,
+            score_articles_batch,
+        )
         
         cache_updates = 0
         new_articles = []
@@ -875,6 +893,7 @@ def main():
 
             sd, cache_key = find_cached_article(cache_data, article, config)
             if sd is not None:
+                sd = apply_industry_relevance_gate(article, sd)
                 try:
                     i_score = float(sd.get('innovation_score', 0))
                     t_score = float(sd.get('traffic_score', 0))
@@ -883,8 +902,12 @@ def main():
                 print(f"[{idx+1}/{len(articles)}] (Cached) [I:{i_score:.1f} T:{t_score:.1f}] {article['title'][:30]}...", flush=True)
                 article['score_data'] = sd
                 article['_cache_key'] = cache_key
-                if 'deep_dive' in cache_data[cache_key]:
-                    article['deep_dive'] = cache_data[cache_key]['deep_dive']
+                cached_deep_dive = cache_data[cache_key].get("deep_dive")
+                if is_verified_deep_dive(cached_deep_dive):
+                    article["deep_dive"] = cached_deep_dive
+                elif "deep_dive" in cache_data[cache_key]:
+                    cache_data[cache_key].pop("deep_dive", None)
+                    cache_updates += 1
                 scored_articles.append(article)
             else:
                 new_articles.append(article)
@@ -921,11 +944,53 @@ def main():
             
             print("--- Phase 1: Pre-filtering (Batches of 20) ---", flush=True)
             passed_pre_filter = []
+            pre_filter_input = []
+
+            for article in new_articles:
+                local_route = local_article_route(article)
+                if local_route == "industry_candidate":
+                    passed_pre_filter.append(article)
+                    continue
+                if local_route not in {"market_only", "reject"}:
+                    pre_filter_input.append(article)
+                    continue
+
+                rejection = (
+                    "market_only"
+                    if local_route == "market_only"
+                    else "non_industrial"
+                )
+                sd = {
+                    "is_relevant": False,
+                    "is_vague_or_roundup": local_route == "reject",
+                    "event_type": rejection,
+                    "industrial_claims": [],
+                    "market_only_claims": (
+                        [article.get("title", "")]
+                        if local_route == "market_only"
+                        else []
+                    ),
+                    "innovation_score": 0,
+                    "traffic_score": 0,
+                    "justification": (
+                        "Filtered out by deterministic industry-news policy"
+                    ),
+                    "translated_title": article["title"],
+                    "translated_summary": "",
+                    "prompt_version": SCORING_PROMPT_VERSION,
+                }
+                article["score_data"] = sd
+                scored_articles.append(article)
+                store_article_score(cache_data, article, sd, config)
+                cache_updates += 1
             
             def process_pre_filter_batch(batch):
                 return run_validated_batch(batch, config, pre_filter_articles_batch)
             
-            batches_p1 = [new_articles[i:i + 20] for i in range(0, len(new_articles), 20)]
+            batches_p1 = [
+                pre_filter_input[i:i + 20]
+                for i in range(0, len(pre_filter_input), 20)
+            ]
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                 futures_p1 = [executor.submit(process_pre_filter_batch, b) for b in batches_p1]
                 
@@ -944,10 +1009,15 @@ def main():
                                 # Mark as irrelevant and cache immediately
                                 sd = {
                                     "is_relevant": False,
+                                    "is_vague_or_roundup": False,
+                                    "event_type": "non_industrial",
+                                    "industrial_claims": [],
+                                    "market_only_claims": [],
                                     "innovation_score": 0, "traffic_score": 0,
                                     "justification": "Filtered out in Phase 1 (Pre-filter)",
                                     "translated_title": matched['title'],
-                                    "translated_summary": ""
+                                    "translated_summary": "",
+                                    "prompt_version": SCORING_PROMPT_VERSION,
                                 }
                                 matched['score_data'] = sd
                                 scored_articles.append(matched)
@@ -974,9 +1044,12 @@ def main():
                             # Find the article
                             matched = next((a for a in passed_pre_filter if a['id'] == article_id), None)
                             if matched:
-                                matched['score_data'] = {
+                                matched['score_data'] = apply_industry_relevance_gate(
+                                    matched,
+                                    {
                                     key: value for key, value in r.items() if key != "id"
-                                }
+                                    },
+                                )
                                 scored_articles.append(matched)
                                 try:
                                     i_s = float(matched['score_data']['innovation_score'])
@@ -995,8 +1068,21 @@ def main():
     
     
     # P1.9: 将 Deep Dive 的生成逻辑移出 Markdown 渲染循环，放到主流水线并行化阶段
+    from score import apply_industry_relevance_gate
+
+    for article in scored_articles:
+        article["score_data"] = apply_industry_relevance_gate(
+            article, article.get("score_data", {})
+        )
     min_score = config.get("output", {}).get("min_score_to_keep", 6)
-    high_scoring_for_dd = [a for a in scored_articles if a.get('score_data', {}).get('innovation_score', 0) + a.get('score_data', {}).get('traffic_score', 0) >= 18]
+    high_scoring_for_dd = [
+        a
+        for a in scored_articles
+        if a.get("score_data", {}).get("is_relevant")
+        and a.get("score_data", {}).get("innovation_score", 0)
+        + a.get("score_data", {}).get("traffic_score", 0)
+        >= 18
+    ]
     
     new_dd = False
     if high_scoring_for_dd:
@@ -1007,15 +1093,21 @@ def main():
         
         def process_dd(a):
             cache_key = a.get('_cache_key')
+            if not is_verified_deep_dive(a.get("deep_dive")):
+                a.pop("deep_dive", None)
             if 'deep_dive' not in a and (
                 not cache_key
                 or cache_key not in cache_data
-                or 'deep_dive' not in cache_data[cache_key]
+                or not is_verified_deep_dive(
+                    cache_data[cache_key].get("deep_dive")
+                )
             ):
                 print(f"Generating Deep Dive for {a['title'][:30]}...", flush=True)
                 dd = generate_deep_dive_report(a, config)
                 return a, cache_key, dd
-            elif cache_key in cache_data and 'deep_dive' in cache_data[cache_key]:
+            elif cache_key in cache_data and is_verified_deep_dive(
+                cache_data[cache_key].get("deep_dive")
+            ):
                 a['deep_dive'] = cache_data[cache_key]['deep_dive']
             return None, None, None
 

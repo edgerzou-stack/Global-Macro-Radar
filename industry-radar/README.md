@@ -13,6 +13,12 @@ Industry Radar 负责采集产业新闻、执行 RSS 健康闸门、去重、LLM
 
 配置权重把子分聚合成两条 0–10 composite：Innovation 与 Traffic。分值必须有限、在范围内且每个输入恰好对应一个输出；缺失、重复或结构错误会重试并最终 fail closed。
 
+评分同时输出事件类型、可独立成立的 `industrial_claims` 和应剥离的
+`market_only_claims`。纯股价、成交额、市值、指数、券商评级或资金流向不能仅凭
+Traffic 分进入报告；公司属于科技行业并不等于该篇文章构成产业事件。明确的技术、
+产品、产能/资本开支、供应链、产业政策、商业部署及说明资金用途的融资事件会进入
+详细评分。对同时包含股价和产业事实的文章，只保留可验证的产业事实。
+
 `source_confidence` 用于记录来源可信度，不会自动给内容分加分。`heuristics.yaml` 中未连接到运行路径的 fatigue 参数不应视为有效规则。当前默认回看窗口由配置决定，不能据此保证所有文章都在 24 小时内。
 
 ## RSS 可靠性
@@ -32,11 +38,11 @@ Industry Radar 负责采集产业新闻、执行 RSS 健康闸门、去重、LLM
 
 ## LLM 路由与缓存
 
-Provider 顺序由配置决定，只有具备凭证且被启用的 provider 才参与。不是固定的 Gemini → OpenAI → DeepSeek 链。缓存键绑定正文、prompt、模型和评分配置版本，使用原子替换；缓存命中不会重新计费，内容或评分合同改变会自动失效。
+Provider 顺序由配置决定，只有具备凭证且被启用的 provider 才参与。不是固定的 Gemini → OpenAI → DeepSeek 链。缓存键绑定正文、prompt、模型和评分配置版本，使用原子替换；缓存命中不会重新计费，内容或评分合同改变会自动失效。缓存结果和最终报告仍会再次经过确定性的产业边界闸门，旧的错误高分不能绕过报告准入。
 
 当前项目策略显式设置 `gemini.enabled: false`，并从 provider 顺序中移除 Gemini；即使本机仍存在 `GEMINI_API_KEY`，也不会创建 Gemini 客户端或发送请求。新闻阶段优先使用 DeepSeek，量化模块使用同一禁用策略。
 
-去重分两层：本地字符串/事件分组和 LLM 高分事件合并。Deep Dive 只在阈值触发时运行；网页正文不可得时会明确降级，不能声称总能定位独立原始来源。
+去重分两层：本地字符串/事件分组和 LLM 高分事件合并。Deep Dive 只在阈值触发且文章中能定位并读取独立一手来源时运行；仅有二手报道、模型返回未出现在原文链接中的 URL 或一手正文不可读时一律跳过，旧的未验证 Deep Dive 缓存不会复用。
 
 ## 运行
 
@@ -77,7 +83,7 @@ synthetic golden set 只用于结构和边界回归，不能证明现实新闻�
 | `score.py` | 评分 schema、prompt 与批处理 |
 | `llm_router.py` | 配置驱动的 provider 路由 |
 | `cache_manager.py` | 版本化增量缓存 |
-| `deep_dive.py` | 高阈值事件深挖 |
+| `deep_dive.py` | 基于可核验一手来源的高阈值事件深挖 |
 | `config.example.yaml` | 可提交的配置模板 |
 
 ## License
