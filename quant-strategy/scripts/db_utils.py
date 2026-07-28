@@ -4,6 +4,7 @@ import os
 import threading
 
 from core.quarantine import quarantine_exclusion
+from core.portfolio_limits import validate_portfolio_holding_limits
 
 
 DATABASE_ENV_KEY = "database_environment"
@@ -182,6 +183,18 @@ def init_db(db_path=None, environment=None):
         c.execute('PRAGMA user_version = 5;')
         version = 5
 
+    # Fresh test/backtest databases must exercise the same execution schema as
+    # production. Production upgrades remain gated by production_release.py.
+    if requested_environment in {"test", "backtest"} and version < 8:
+        from migrations.v006_execution_ledger import apply_v006
+        from migrations.v007_trade_intents import apply_v007
+        from migrations.v008_trade_execution_evidence import apply_v008
+
+        apply_v006(conn)
+        apply_v007(conn)
+        apply_v008(conn)
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+
     if requested_environment is not None:
         c.execute("SELECT value FROM meta_data WHERE key = ?", (DATABASE_ENV_KEY,))
         existing_environment = c.fetchone()
@@ -253,7 +266,7 @@ def load_portfolio_and_trades():
     trade_test_filter, trade_test_parameters = test_strategy_filter("strategy")
     c.execute(
         "SELECT id, strategy, name_or_code, entry_date, entry_price, "
-        "exit_date, exit_price, pnl, reason "
+        "exit_date, exit_price, pnl, reason, shares "
         f"FROM trade_history WHERE 1=1{trade_exclusion}{trade_test_filter}",
         trade_test_parameters,
     )
@@ -269,17 +282,19 @@ def load_portfolio_and_trades():
             exit_price,
             pnl,
             reason,
+            shares,
         ) = row
         trade_history.append({
             "strategy": strategy, "name": name_or_code, "entry_date": entry_date, 
             "entry_price": entry_price, "exit_date": exit_date, "exit_price": exit_price, "pnl": pnl,
-            "reason": reason
+            "reason": reason, "shares": max(1, shares or 0)
         })
         
     conn.close()
     return portfolio, trade_history
 
 def update_portfolio(portfolio_dict):
+    validate_portfolio_holding_limits(portfolio_dict)
     conn = get_connection()
     c = conn.cursor()
     portfolio_exclusion, _ = quarantine_exclusion(conn, "portfolio")
@@ -342,6 +357,7 @@ def update_portfolio_and_trades(portfolio_dict, trades_list, snapshot_date=None,
 
 def _execute_portfolio_updates(c, portfolio_dict, trades_list, snapshot_date):
     # --- State Machine Sanity Guards ---
+    validate_portfolio_holding_limits(portfolio_dict)
     strategy_ids = list(portfolio_dict)
     if not strategy_ids:
         return

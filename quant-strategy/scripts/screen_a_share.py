@@ -14,7 +14,6 @@ from data_provider import (
     stock_zcfz_em_cached,
     stock_dividend_cninfo_cached,
     stock_info_a_code_name_cached,
-    stock_gdhs_cached,
     clear_cache,
 )
 import pandas as pd
@@ -25,6 +24,7 @@ ANNUAL_REPORT_LOOKBACK = 8
 LONG_TERM_CAGR_YEARS = 3
 DIVIDEND_TTM_DAYS = 365
 DIVIDEND_HISTORY_YEARS = 5
+DIVIDEND_AVG_ROE_MIN = 5.0
 
 
 def _empty_dividend_metrics(symbol: str, status: str, error: Optional[str] = None) -> dict:
@@ -236,6 +236,60 @@ def load_financial_tables(report_date: str) -> tuple[pd.DataFrame, pd.DataFrame]
     return yjbb, zcfz
 
 
+def _previous_quarter_end(value: pd.Timestamp) -> Optional[pd.Timestamp]:
+    quarter = (int(value.month), int(value.day))
+    if quarter == (3, 31):
+        return pd.Timestamp(year=value.year - 1, month=12, day=31)
+    if quarter == (6, 30):
+        return pd.Timestamp(year=value.year, month=3, day=31)
+    if quarter == (9, 30):
+        return pd.Timestamp(year=value.year, month=6, day=30)
+    if quarter == (12, 31):
+        return pd.Timestamp(year=value.year, month=9, day=30)
+    return None
+
+
+def has_three_consecutive_positive_qoq(group: pd.DataFrame) -> bool:
+    """Require positive revenue and profit QoQ for three consecutive reports."""
+    required = {
+        "财务报告期_dt",
+        "营业总收入-季度环比增长",
+        "净利润-季度环比增长",
+    }
+    if not required.issubset(group.columns):
+        return False
+    periods = group[list(required)].copy()
+    periods["财务报告期_dt"] = pd.to_datetime(
+        periods["财务报告期_dt"], errors="coerce"
+    )
+    periods = (
+        periods.dropna(subset=["财务报告期_dt"])
+        .sort_values("财务报告期_dt", ascending=False)
+        .drop_duplicates("财务报告期_dt", keep="first")
+        .head(3)
+    )
+    if len(periods) != 3:
+        return False
+
+    report_dates = periods["财务报告期_dt"].tolist()
+    if any(_previous_quarter_end(report_dates[index]) != report_dates[index + 1]
+           for index in range(2)):
+        return False
+
+    revenue_qoq = pd.to_numeric(
+        periods["营业总收入-季度环比增长"], errors="coerce"
+    )
+    profit_qoq = pd.to_numeric(
+        periods["净利润-季度环比增长"], errors="coerce"
+    )
+    return bool(
+        revenue_qoq.notna().all()
+        and profit_qoq.notna().all()
+        and (revenue_qoq > 0).all()
+        and (profit_qoq > 0).all()
+    )
+
+
 def infer_candidate_annual_report_dates(
     as_of_date: date, lookback: int = ANNUAL_REPORT_LOOKBACK
 ) -> list[str]:
@@ -299,20 +353,16 @@ def load_dynamic_cagr_table(
         return yjbb
 
     from tqdm import tqdm
-    import concurrent.futures
-    import random
-    import time
-    
-    def process_annual_with_delay(d):
-        time.sleep(random.uniform(0.1, 0.4))
-        return process_annual(d)
-        
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(process_annual_with_delay, d): d for d in annual_report_dates}
-        for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Loading A-share dynamic CAGR"):
-            res = future.result()
-            if res is not None:
-                frames.append(res)
+
+    # Each report fetch already performs bounded page concurrency.  Processing
+    # several report periods in parallel multiplies that fan-out and makes the
+    # authoritative source unstable, so periods are intentionally serialized.
+    for report_date in tqdm(
+        annual_report_dates, desc="Loading A-share dynamic CAGR"
+    ):
+        result = process_annual(report_date)
+        if result is not None:
+            frames.append(result)
                 
     if not frames:
         return pd.DataFrame(
@@ -487,20 +537,13 @@ def load_financial_table_as_of(
         ]
 
     from tqdm import tqdm
-    import concurrent.futures
-    import random
-    import time
 
-    def process_candidate_with_delay(c):
-        time.sleep(random.uniform(0.1, 0.4))
-        return process_candidate(c)
-        
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(process_candidate_with_delay, c): c for c in candidate_report_dates}
-        for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Loading A-share financial tables"):
-            res = future.result()
-            if res is not None:
-                frames.append(res)
+    for candidate in tqdm(
+        candidate_report_dates, desc="Loading A-share financial tables"
+    ):
+        result = process_candidate(candidate)
+        if result is not None:
+            frames.append(result)
                 
     if not frames:
         empty = pd.DataFrame(
@@ -533,21 +576,6 @@ def load_financial_table_as_of(
         ascending=[True, False, False, False],
     )
     
-    # Add 3-quarter QoQ positive growth flag (Losses narrowing or profits rising)
-    def check_acceleration(grp):
-        import numpy as np
-        if len(grp) < 3:
-            return False
-            
-        grp_asc = grp.sort_values("财务报告期_dt", ascending=True)
-        prof_qoq = pd.to_numeric(grp_asc["净利润-季度环比增长"].values[-3:], errors="coerce")
-        rev_qoq = pd.to_numeric(grp_asc["营业总收入-季度环比增长"].values[-3:], errors="coerce")
-        
-        if np.isnan(prof_qoq).any() or np.isnan(rev_qoq).any():
-            return False
-            
-        return (prof_qoq > 0).all() and (rev_qoq > 0).all()
-
     acceleration_columns = [
         "财务报告期_dt",
         "净利润-季度环比增长",
@@ -555,7 +583,7 @@ def load_financial_table_as_of(
     ]
     accel_flags = (
         financial.groupby("股票代码")[acceleration_columns]
-        .apply(check_acceleration)
+        .apply(has_three_consecutive_positive_qoq)
         .reset_index(name="3个季度连续加速增长")
     )
     financial = financial.merge(accel_flags, on="股票代码", how="left")
@@ -747,38 +775,26 @@ def passes_valuation_formula(row: pd.Series, max_value: float) -> bool:
 
 
 
-# 红利股防御型/跨越周期底池
-DEFENSIVE_INDUSTRIES = [
-    # 公用事业（极强防御）
-    "电力行业", "燃气", "水务", "公用事业",
-    # 交通基建（现金牛）
-    "铁路公路", "港口航运", "交运设备",
-    # 必选消费（抗通胀/抗衰退）
-    "食品饮料", "酿酒行业", "农牧饲渔", "中药", "医药商业",
-    # 金融大基建（高分红底仓）
-    "银行", "保险", "出版"
-]
-
 def filter_dividend_strategy(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
     if df.empty:
         return df.copy()
         
     roe_series = df.get("3年平均净资产收益率", df.get("净资产收益率"))
-    net_margin_series = df.get("3年平均净利率", df.get("销售净利率"))
     mask = (
         df["PE"].notna() & (df["PE"] > 0)
         & df["PB"].notna() & (df["PB"] > 0)
         & df["估值公式值"].notna() & (df["估值公式值"] < args.valuation_formula_max)
         & df["3年经营现金流平均增速"].notna() & (df["3年经营现金流平均增速"] > 0)
         & df["总市值"].notna() & (df["总市值"] > args.market_cap_min_yi * 1e8)
-        & net_margin_series.notna() & (net_margin_series > args.avg_net_profit_margin_min)
         & df["3年净利润CAGR"].notna() & (df["3年净利润CAGR"] > args.profit_cagr_min)
         & roe_series.notna() & (roe_series > args.dividend_roe_min)
         & df["3年平均现金流利润覆盖"].notna()
         & (df["3年平均现金流利润覆盖"] >= getattr(args, "cash_profit_coverage_min", 0.8))
     )
-    if getattr(args, "require_continuous_growth", True):
-        mask &= df["3年连续双增长"].fillna(False).astype(bool)
+    # User-approved production policy: three-year revenue/profit dual growth is
+    # a non-optional dividend hard gate. The legacy CLI switch may remain for
+    # argument compatibility but cannot weaken production selection.
+    mask &= df["3年连续双增长"].fillna(False).astype(bool)
     return df[mask].copy()
 
 
@@ -806,21 +822,10 @@ def filter_dividend_quality(df: pd.DataFrame, args: argparse.Namespace) -> pd.Da
     if max_per_industry > 0 and not qualified.empty:
         industry = qualified["所处行业"].fillna("未知行业")
         qualified = qualified[industry.groupby(industry).cumcount() < max_per_industry]
+    max_results = getattr(args, "dividend_max_results", 50)
+    if max_results > 0:
+        qualified = qualified.head(max_results)
     return qualified.copy()
-
-# 成长股强周期底池
-CYCLICAL_GROWTH_INDUSTRIES = [
-    # 硬科技与半导体 (周期性极强)
-    "半导体", "计算机设备", "软件开发", "通信设备", "通信服务",
-    "光学光电子", "消费电子", "元件", "其他电子Ⅱ", "电子化学品Ⅱ",
-    "IT服务Ⅱ", "数字媒体",
-    # 大宗与强周期资源 (顺周期爆发)
-    "能源金属", "小金属", "有色金属", "煤炭行业", "钢铁行业", "化肥行业",
-    # 牛市旗手与可选消费
-    "证券", "乘用车", "汽车零部件", "电池",
-    # 周期制造/出海
-    "专用设备", "通用设备", "航海装备", "工程机械"
-]
 
 def filter_growth_strategy(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
     """
@@ -832,15 +837,25 @@ def filter_growth_strategy(df: pd.DataFrame, args: argparse.Namespace) -> pd.Dat
     if df.empty:
         return df.copy()
 
-    roe_series = df.get("3年平均净资产收益率", df.get("净资产收益率"))
-    net_margin_series = df.get("3年平均净利率", df.get("销售净利率"))
-    profit_yoy_series = df.get("净利润-同比增长", df.get("净利润同比增长率"))
-    revenue_yoy_series = df.get("营业总收入-同比增长", df.get("营业总收入同比增长率"))
+    pe_series = pd.to_numeric(df.get("PE"), errors="coerce")
+    profit_yoy_series = pd.to_numeric(
+        df.get("净利润-同比增长", df.get("净利润同比增长率")), errors="coerce"
+    )
+    revenue_yoy_series = pd.to_numeric(
+        df.get("营业总收入-同比增长", df.get("营业总收入同比增长率")), errors="coerce"
+    )
+    market_cap_series = pd.to_numeric(df.get("总市值"), errors="coerce")
 
     mask = (
-        df["总市值"].notna() & (df["总市值"] > args.market_cap_min_yi * 1e8)
-        & df["3个季度连续加速增长"].fillna(False)
-        & (df["PE"].isna() | ((df["PE"] < profit_yoy_series) & (df["PE"] < revenue_yoy_series)))
+        market_cap_series.notna()
+        & (market_cap_series > args.market_cap_min_yi * 1e8)
+        & df["3个季度连续加速增长"].eq(True)
+        & pe_series.notna()
+        & (pe_series > 0)
+        & profit_yoy_series.notna()
+        & revenue_yoy_series.notna()
+        & (profit_yoy_series > pe_series)
+        & (revenue_yoy_series > pe_series)
     )
     return df[mask].copy()
 
@@ -879,12 +894,20 @@ def threshold_payload(args: argparse.Namespace) -> dict:
         "dividend_max_results": getattr(args, "dividend_max_results", 50),
         "debt_ratio_is_hard_filter": False,
         "market_cap_min_yi": args.market_cap_min_yi,
-        "avg_net_profit_margin_min": args.avg_net_profit_margin_min,
+        "dividend_net_profit_margin_is_hard_filter": False,
+        "dividend_roe_min": args.dividend_roe_min,
         "revenue_yoy_positive_years": LONG_TERM_CAGR_YEARS,
         "profit_yoy_positive_years": LONG_TERM_CAGR_YEARS,
-        "require_continuous_growth": args.require_continuous_growth,
+        "require_continuous_growth": True,
         "profit_cagr_min": args.profit_cagr_min,
         "long_term_cagr_years": LONG_TERM_CAGR_YEARS,
+        "growth_industry_filter": False,
+        "growth_three_year_continuous_growth_required": False,
+        "growth_positive_qoq_quarters": 3,
+        "growth_latest_revenue_yoy_must_exceed_pe": True,
+        "growth_latest_profit_yoy_must_exceed_pe": True,
+        "growth_pe_must_be_positive_and_present": True,
+        "growth_max_results": None,
     }
 
 
@@ -916,7 +939,6 @@ def output_columns(df: pd.DataFrame) -> pd.DataFrame:
         "营业总收入同比增长率",
         "3年经营现金流平均增速",
         "3年平均现金流利润覆盖",
-        "红利综合评分",
         "所处行业",
         "3年营收CAGR",
         "3年净利润CAGR",
@@ -928,12 +950,11 @@ def output_columns(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = pd.NA
             
     result = df[cols]
-    if result["红利综合评分"].notna().any():
+    if "TTM股息率" in result.columns and result["TTM股息率"].notna().any():
         return result.sort_values(
-            ["红利综合评分", "TTM股息率", "股票代码"],
-            ascending=[False, False, True],
+            ["TTM股息率", "股票代码"], ascending=[False, True]
         )
-    return result.sort_values(["PB", "TTM股息率"], ascending=[True, False])
+    return result.sort_values(["股票代码"], ascending=[True])
 
 
 def number_or_none(value) -> Optional[float]:
@@ -953,58 +974,90 @@ def evaluate_holding(row: pd.Series, args: argparse.Namespace, user_input: str) 
 
     checks = [
         (
+            "PE",
+            "PE 必须存在且 > 0",
+            row.get("PE"),
+            lambda x: x > 0,
+        ),
+        (
+            "PB",
+            "PB 必须存在且 > 0",
+            row.get("PB"),
+            lambda x: x > 0,
+        ),
+        (
             "估值公式值",
             f"(总市值 - 总市值 / PB) / (总市值 / PE) < {args.valuation_formula_max}",
-            row["估值公式值"],
+            row.get("估值公式值"),
             lambda x: x < args.valuation_formula_max,
         ),
         (
             "TTM股息率",
             f"TTM股息率 > {args.dividend_yield_min}%",
-            row["TTM股息率"],
+            row.get("TTM股息率"),
             lambda x: x > args.dividend_yield_min,
+        ),
+        (
+            "分红数据状态",
+            "分红数据必须来自成功完成的权威查询",
+            1.0 if row.get("分红数据状态") == "ok" else 0.0,
+            lambda x: x == 1.0,
         ),
         (
             "总市值(亿元)",
             f"总市值 > {args.market_cap_min_yi}亿",
-            row["总市值(亿元)"],
+            row.get("总市值(亿元)"),
             lambda x: x > args.market_cap_min_yi,
         ),
         (
-            "销售净利率",
-            f"过去3年平均净利率 > {args.avg_net_profit_margin_min}%",
-            row["销售净利率"],
-            lambda x: x > args.avg_net_profit_margin_min,
+            "净资产收益率",
+            f"过去3年平均 ROE > {args.dividend_roe_min}%",
+            row.get("净资产收益率"),
+            lambda x: x > args.dividend_roe_min,
         ),
         (
             "3年净利润CAGR",
             f"过去3年净利润年复合增长率 > {args.profit_cagr_min}%",
-            row["3年净利润CAGR"],
+            row.get("3年净利润CAGR"),
             lambda x: x > args.profit_cagr_min,
         ),
         (
-            "3年营收同比均为正",
-            "最近3个年报的营业总收入同比增长率每年都 > 0",
-            1.0 if row.get("3年营收同比均为正") else 0.0,
+            "3年经营现金流平均增速",
+            "过去3年经营现金流平均增速 > 0",
+            row.get("3年经营现金流平均增速"),
+            lambda x: x > 0,
+        ),
+        (
+            "3年平均现金流利润覆盖",
+            f"过去3年平均现金流利润覆盖 >= {args.cash_profit_coverage_min}",
+            row.get("3年平均现金流利润覆盖"),
+            lambda x: x >= args.cash_profit_coverage_min,
+        ),
+        (
+            "近5年分红年份数",
+            f"最近5年中至少 {args.dividend_min_years} 年实施现金分红",
+            row.get("近5年分红年份数"),
+            lambda x: x >= args.dividend_min_years,
+        ),
+        (
+            "连续3年分红",
+            "最近3年连续实施现金分红",
+            1.0 if row.get("连续3年分红") else 0.0,
             lambda x: x == 1.0,
         ),
         (
-            "3年净利润同比均为正",
-            "最近3个年报的净利润同比增长率每年都 > 0",
-            1.0 if row.get("3年净利润同比均为正") else 0.0,
+            "最近年度分红变动率",
+            f"最近年度现金分红降幅不超过 {args.dividend_max_cut_pct}%",
+            row.get("最近年度分红变动率"),
+            lambda x: x >= -args.dividend_max_cut_pct,
+        ),
+        (
+            "3年连续双增长",
+            "过去3年每一年的营收和净利润同比增长 > 0",
+            1.0 if row.get("3年连续双增长") else 0.0,
             lambda x: x == 1.0,
         ),
     ]
-
-    if args.require_continuous_growth:
-        checks.append(
-            (
-                "3年连续双增长",
-                "过去3年每一年的营收和净利润同比增长 > 0",
-                1.0 if row.get("3年连续双增长") else 0.0,
-                lambda x: x == 1.0,
-            )
-        )
 
     for field, rule_text, value, rule_fn in checks:
         if pd.isna(value):
@@ -1060,20 +1113,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--valuation-formula-max", type=float, default=10.0)
     parser.add_argument("--dividend-yield-min", type=float, default=3.0)
     parser.add_argument("--market-cap-min-yi", type=float, default=100.0)
-    parser.add_argument("--avg-net-profit-margin-min", type=float, default=10.0)
+    parser.add_argument(
+        "--avg-net-profit-margin-min",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--require-continuous-growth",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Require revenue and net profit YoY growth in each of the latest 3 annual reports",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--profit-cagr-min", type=float, default=5.0)
     # 1-year explosive growth thresholds
     parser.add_argument("--growth-yoy-min", type=float, default=30.0)
     parser.add_argument("--growth-roe-min", type=float, default=10.0)
     # Dividend thresholds
-    parser.add_argument("--dividend-roe-min", type=float, default=10.0,
-                        help="Minimum 3-year avg ROE for dividend strategy (default: 10%%)")
+    parser.add_argument(
+        "--dividend-roe-min",
+        type=float,
+        default=DIVIDEND_AVG_ROE_MIN,
+        help="Minimum 3-year avg ROE for dividend strategy (default: 5%%)",
+    )
     parser.add_argument("--cash-profit-coverage-min", type=float, default=0.8)
     parser.add_argument("--dividend-min-years", type=int, default=4)
     parser.add_argument("--dividend-max-cut-pct", type=float, default=30.0)
@@ -1254,25 +1316,6 @@ def main() -> int:
             final_dividend = filter_dividend_quality(final_dividend, args)
             
         final_growth = with_dividend[with_dividend["股票代码"].isin(growth_candidates["股票代码"])].copy()
-        
-        # Apply shareholder constraint (< 100000)
-        def filter_by_shareholder_count(df: pd.DataFrame, max_count: int = 100000) -> pd.DataFrame:
-            if df.empty:
-                return df
-            try:
-                gdhs = stock_gdhs_cached()
-                if not gdhs.empty:
-                    gdhs['股东户数-本次'] = pd.to_numeric(gdhs['股东户数-本次'], errors='coerce')
-                    valid_gdhs = gdhs[gdhs['股东户数-本次'] < max_count]
-                    valid_codes = set(valid_gdhs['代码'].astype(str))
-                    return df[df['股票代码'].isin(valid_codes)].copy()
-            except Exception as e:
-                import logging
-                logging.error(f"Failed to filter by shareholder count: {e}")
-            return df
-            
-        final_dividend = filter_by_shareholder_count(final_dividend)
-        final_growth = filter_by_shareholder_count(final_growth)
         
         div_result = output_columns(final_dividend)
         gro_result = output_columns(final_growth)

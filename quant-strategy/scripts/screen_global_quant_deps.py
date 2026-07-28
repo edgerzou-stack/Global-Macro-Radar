@@ -5,15 +5,9 @@ import hashlib
 from datetime import datetime
 import yfinance as yf
 from screen_a_share import fetch_quote_snapshot_cached
+from core.strategy_registry import ACTIVE_STRATEGIES
 
-STRATEGIES = [
-    "dividend_a_stock", "growth_a_stock",
-    "dividend_us_stock", "growth_us_stock",
-    "dividend_hk_stock", "growth_hk_stock",
-    "hot_spot_a_stock",
-    "hot_spot_us_stock",
-    "hot_spot_hk_stock"
-]
+STRATEGIES = ACTIVE_STRATEGIES
 
 HOT_SPOT_SCHEMA_VERSION = 1
 HOT_SPOT_STRATEGIES = (

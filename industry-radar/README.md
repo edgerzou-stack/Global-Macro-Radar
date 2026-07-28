@@ -22,10 +22,13 @@ Industry Radar 负责采集产业新闻、执行 RSS 健康闸门、去重、LLM
 - HTTP/content-type 和 feed 解析结果
 - UTC aware 发布时间与 freshness
 - healthy source ratio、fresh article count
-- 命名 critical source groups
+- 命名 critical source groups 的 transport availability 与独立内容时效 SLA
 - fixture 中声明的健康统计与真实文章数一致
 
-零条新文章的可达 feed 会标为 degraded；聚合健康或关键源组不达标时整轮停止。当前真实配置包含 22 个 feed，但数量和成员以本机 `config.yaml` 为准。
+零条新文章的可达 feed 会标为 degraded，但不会被误报为网络不可用。关键源组可以用
+`content_max_age_hours` 为低频高质量媒体设置明确时效 SLA；聚合健康、可访问源数量或
+内容时效不达标时整轮停止。当前真实配置包含 22 个 feed，但数量和成员以本机
+`config.yaml` 为准。
 
 ## LLM 路由与缓存
 
@@ -42,11 +45,16 @@ Provider 顺序由配置决定，只有具备凭证且被启用的 provider 才�
 ```bash
 ./run_all.sh --mode live-shadow \
   --database /absolute/path/to/test-copy.db \
+  --expected-source-sha256 SHA256_RECORDED_WHEN_COPY_WAS_PREPARED \
   --artifact-root /absolute/path/to/artifacts \
   --effective-date YYYY-MM-DD \
   --run-id unique-run-id \
   --delivery-mode sink
 ```
+
+历史 effective date 不允许读取当前 RSS；必须额外传入
+`--rss-fixture /absolute/path/to/radar_rss.json`。fixture 中晚于 effective date 的
+文章或健康时间戳会被拒绝。
 
 仅调试新闻模块时：
 

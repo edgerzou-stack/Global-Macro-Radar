@@ -2,6 +2,7 @@ import os
 import time
 import pickle
 import hashlib
+import logging
 from datetime import datetime
 import functools
 
@@ -13,10 +14,16 @@ CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".cac
 DEFAULT_EXPIRE_HOURS = 12
 LIVE_QUOTE_MODES = {"shadow", "live-shadow", "production"}
 QUOTE_CACHE_SCHEMA_VERSION = 2
+FINANCIAL_CACHE_SCHEMA_VERSION = 2
+logger = logging.getLogger(__name__)
 
 
 class QuoteSnapshotModeError(RuntimeError):
     """Raised when a quote request conflicts with the explicit run context."""
+
+
+class FinancialDataFetchError(RuntimeError):
+    """Raised when an authoritative financial report cannot be fetched whole."""
 
 def clear_cache():
     if not os.path.exists(CACHE_DIR):
@@ -307,19 +314,42 @@ async def _fetch_em_page(session, url, params, page, semaphore):
     async with semaphore:
         p = params.copy()
         p["pageNumber"] = page
+        last_error = None
         for attempt in range(3):
             try:
-                async with session.get(url, params=p, timeout=10) as resp:
+                timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
+                async with session.get(url, params=p, timeout=timeout) as resp:
                     resp.raise_for_status()
                     data = await resp.json(content_type=None)
-                    return data["result"]["data"] if data and data.get("result") else []
+                    result = data.get("result") if isinstance(data, dict) else None
+                    rows = result.get("data") if isinstance(result, dict) else None
+                    if not isinstance(rows, list) or not rows:
+                        raise FinancialDataFetchError(
+                            f"Eastmoney {params.get('reportName', 'unknown')} page "
+                            f"{page} returned no rows despite advertised page count"
+                        )
+                    return rows
             except Exception as e:
+                last_error = e
                 if attempt == 2:
-                    import logging
-                    logging.error(f"Failed to fetch em page {page}: {e}", exc_info=True)
-                    return []
+                    break
                 import random
                 await asyncio.sleep(2 ** attempt + random.uniform(0, 1))
+        report_name = params.get("reportName", "unknown")
+        raise FinancialDataFetchError(
+            f"Eastmoney {report_name} page {page} failed after 3 attempts"
+        ) from last_error
+
+
+def _em_report_max_concurrency() -> int:
+    raw = os.environ.get("EM_REPORT_MAX_CONCURRENCY", "4")
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError("EM_REPORT_MAX_CONCURRENCY must be an integer") from error
+    if not 1 <= value <= 8:
+        raise ValueError("EM_REPORT_MAX_CONCURRENCY must be between 1 and 8")
+    return value
 
 async def _fetch_em_report_async(date, report_name):
     url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
@@ -342,10 +372,17 @@ async def _fetch_em_report_async(date, report_name):
                     break
             except Exception as e:
                 logger.warning(f"Fetch failed on attempt {attempt} for {url}: {e}")
-                if attempt == 2: raise
+                if attempt == 2:
+                    raise FinancialDataFetchError(
+                        f"Eastmoney {report_name} initial page failed after 3 attempts"
+                    ) from e
                 await asyncio.sleep(2 ** attempt)
         
-        sem = asyncio.Semaphore(15)
+        # Report periods are fetched sequentially by screen_a_share.  Keep the
+        # per-report fan-out small as well: the previous 3 x 15 nested
+        # concurrency burst caused Eastmoney to time out and silently produced
+        # partial financial tables.
+        sem = asyncio.Semaphore(_em_report_max_concurrency())
         tasks = [_fetch_em_page(session, url, params, p, sem) for p in range(2, pages + 1)]
         results = await asyncio.gather(*tasks)
         
@@ -353,7 +390,7 @@ async def _fetch_em_report_async(date, report_name):
         for r in results: all_data.extend(r)
         return all_data
 
-@disk_cache(expire_hours=24)
+@disk_cache(expire_hours=24, schema_version=FINANCIAL_CACHE_SCHEMA_VERSION)
 @with_retry(max_retries=3, delay=2)
 def stock_yjbb_em_cached(date: str) -> pd.DataFrame:
     rows = asyncio.run(_fetch_em_report_async(date, "RPT_LICO_FN_CPD"))
@@ -377,7 +414,7 @@ def stock_yjbb_em_cached(date: str) -> pd.DataFrame:
             df[col] = None
     return df
 
-@disk_cache(expire_hours=24)
+@disk_cache(expire_hours=24, schema_version=FINANCIAL_CACHE_SCHEMA_VERSION)
 @with_retry(max_retries=3, delay=2)
 def stock_zcfz_em_cached(date: str) -> pd.DataFrame:
     rows = asyncio.run(_fetch_em_report_async(date, "RPT_DMSK_FN_BALANCE"))

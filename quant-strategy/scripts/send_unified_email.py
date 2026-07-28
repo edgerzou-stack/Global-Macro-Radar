@@ -1,8 +1,10 @@
 """Build and deliver the unified report through an explicit delivery mode.
 
-Non-production runs use the local sink.  Live delivery is journaled by run ID;
-an interrupted ``sending`` state is deliberately ambiguous and therefore
-requires operator reconciliation rather than risking a duplicate message.
+Non-production runs use the local sink. Live delivery is journaled by run ID.
+``accepted_by_smtp`` means only that the outbound server reported no immediate
+recipient refusal; it does not claim inbox delivery. An interrupted ``sending``
+state is deliberately ambiguous and therefore requires operator reconciliation
+rather than risking a duplicate message.
 """
 
 from __future__ import annotations
@@ -19,9 +21,11 @@ import ssl
 import sys
 import tempfile
 from contextlib import contextmanager
+from datetime import date, datetime, timezone
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import format_datetime
 from pathlib import Path
 
 import markdown
@@ -30,6 +34,7 @@ from dotenv import load_dotenv
 
 
 VALID_DELIVERY_MODES = {"disabled", "sink", "live"}
+DELIVERY_JOURNAL_SCHEMA_VERSION = 2
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 DATA_IMAGE_PATTERN = re.compile(
@@ -85,11 +90,27 @@ def _delivery_lock(path: Path):
         os.close(descriptor)
 
 
-def get_latest_radar_report(reports_dir=None):
+def get_latest_radar_report(reports_dir=None, effective_date=None):
     default_reports_dir = Path(__file__).resolve().parents[2] / "industry-radar" / "reports"
     directory = Path(
         reports_dir or os.environ.get("RADAR_REPORTS_DIR", default_reports_dir)
     )
+    date_text = effective_date or os.environ.get("PIPELINE_EFFECTIVE_DATE") or os.environ.get(
+        "EFFECTIVE_DATE"
+    )
+    if date_text:
+        try:
+            date.fromisoformat(date_text)
+        except ValueError as error:
+            raise DeliveryError(
+                f"Invalid report effective date {date_text!r}; expected YYYY-MM-DD"
+            ) from error
+        report = directory / f"industry_report_{date_text}.md"
+        if not report.is_file():
+            raise DeliveryError(
+                f"Radar report for effective date {date_text} does not exist: {report}"
+            )
+        return str(report)
     reports = sorted(directory.glob("*.md"), reverse=True)
     return str(reports[0]) if reports else None
 
@@ -134,10 +155,12 @@ def load_approved_html(path, expected_sha256=None):
     return html_content, digest
 
 
-def build_unified_html(project_root=None, radar_report=None):
+def build_unified_html(project_root=None, radar_report=None, effective_date=None):
     root = Path(project_root or os.environ.get("PROJECT_ROOT") or Path(__file__).resolve().parents[1])
     quant_html = root / "reports" / "screening_results.html"
-    radar_report = radar_report or get_latest_radar_report()
+    radar_report = radar_report or get_latest_radar_report(
+        effective_date=effective_date
+    )
 
     radar_html = ""
     if radar_report and Path(radar_report).exists():
@@ -175,7 +198,9 @@ def _load_existing_journal(path: Path, content_hash: str):
     if payload.get("content_sha256") != content_hash:
         raise DeliveryError("Run ID was already used for different email content")
     state = payload.get("state")
-    if state in {"sink", "delivered"}:
+    # ``delivered`` is the legacy name for an SMTP-accepted message.  Keep it
+    # terminal for idempotency, but never emit it for a new send.
+    if state in {"sink", "accepted_by_smtp", "confirmed_received", "delivered"}:
         return payload
     if state == "sending":
         raise DeliveryError(
@@ -183,6 +208,72 @@ def _load_existing_journal(path: Path, content_hash: str):
             "reconcile with SMTP provider before retrying"
         )
     return None
+
+
+def reconcile_confirmed_delivery(
+    *,
+    artifact_dir,
+    run_id: str,
+    expected_html_sha256: str,
+    expected_recipient: str,
+    confirmed_by: str,
+):
+    """Record actual receipt only after the recipient confirms it."""
+    if not run_id or not RUN_ID_PATTERN.fullmatch(run_id):
+        raise DeliveryError(
+            "RUN_ID must contain 1-128 safe alphanumeric/._:- characters"
+        )
+    if not SHA256_PATTERN.fullmatch(expected_html_sha256 or ""):
+        raise DeliveryError("Expected HTML SHA-256 must contain exactly 64 hex digits")
+    if not expected_recipient:
+        raise DeliveryError("Expected recipient is required for delivery reconciliation")
+    if confirmed_by != "recipient":
+        raise DeliveryError("Delivery reconciliation requires recipient confirmation")
+
+    output_dir = Path(artifact_dir).expanduser().resolve() / "delivery"
+    journal_path = output_dir / f"{run_id}.json"
+    lock_path = output_dir / f"{run_id}.lock"
+    with _delivery_lock(lock_path):
+        try:
+            payload = json.loads(journal_path.read_text(encoding="utf-8"))
+        except FileNotFoundError as error:
+            raise DeliveryError(f"Delivery journal does not exist: {journal_path}") from error
+        except (OSError, json.JSONDecodeError) as error:
+            raise DeliveryError(f"Unreadable delivery journal: {journal_path}") from error
+
+        actual_hash = str(payload.get("html_sha256") or "").lower()
+        if actual_hash != expected_html_sha256.lower():
+            raise DeliveryError(
+                "Delivery reconciliation HTML SHA-256 mismatch: "
+                f"expected={expected_html_sha256.lower()} actual={actual_hash}"
+            )
+        actual_recipient = payload.get("recipient")
+        if actual_recipient != expected_recipient:
+            raise DeliveryError(
+                "Delivery reconciliation recipient mismatch: "
+                f"expected={expected_recipient!r} actual={actual_recipient!r}"
+            )
+        state = payload.get("state")
+        if state in {"confirmed_received", "delivered"}:
+            return {**payload, "duplicate": True}
+        if state not in {"sending", "accepted_by_smtp"}:
+            raise DeliveryError(
+                "Only a 'sending' or 'accepted_by_smtp' journal can be "
+                "reconciled as confirmed received; "
+                f"actual state={state!r}"
+            )
+
+        reconciled = {
+            **payload,
+            "state": "confirmed_received",
+            "safe_to_retry": False,
+            "reconciled_from": state,
+            "reconciliation": "recipient_confirmed_received",
+            "reconciled_at": datetime.now(timezone.utc).isoformat(),
+            "confirmed_by": confirmed_by,
+        }
+        _write_journal(journal_path, reconciled)
+        return reconciled
 
 
 def _build_live_message(*, html_content, subject, sender, recipient, run_id):
@@ -207,6 +298,12 @@ def _build_live_message(*, html_content, subject, sender, recipient, run_id):
     message["Subject"] = subject
     message["From"] = sender
     message["To"] = recipient
+    message["Date"] = format_datetime(datetime.now(timezone.utc))
+    sender_domain = sender.rpartition("@")[2] or "localhost"
+    message_identity = hashlib.sha256(
+        (run_id + "\0" + sender + "\0" + html_content).encode("utf-8")
+    ).hexdigest()
+    message["Message-ID"] = f"<gmr-{message_identity[:32]}@{sender_domain}>"
     message["X-Global-Macro-Radar-Run-ID"] = run_id
 
     alternatives = MIMEMultipart("alternative")
@@ -233,6 +330,23 @@ def _build_live_message(*, html_content, subject, sender, recipient, run_id):
     return message, len(inline_images)
 
 
+def _serialise_refused_recipients(refused):
+    """Convert smtplib's refusal mapping into stable JSON-safe evidence."""
+    result = {}
+    for address, detail in (refused or {}).items():
+        try:
+            code, response = detail
+        except (TypeError, ValueError):
+            code, response = None, detail
+        if isinstance(response, bytes):
+            response = response.decode("utf-8", errors="replace")
+        result[str(address)] = {
+            "code": int(code) if code is not None else None,
+            "message": str(response),
+        }
+    return result
+
+
 def deliver_report(
     *,
     html_content: str,
@@ -243,6 +357,7 @@ def deliver_report(
     smtp_factory=smtplib.SMTP,
     password=None,
     confirm_live_delivery=False,
+    report_html_path=None,
 ):
     if mode not in VALID_DELIVERY_MODES:
         raise DeliveryError(f"Unsupported delivery mode: {mode!r}")
@@ -279,7 +394,7 @@ def deliver_report(
             return {**existing, "duplicate": True}
 
         base = {
-            "schema_version": 1,
+            "schema_version": DELIVERY_JOURNAL_SCHEMA_VERSION,
             "run_id": run_id,
             "mode": mode,
             "content_sha256": content_hash,
@@ -297,16 +412,23 @@ def deliver_report(
 
         if not sender or not recipient:
             raise DeliveryError("Live delivery requires sender_email and recipient_email")
-        password = (
-            password
-            if password is not None
-            else os.environ.get("ICLOUD_APP_PASSWORD")
+        password = password if password is not None else (
+            os.environ.get("SMTP_APP_PASSWORD")
+            or os.environ.get("ICLOUD_APP_PASSWORD")
         )
         if not password:
-            raise DeliveryError("Live delivery requires ICLOUD_APP_PASSWORD")
+            raise DeliveryError(
+                "Live delivery requires SMTP_APP_PASSWORD "
+                "(or legacy ICLOUD_APP_PASSWORD)"
+            )
 
         server = delivery_config.get("smtp_server", "smtp.mail.me.com")
         port = int(delivery_config.get("smtp_port", 587))
+        smtp_username = (
+            delivery_config.get("smtp_username")
+            or os.environ.get("SMTP_USERNAME")
+            or sender
+        )
         message, inline_image_count = _build_live_message(
             html_content=html_content,
             subject=subject,
@@ -314,14 +436,22 @@ def deliver_report(
             recipient=recipient,
             run_id=run_id,
         )
-        base = {**base, "inline_image_count": inline_image_count}
+        base = {
+            **base,
+            "inline_image_count": inline_image_count,
+            "message_id": message["Message-ID"],
+            "message_date": message["Date"],
+            "smtp_server": server,
+            "smtp_port": port,
+            "smtp_username": smtp_username,
+        }
         _write_journal(journal_path, {**base, "state": "pending"})
 
         smtp = None
         try:
             smtp = smtp_factory(server, port, timeout=20)
             smtp.starttls(context=ssl.create_default_context())
-            smtp.login(sender, password)
+            smtp.login(smtp_username, password)
         except Exception as error:
             _write_journal(
                 journal_path,
@@ -338,12 +468,55 @@ def deliver_report(
 
         _write_journal(journal_path, {**base, "state": "sending"})
         try:
-            smtp.send_message(message)
+            refused = smtp.send_message(message)
+        except smtplib.SMTPRecipientsRefused as error:
+            refused = _serialise_refused_recipients(error.recipients)
+            payload = {
+                **base,
+                "state": "rejected_by_smtp",
+                "safe_to_retry": True,
+                "smtp_refused_recipients": refused,
+            }
+            _write_journal(journal_path, payload)
+            try:
+                smtp.quit()
+            except Exception:
+                if hasattr(smtp, "close"):
+                    smtp.close()
+            raise DeliveryError(
+                "Live SMTP recipient refused: "
+                + ", ".join(sorted(refused))
+            ) from error
         except Exception as error:
             # Keep the ambiguous state.  Retrying automatically could duplicate mail.
             raise DeliveryError(f"Live SMTP delivery failed: {error}") from error
 
-        payload = {**base, "state": "delivered"}
+        refused = _serialise_refused_recipients(refused)
+        if refused:
+            payload = {
+                **base,
+                "state": "rejected_by_smtp",
+                "safe_to_retry": True,
+                "smtp_refused_recipients": refused,
+            }
+            _write_journal(journal_path, payload)
+            try:
+                smtp.quit()
+            except Exception:
+                if hasattr(smtp, "close"):
+                    smtp.close()
+            raise DeliveryError(
+                "Live SMTP recipient refused: "
+                + ", ".join(sorted(refused))
+            )
+
+        payload = {
+            **base,
+            "state": "accepted_by_smtp",
+            "safe_to_retry": False,
+            "smtp_acceptance": "send_message_returned_no_refusals",
+            "accepted_at": datetime.now(timezone.utc).isoformat(),
+        }
         _write_journal(journal_path, payload)
         try:
             smtp.quit()
@@ -362,11 +535,32 @@ def build_parser():
     parser.add_argument("--artifact-dir")
     parser.add_argument("--env-file")
     parser.add_argument("--html-file")
+    parser.add_argument("--prepared-manifest")
+    parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--prepared-html")
     parser.add_argument("--expected-html-sha256")
+    parser.add_argument(
+        "--effective-date",
+        help="Logical report date in YYYY-MM-DD; defaults to the pipeline environment",
+    )
     parser.add_argument(
         "--confirm-live-delivery",
         action="store_true",
         help="Required explicit acknowledgement for live SMTP delivery",
+    )
+    parser.add_argument(
+        "--reconcile-confirmed-delivery",
+        action="store_true",
+        help=(
+            "Mark a sending/accepted_by_smtp journal confirmed_received after "
+            "recipient confirmation"
+        ),
+    )
+    parser.add_argument("--expected-recipient")
+    parser.add_argument(
+        "--confirm-recipient-received",
+        action="store_true",
+        help="Required acknowledgement that the recipient confirmed receipt",
     )
     return parser
 
@@ -374,6 +568,38 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     _load_runtime_environment(args.env_file)
+    project_root = Path(
+        os.environ.get("PROJECT_ROOT")
+        or Path(__file__).resolve().parents[1]
+    )
+    report_html_path = project_root / "reports" / "screening_results.html"
+    if args.prepare_only:
+        if not args.prepared_html or not args.prepared_manifest:
+            raise DeliveryError(
+                "--prepare-only requires --prepared-html and --prepared-manifest"
+            )
+        html_content = build_unified_html(
+            project_root=project_root,
+            effective_date=args.effective_date,
+        )
+        prepared_path = Path(args.prepared_html).expanduser().resolve()
+        manifest_path = Path(args.prepared_manifest).expanduser().resolve()
+        digest = hashlib.sha256(html_content.encode("utf-8")).hexdigest()
+        _atomic_write(prepared_path, html_content)
+        _atomic_write(report_html_path, html_content)
+        manifest = {
+            "schema_version": 1,
+            "html_path": str(prepared_path),
+            "canonical_report_path": str(report_html_path.resolve()),
+            "html_sha256": digest,
+        }
+        _atomic_write(
+            manifest_path,
+            json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2),
+        )
+        print(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
+        return 0
+
     mode = args.mode or os.environ.get("DELIVERY_MODE", "disabled")
     run_id = args.run_id or os.environ.get("PIPELINE_RUN_ID") or os.environ.get("RUN_ID")
     artifact_dir = (
@@ -383,18 +609,50 @@ def main(argv=None):
     )
     if mode != "disabled" and not artifact_dir:
         raise DeliveryError("ARTIFACT_DIR/PIPELINE_ARTIFACT_DIR is required")
+    if args.reconcile_confirmed_delivery:
+        if not artifact_dir:
+            raise DeliveryError("ARTIFACT_DIR/PIPELINE_ARTIFACT_DIR is required")
+        if not args.confirm_recipient_received:
+            raise DeliveryError(
+                "Delivery reconciliation requires --confirm-recipient-received"
+            )
+        result = reconcile_confirmed_delivery(
+            artifact_dir=artifact_dir,
+            run_id=run_id or "",
+            expected_html_sha256=args.expected_html_sha256 or "",
+            expected_recipient=args.expected_recipient or "",
+            confirmed_by="recipient",
+        )
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0
     if args.expected_html_sha256 and not args.html_file:
         raise DeliveryError("--expected-html-sha256 requires --html-file")
+    if args.prepared_manifest and args.html_file:
+        raise DeliveryError("--prepared-manifest and --html-file are mutually exclusive")
     if mode == "live" and args.html_file and not args.expected_html_sha256:
         raise DeliveryError(
             "Live delivery of an approved HTML file requires --expected-html-sha256"
         )
-    if args.html_file:
+    if args.prepared_manifest:
+        manifest_path = Path(args.prepared_manifest).expanduser().resolve()
+        try:
+            prepared = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise DeliveryError(
+                f"Unable to read prepared HTML manifest: {manifest_path}"
+            ) from error
+        if prepared.get("schema_version") != 1:
+            raise DeliveryError("Unsupported prepared HTML manifest schema")
+        html_content, _ = load_approved_html(
+            prepared.get("html_path", ""),
+            expected_sha256=prepared.get("html_sha256"),
+        )
+    elif args.html_file:
         html_content, _ = load_approved_html(
             args.html_file, expected_sha256=args.expected_html_sha256
         )
     else:
-        html_content = build_unified_html()
+        html_content = build_unified_html(effective_date=args.effective_date)
     result = deliver_report(
         html_content=html_content,
         run_id=run_id or "",

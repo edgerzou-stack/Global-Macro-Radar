@@ -148,19 +148,44 @@ def main():
         end_str = end_dt.strftime("%Y%m%d")
 
         # Test benchmark 600519 (Moutai)
-        df_baostock = dg._fetch_from_baostock("600519", start_str, end_str, adjust="")
-        df_sina = dg._fetch_from_sina("600519", start_str, end_str, adjust="")
+        frames = {}
+        failures = {}
+        for source, fetch in (
+            ("baostock", dg._fetch_from_baostock),
+            ("sina", dg._fetch_from_sina),
+        ):
+            try:
+                frame = fetch("600519", start_str, end_str, adjust="")
+                validate_price_frame_fresh(frame, end_dt)
+                frames[source] = frame
+            except Exception as error:
+                failures[source] = error
+                logger.warning("A-share health source %s unavailable: %s", source, error)
 
-        if df_baostock.empty or df_sina.empty:
-            logger.error(f"A-share fetch returned empty. Baostock: {not df_baostock.empty}, Sina: {not df_sina.empty}")
-            sys.exit(1)
-
-        validate_price_frame_fresh(df_baostock, end_dt)
-        validate_price_frame_fresh(df_sina, end_dt)
-
-        validate_a_share_cross_check(df_baostock, df_sina)
-
-        logger.info("A-share API chain is healthy.")
+        if len(frames) == 2:
+            validate_a_share_cross_check(frames["baostock"], frames["sina"])
+            logger.info("A-share API chain is healthy with two-source cross-check.")
+        elif len(frames) == 1:
+            source = next(iter(frames))
+            logger.warning(
+                "A-share API chain is degraded but operational through validated "
+                "%s data; unavailable sources=%s",
+                source,
+                sorted(failures),
+            )
+        else:
+            # The actual gateway is cache-first.  A complete, strictly validated
+            # completed-session cache is an acceptable temporary degraded mode;
+            # stale or absent cache still fails closed.
+            cached = dg.get_historical_prices(
+                "600519", end_str, end_str, adjust=""
+            )
+            validate_price_frame_fresh(cached, end_dt)
+            logger.warning(
+                "A-share live sources are unavailable; proceeding with an exact "
+                "completed-session validated cache row. failures=%s",
+                sorted(failures),
+            )
     except Exception as e:
         logger.error(f"A-share API chain failed: {e}", exc_info=True)
         sys.exit(1)
@@ -183,7 +208,7 @@ def main():
         logger.error(f"US-share API failed: {e}")
         sys.exit(1)
 
-    logger.info("All Stock APIs are healthy. Ready for daily run.")
+    logger.info("Required stock data paths are operational. Ready for daily run.")
     sys.exit(0)
 
 if __name__ == "__main__":

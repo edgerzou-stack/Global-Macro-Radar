@@ -25,7 +25,10 @@ from migrations.quarantine_manifest import (
     install_quarantine_write_guards,
 )
 from migrations.v006_execution_ledger import apply_v006
+from migrations.v007_trade_intents import apply_v007
+from migrations.v008_trade_execution_evidence import apply_v008
 from core.writer_lock import writer_fence
+from core.portfolio_limits import MAX_HOLDINGS_PER_STRATEGY
 
 
 PRODUCTION_CONFIRM_TOKEN = "APPLY-V6-QUARANTINE-2026-07-18"
@@ -34,6 +37,8 @@ MAINTENANCE_START = time(14, 0)
 MAINTENANCE_END = time(16, 0)
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 V6_TABLES = ("orders", "fills", "journal_transactions", "journal_entries")
+V7_TABLES = ("trade_intents",)
+V8_TABLES = ("trade_execution_evidence", "trade_intent_supersessions")
 QUARANTINE_TABLES = (
     "quarantine_manifests",
     "quarantine_candidates",
@@ -177,6 +182,83 @@ def v6_fingerprint(conn):
     return hashlib.sha256(_canonical_json(schemas).encode("utf-8")).hexdigest()
 
 
+def expected_v7_table_sql():
+    with sqlite3.connect(":memory:") as conn:
+        conn.execute("PRAGMA user_version=6")
+        apply_v007(conn)
+        return _table_sql_map(conn, V7_TABLES)
+
+
+def validate_v7_name_collisions(conn):
+    expected = expected_v7_table_sql()
+    existing = _table_sql_map(conn, V7_TABLES)
+    mismatches = {
+        name: {"expected": expected[name], "actual": actual}
+        for name, actual in existing.items()
+        if actual != expected[name]
+    }
+    if mismatches:
+        raise SchemaFingerprintMismatch(
+            f"Existing v7 table names have incompatible schemas: {sorted(mismatches)}"
+        )
+    return {
+        "present": sorted(existing),
+        "fingerprint": hashlib.sha256(
+            _canonical_json(existing).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def v7_fingerprint(conn):
+    schemas = _table_sql_map(conn, V7_TABLES)
+    if set(schemas) != set(V7_TABLES):
+        raise SchemaFingerprintMismatch(
+            f"Missing v7 tables after migration: {sorted(set(V7_TABLES) - set(schemas))}"
+        )
+    if schemas != expected_v7_table_sql():
+        raise SchemaFingerprintMismatch("Post-migration v7 schema differs from expected schema")
+    return hashlib.sha256(_canonical_json(schemas).encode("utf-8")).hexdigest()
+
+
+def expected_v8_table_sql():
+    with sqlite3.connect(":memory:") as conn:
+        conn.execute("PRAGMA user_version=6")
+        apply_v007(conn)
+        apply_v008(conn)
+        return _table_sql_map(conn, V8_TABLES)
+
+
+def validate_v8_name_collisions(conn):
+    expected = expected_v8_table_sql()
+    existing = _table_sql_map(conn, V8_TABLES)
+    mismatches = {
+        name: {"expected": expected[name], "actual": actual}
+        for name, actual in existing.items()
+        if actual != expected[name]
+    }
+    if mismatches:
+        raise SchemaFingerprintMismatch(
+            f"Existing v8 table names have incompatible schemas: {sorted(mismatches)}"
+        )
+    return {
+        "present": sorted(existing),
+        "fingerprint": hashlib.sha256(
+            _canonical_json(existing).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def v8_fingerprint(conn):
+    schemas = _table_sql_map(conn, V8_TABLES)
+    if set(schemas) != set(V8_TABLES):
+        raise SchemaFingerprintMismatch(
+            f"Missing v8 tables after migration: {sorted(set(V8_TABLES) - set(schemas))}"
+        )
+    if schemas != expected_v8_table_sql():
+        raise SchemaFingerprintMismatch("Post-migration v8 schema differs from expected schema")
+    return hashlib.sha256(_canonical_json(schemas).encode("utf-8")).hexdigest()
+
+
 def validate_database(conn):
     integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
     foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
@@ -289,7 +371,9 @@ def _primary_key_columns(conn, table):
 
 
 def legacy_snapshot(conn):
-    excluded = set(V6_TABLES) | set(QUARANTINE_TABLES)
+    excluded = (
+        set(V6_TABLES) | set(V7_TABLES) | set(V8_TABLES) | set(QUARANTINE_TABLES)
+    )
     snapshot = {}
     for table in sorted(_table_names(conn) - excluded):
         rows = _rows_as_dicts(conn, f"SELECT * FROM {_quote_identifier(table)}")
@@ -443,6 +527,31 @@ def _table_columns(conn, table):
 def _detect_uncovered_anomalies(conn, selected_identities):
     tables = _table_names(conn)
     flagged = []
+    covered_identities = set(selected_identities)
+    if "quarantine_key_index" in tables:
+        for source_table, source_pk_json in conn.execute(
+            "SELECT source_table, source_pk_json FROM quarantine_key_index"
+        ):
+            if source_table not in tables:
+                raise FreshAuditError(
+                    "Existing quarantine references a missing source table: "
+                    f"{source_table!r}"
+                )
+            try:
+                primary_key = json.loads(source_pk_json)
+            except (TypeError, json.JSONDecodeError) as error:
+                raise FreshAuditError(
+                    "Existing quarantine contains invalid source_pk_json"
+                ) from error
+            expected_columns = set(_primary_key_columns(conn, source_table))
+            if not isinstance(primary_key, dict) or set(primary_key) != expected_columns:
+                raise FreshAuditError(
+                    "Existing quarantine primary key does not match source schema: "
+                    f"{source_table!r}"
+                )
+            covered_identities.add(
+                (source_table, _canonical_json(primary_key))
+            )
 
     def flag_query(table, condition):
         if table not in tables:
@@ -454,7 +563,7 @@ def _detect_uncovered_anomalies(conn, selected_identities):
         for row in rows:
             primary_key = {column: row[column] for column in pk_columns}
             identity = (table, _canonical_json(primary_key))
-            if identity not in selected_identities:
+            if identity not in covered_identities:
                 flagged.append({"table": table, "primary_key": primary_key})
 
     if "portfolio" in tables:
@@ -468,6 +577,34 @@ def _detect_uncovered_anomalies(conn, selected_identities):
             conditions.append("lower(strategy) LIKE 'test%'")
         if conditions:
             flag_query("portfolio", " OR ".join(f"({item})" for item in conditions))
+
+        if {"strategy", "name_or_code"}.issubset(columns):
+            primary_key_columns = _primary_key_columns(conn, "portfolio")
+            effective_holdings = {}
+            for row in _rows_as_dicts(conn, "SELECT * FROM portfolio"):
+                primary_key = {
+                    column: row[column] for column in primary_key_columns
+                }
+                identity = ("portfolio", _canonical_json(primary_key))
+                if identity in covered_identities:
+                    continue
+                strategy = row.get("strategy")
+                effective_holdings.setdefault(strategy, set()).add(
+                    row.get("name_or_code")
+                )
+            for strategy, symbols in sorted(
+                effective_holdings.items(), key=lambda item: str(item[0])
+            ):
+                if len(symbols) > MAX_HOLDINGS_PER_STRATEGY:
+                    flagged.append(
+                        {
+                            "table": "portfolio",
+                            "anomaly": "holding limit exceeded",
+                            "strategy": strategy,
+                            "holding_count": len(symbols),
+                            "maximum": MAX_HOLDINGS_PER_STRATEGY,
+                        }
+                    )
 
     for table in ("strategy_accounts", "strategy_nav_history"):
         if table in tables and "strategy_id" in _table_columns(conn, table):
@@ -499,7 +636,7 @@ def _detect_uncovered_anomalies(conn, selected_identities):
                     "strategy_daily_results",
                     _canonical_json(primary_key),
                 )
-                if identity not in selected_identities:
+                if identity not in covered_identities:
                     flagged.append(
                         {"table": "strategy_daily_results", "primary_key": primary_key}
                     )
@@ -529,6 +666,8 @@ def refresh_audit(*, source_db, baseline_audit_path, output_path, now=None):
     with _open_read_only(source_path) as conn:
         checks = validate_database(conn)
         validate_v6_name_collisions(conn)
+        validate_v7_name_collisions(conn)
+        validate_v8_name_collisions(conn)
         selected_identities, candidate_counts = _selected_candidate_identities(
             conn, candidates
         )
@@ -838,6 +977,8 @@ def _apply_release_to_database(
                 locked_preflight(conn)
             pre_checks = validate_database(conn)
             validate_v6_name_collisions(conn)
+            validate_v7_name_collisions(conn)
+            validate_v8_name_collisions(conn)
             legacy_before = legacy_snapshot(conn)
             apply_v006(conn)
             if fault_injector:
@@ -859,6 +1000,52 @@ def _apply_release_to_database(
             }
             if first_fingerprint != second_fingerprint or first_counts != second_counts:
                 raise SchemaFingerprintMismatch("apply_v006 is not idempotent")
+            apply_v007(conn)
+            if fault_injector:
+                fault_injector("after_v007")
+            first_v7_fingerprint = v7_fingerprint(conn)
+            first_v7_counts = {
+                table: conn.execute(
+                    f"SELECT COUNT(*) FROM {_quote_identifier(table)}"
+                ).fetchone()[0]
+                for table in V7_TABLES
+            }
+            apply_v007(conn)
+            second_v7_fingerprint = v7_fingerprint(conn)
+            second_v7_counts = {
+                table: conn.execute(
+                    f"SELECT COUNT(*) FROM {_quote_identifier(table)}"
+                ).fetchone()[0]
+                for table in V7_TABLES
+            }
+            if (
+                first_v7_fingerprint != second_v7_fingerprint
+                or first_v7_counts != second_v7_counts
+            ):
+                raise SchemaFingerprintMismatch("apply_v007 is not idempotent")
+            apply_v008(conn)
+            if fault_injector:
+                fault_injector("after_v008")
+            first_v8_fingerprint = v8_fingerprint(conn)
+            first_v8_counts = {
+                table: conn.execute(
+                    f"SELECT COUNT(*) FROM {_quote_identifier(table)}"
+                ).fetchone()[0]
+                for table in V8_TABLES
+            }
+            apply_v008(conn)
+            second_v8_fingerprint = v8_fingerprint(conn)
+            second_v8_counts = {
+                table: conn.execute(
+                    f"SELECT COUNT(*) FROM {_quote_identifier(table)}"
+                ).fetchone()[0]
+                for table in V8_TABLES
+            }
+            if (
+                first_v8_fingerprint != second_v8_fingerprint
+                or first_v8_counts != second_v8_counts
+            ):
+                raise SchemaFingerprintMismatch("apply_v008 is not idempotent")
             quarantine = apply_quarantine_candidates(
                 conn,
                 audit=audit,
@@ -867,6 +1054,11 @@ def _apply_release_to_database(
                 release_mode=mode,
                 created_at=created_at,
             )
+            # A baseline audit can predate newly introduced invariants. Recheck
+            # the effective post-quarantine state on every dry run as well as a
+            # production release, so an over-limit legacy portfolio cannot be
+            # handed to the pipeline as an apparently valid working database.
+            _detect_uncovered_anomalies(conn, set())
             if fault_injector:
                 fault_injector("after_quarantine")
             post_checks = validate_database(conn)
@@ -890,8 +1082,81 @@ def _apply_release_to_database(
                 "applied_twice_idempotently": True,
                 "table_counts": second_counts,
             },
+            "v007": {
+                "fingerprint": second_v7_fingerprint,
+                "applied_twice_idempotently": True,
+                "table_counts": second_v7_counts,
+            },
+            "v008": {
+                "fingerprint": second_v8_fingerprint,
+                "applied_twice_idempotently": True,
+                "table_counts": second_v8_counts,
+            },
             "quarantine": quarantine,
         }
+
+
+def prepare_live_shadow_database(path, *, source_sha256):
+    """Retag an isolated release copy for non-production pipeline writes.
+
+    A SQLite online backup faithfully copies the source database's
+    ``database_environment=production`` marker.  That marker must not be left
+    on the writable copy passed to ``--mode live-shadow``: the child stages
+    correctly request a test database and would otherwise fail closed with an
+    environment mismatch.  Only the already-isolated working copy is changed;
+    provenance is retained alongside the new test marker.
+    """
+
+    database_path = normalize_path(path)
+    if database_path == normalize_path(get_canonical_production_path()):
+        raise ProductionAuthorizationError(
+            "Refusing to retag the canonical production database for live-shadow"
+        )
+    with sqlite3.connect(database_path, timeout=30.0) as conn:
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS meta_data (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+                """
+            )
+            row = conn.execute(
+                "SELECT value FROM meta_data WHERE key = 'database_environment'"
+            ).fetchone()
+            original_environment = row[0] if row else "unlabeled"
+            if original_environment not in {"production", "test", "unlabeled"}:
+                raise DatabaseValidationError(
+                    "Live-shadow copy must originate from a production, test, or "
+                    "legacy unlabeled "
+                    f"database, not {original_environment!r}"
+                )
+            conn.execute(
+                "INSERT OR REPLACE INTO meta_data (key, value) VALUES (?, ?)",
+                ("database_environment_origin", original_environment),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO meta_data (key, value) VALUES (?, ?)",
+                ("database_environment_source_sha256", str(source_sha256)),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO meta_data (key, value) VALUES (?, ?)",
+                ("database_environment", "test"),
+            )
+            checks = validate_database(conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return {
+        "environment": "test",
+        "origin_environment": original_environment,
+        "source_sha256": str(source_sha256),
+        "checks": checks,
+    }
 
 
 def _write_json_atomic(path, payload):
@@ -953,6 +1218,7 @@ def _run_release_unlocked(
         source_checks = validate_database(source)
         source_checks.update(validate_against_audit(source, source_path, audit))
         validate_v6_name_collisions(source)
+        validate_v7_name_collisions(source)
 
     output_path = Path(normalize_path(output_dir))
     output_path.mkdir(parents=True, exist_ok=False)
@@ -984,6 +1250,11 @@ def _run_release_unlocked(
             "dry-run",
             started_at,
         )
+        shadow_database = prepare_live_shadow_database(
+            working_copy,
+            source_sha256=source_sha,
+        )
+        manifest["working_database_environment"] = shadow_database
         manifest["copy_drill"] = drill
         if apply_production:
             if sha256_file(source_path) != source_sha:
@@ -1007,6 +1278,7 @@ def _run_release_unlocked(
                     validate_database(connection)
                     validate_against_audit(connection, source_path, audit)
                     validate_v6_name_collisions(connection)
+                    validate_v7_name_collisions(connection)
 
                 applied = _apply_release_to_database(
                     source_path,

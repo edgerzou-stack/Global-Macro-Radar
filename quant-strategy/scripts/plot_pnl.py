@@ -21,10 +21,8 @@ STRAT_NAMES = {
     "dividend_a_stock": "A股红利",
     "growth_a_stock": "A股高增",
     "hot_spot_a_stock": "A股热点",
-    "dividend_us_stock": "美股红利",
     "growth_us_stock": "美股高增",
     "hot_spot_us_stock": "美股热点",
-    "dividend_hk_stock": "港股红利",
     "growth_hk_stock": "港股高增",
     "hot_spot_hk_stock": "港股热点"
 }

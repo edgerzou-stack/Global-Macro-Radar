@@ -11,6 +11,10 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from core.ttl_cache import ttl_cache
 
 from core.data_gateway import DataGateway
+from core.portfolio_limits import (
+    MAX_HOLDINGS_PER_STRATEGY,
+    ordered_unique_symbols,
+)
 from core.quarantine import quarantine_exclusion
 data_gateway = DataGateway()
 
@@ -29,11 +33,22 @@ def _should_block_exit(market_name, entry_date, entry_price, effective_today):
 
 
 class PortfolioManager:
-    def __init__(self, db_utils_module):
+    def __init__(self, db_utils_module, max_holdings=MAX_HOLDINGS_PER_STRATEGY):
         """
         Pass the db_utils module to interact with the database.
         """
+        if (
+            isinstance(max_holdings, bool)
+            or not isinstance(max_holdings, int)
+            or max_holdings <= 0
+            or max_holdings > MAX_HOLDINGS_PER_STRATEGY
+        ):
+            raise ValueError(
+                "max_holdings must be a positive integer no greater than "
+                f"{MAX_HOLDINGS_PER_STRATEGY}"
+            )
         self.db = db_utils_module
+        self.max_holdings = max_holdings
 
     def get_simulated_trade_price(self, prices_dict: Dict[str, Any], market_type: str) -> float:
         """
@@ -310,7 +325,15 @@ class PortfolioManager:
 
             for strat, target_keys in strategy_targets.items():
                 cash_mgr.initialize_strategy(strat, cursor=cursor)
-                target_keys_set = set(target_keys)
+                ranked_target_keys = ordered_unique_symbols(target_keys)
+                execution_target_keys = ranked_target_keys[:self.max_holdings]
+                if len(ranked_target_keys) > self.max_holdings:
+                    print(
+                        f"HOLDING LIMIT: {strat} has {len(ranked_target_keys)} "
+                        f"research candidates; only the first {self.max_holdings} "
+                        "ranked names are execution targets."
+                    )
+                target_keys_set = set(execution_target_keys)
                 old_keys = set(old_portfolio.get(strat, {}).keys())
 
                 # --- Pre-fetch prices concurrently to populate cache ---
@@ -372,7 +395,10 @@ class PortfolioManager:
                             if key in target_keys_set:
                                 target_keys_set.remove(key)
 
-                added = target_keys_set - old_keys
+                eligible_target_keys = [
+                    key for key in execution_target_keys if key in target_keys_set
+                ]
+                added = [key for key in eligible_target_keys if key not in old_keys]
                 removed = (old_keys - target_keys_set) | hard_stop_keys
 
                 # Track stocks sold today to enforce T+0 re-entry guard
@@ -489,7 +515,7 @@ class PortfolioManager:
                     cash_mgr.release(strat, shares, pnl, cursor=cursor)
 
                 # --- Process RETAINED (Average Down) ---
-                retained = target_keys_set & old_keys
+                retained = [key for key in eligible_target_keys if key in old_keys]
                 for key in retained:
                     old_pos = old_portfolio[strat][key]
                     ep = old_pos.get("entry_price", 0)
@@ -547,6 +573,14 @@ class PortfolioManager:
                 for key in added:
                     if key in sold_today_keys and '_a_' in strat:
                         print(f"T+0 GUARD: Skipping re-entry of {key} in {strat} (sold today)")
+                        continue
+
+                    if len(new_portfolio[strat]) >= self.max_holdings:
+                        print(
+                            f"HOLDING LIMIT: Deferring {key} in {strat}; "
+                            f"{len(new_portfolio[strat])} live positions already "
+                            "consume all available slots."
+                        )
                         continue
 
                     price = execution_price(current_prices.get(key, {}), strat)

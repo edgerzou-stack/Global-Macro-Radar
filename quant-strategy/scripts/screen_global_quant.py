@@ -2,7 +2,6 @@
 import os
 import json
 import argparse
-import sys
 import sqlite3
 import hashlib
 import math
@@ -12,6 +11,7 @@ from datetime import date, datetime, timedelta
 import pandas as pd
 
 from screen_a_share import (
+    DIVIDEND_AVG_ROE_MIN,
     build_quote_table,
     attach_latest_financial_fields,
     attach_dynamic_cagr_fields,
@@ -20,26 +20,108 @@ from screen_a_share import (
     filter_growth_strategy,
     attach_ttm_dividend_yield,
     output_columns,
-    CYCLICAL_GROWTH_INDUSTRIES,
     threshold_payload,
     number_or_none,
     string_or_none
 )
 
 from us_hk_quant import screen_us_hk
-from screen_global_quant_deps import STRATEGIES, load_universes, load_hot_spot_today, get_current_prices_for_portfolio
+from screen_global_quant_deps import STRATEGIES, load_universes, load_hot_spot_today
 
 def get_key(row, strat):
     # 修改 P0.6：所有市场统一使用股票代码作为 key，不再使用中文简称
     return row.get("股票代码", "")
 import db_utils
-from core.portfolio import PortfolioManager
+from core.portfolio_limits import MAX_HOLDINGS_PER_STRATEGY, ordered_unique_symbols
 from core.strategy import ADividendStrategy, AGrowthStrategy, USHKQuantStrategy, HotSpotStrategy
 from core.quarantine import quarantine_filter
+from core.trade_intents import TradeIntentLedger
 
 
 GLOBAL_SCREEN_FIXTURE_ENV = "GLOBAL_SCREEN_FIXTURE"
 GLOBAL_SCREEN_FIXTURE_VERSION = 1
+LLM_SECONDARY_GROWTH_STRATEGIES = ()
+
+
+def _plan_trade_intents(strategy_targets, snapshot_date, old_portfolio):
+    """Persist target changes without claiming that a market fill occurred."""
+    run_id = (
+        os.environ.get("PIPELINE_RUN_ID")
+        or os.environ.get("RUN_ID")
+        or f"manual-screen-{snapshot_date}"
+    )
+    connection = db_utils.get_connection()
+    try:
+        connection.execute("BEGIN")
+        for strategy in STRATEGIES:
+            connection.execute(
+                "INSERT OR IGNORE INTO strategy_accounts "
+                "(strategy_id,total_capital,available_cash) VALUES (?,1000000,1000000)",
+                (strategy,),
+            )
+        ledger = TradeIntentLedger(connection)
+        diff = {strategy: {"added": [], "removed": []} for strategy in STRATEGIES}
+        summary = {strategy: [] for strategy in STRATEGIES}
+        for strategy in STRATEGIES:
+            execution_targets = ordered_unique_symbols(
+                strategy_targets.get(strategy, [])
+            )[:MAX_HOLDINGS_PER_STRATEGY]
+            intents = ledger.plan_strategy(
+                run_id=run_id,
+                signal_date=snapshot_date,
+                strategy_id=strategy,
+                ranked_targets=execution_targets,
+                reason="quantitative target change; awaiting eligible-session raw open",
+                manage_transaction=False,
+            )
+            for intent in intents:
+                item = {
+                    "intent_id": intent["intent_id"],
+                    "name": intent["symbol"],
+                    "action": intent["action"],
+                    "state": intent["state"],
+                    "eligible_session": intent["eligible_session"],
+                    "reason": intent.get("reason") or "",
+                }
+                summary[strategy].append(item)
+                if intent["action"] == "SELL_ALL":
+                    position = old_portfolio.get(strategy, {}).get(intent["symbol"], {})
+                    diff[strategy]["removed"].append(
+                        {
+                            **item,
+                            "entry_price": float(position.get("entry_price") or 0),
+                            "exit_price": 0.0,
+                            "pnl": 0.0,
+                        }
+                    )
+                else:
+                    diff[strategy]["added"].append(
+                        {**item, "entry_price": 0.0}
+                    )
+        connection.commit()
+        return diff, summary
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def apply_final_result_limits(results, appendix, args):
+    """Cap dividend output only; every mechanically qualified growth stock remains."""
+    final_limits = {strategy: 10 for strategy in STRATEGIES}
+    final_limits["dividend_a_stock"] = args.dividend_max_results
+    for strategy in ("growth_a_stock", "growth_us_stock", "growth_hk_stock"):
+        final_limits[strategy] = None
+    for strategy in STRATEGIES:
+        limit = final_limits[strategy]
+        if limit is None or len(results[strategy]) <= limit:
+            continue
+        if not appendix.get(strategy):
+            appendix[strategy] = results[strategy][limit:]
+        else:
+            appendix[strategy].extend(results[strategy][limit:])
+        results[strategy] = results[strategy][:limit]
 
 
 class GlobalScreenFixtureError(ValueError):
@@ -236,7 +318,7 @@ def _write_json_atomic(path, payload):
 
 
 def _run_offline_fixture(args, fixture):
-    """Execute the real portfolio/database flow while blocking every screen/data fetch."""
+    """Plan the real settlement flow while blocking every screen/data fetch."""
     database_path = db_utils.get_db_path()
     database_environment = os.environ.get("QUANT_DB_ENV")
     if (
@@ -249,49 +331,16 @@ def _run_offline_fixture(args, fixture):
         )
     snapshot_date = fixture["snapshot_date"]
     results = fixture["results"]
-    current_prices = fixture["current_prices"]
     old_portfolio, _ = db_utils.load_portfolio_and_trades()
-
-    required_symbols = {
-        symbol
-        for strategy in STRATEGIES
-        for symbol in old_portfolio.get(strategy, {})
-    } | {
-        row["股票代码"]
-        for strategy in STRATEGIES
-        for row in results[strategy]
-    }
-    missing_prices = sorted(required_symbols - set(current_prices))
-    if missing_prices:
-        raise GlobalScreenFixtureError(
-            f"current_prices must cover existing and target positions: {missing_prices}"
-        )
 
     strategy_targets = {
         strategy: [get_key(row, strategy) for row in results[strategy]]
         for strategy in STRATEGIES
     }
-    manager = PortfolioManager(db_utils)
-
-    # Fixture prices are already execution-approved inputs. Bypass market-clock and
-    # pending-price resolution so an offline run cannot branch on wall clock or network.
-    manager.get_simulated_trade_price = lambda prices, _strategy: float(prices["最新价"])
-    manager.resolve_pending_prices = lambda: None
-    portfolio_module = sys.modules[PortfolioManager.__module__]
-    from core import diagnose as diagnose_module
-    original_gateway = portfolio_module.data_gateway
-    original_diagnose = diagnose_module.diagnose_elimination
-    portfolio_module.data_gateway = _OfflineFixtureGateway()
-    diagnose_module.diagnose_elimination = (
-        lambda _symbol, _strategy: "离线固定测试集移除"
+    diff, intent_summary = _plan_trade_intents(
+        strategy_targets, snapshot_date, old_portfolio
     )
-    try:
-        portfolio, _new_trades, diff = manager.diff_and_update(
-            strategy_targets, current_prices, snapshot_date
-        )
-    finally:
-        portfolio_module.data_gateway = original_gateway
-        diagnose_module.diagnose_elimination = original_diagnose
+    portfolio = old_portfolio
     inject_portfolio_metrics(
         results, portfolio, snapshot_date, gateway_instance=_OfflineFixtureGateway()
     )
@@ -309,6 +358,7 @@ def _run_offline_fixture(args, fixture):
         "results": results,
         "appendix": {strategy: [] for strategy in STRATEGIES},
         "diff": diff,
+        "trade_intents": intent_summary,
         "portfolio": portfolio,
         "trade_history": [],
     }
@@ -373,7 +423,6 @@ def process_a_share_data(args, a_tickers, as_of_date):
 
     gro_pre_mask = (
         with_financial["总市值"].notna() & (with_financial["总市值"] > args.market_cap_min_yi * 1e8)
-        & with_financial["所处行业"].isin(CYCLICAL_GROWTH_INDUSTRIES)
     )
     gro_pre = with_financial[gro_pre_mask].copy()
 
@@ -432,7 +481,8 @@ def process_a_share_data(args, a_tickers, as_of_date):
         f"financials={financial_coverage:.2%}, "
         f"dividends={dividend_coverage:.2%}, dividend_prefilter={len(div_pre)}, "
         f"dividend_fundamentals={dividend_fundamental_count}, "
-        f"dividend_selected={len(div_df)} (quality gates + industry cap; no score)",
+        f"dividend_selected={len(div_df)} (quality gates + industry cap; no score), "
+        f"growth_prefilter={len(gro_pre)}, growth_selected={len(gro_df)} (uncapped)",
         flush=True,
     )
     return div_df, gro_df, a_prices
@@ -444,11 +494,13 @@ def inject_portfolio_metrics(results, portfolio, snapshot_date, gateway_instance
     gateway = gateway_instance if gateway_instance else DataGateway()
 
     for strat in STRATEGIES:
+        strategy_positions = portfolio.get(strat) or {}
         for row in results.get(strat, []):
             key = get_key(row, strat)
-            ep = portfolio[strat].get(key, {}).get("entry_price", 0.0)
-            ed = portfolio[strat].get(key, {}).get("entry_date", snapshot_date)
-            shares = portfolio[strat].get(key, {}).get("shares", 1)
+            position = strategy_positions.get(key) or {}
+            ep = position.get("entry_price", 0.0)
+            ed = position.get("entry_date", snapshot_date)
+            shares = position.get("shares", 1)
             cp = row.get("最新价", 0.0)
             if cp is None: cp = 0.0
 
@@ -481,22 +533,31 @@ def inject_portfolio_metrics(results, portfolio, snapshot_date, gateway_instance
                 row["累计涨跌幅"] = f"{(cp / adj_ep - 1) * 100:.2f}%" if adj_ep > 0 else "0.00%"
             row["入选日期"] = ed
 
-def main(argv=None):
+def build_parser():
     parser = argparse.ArgumentParser(description="Global Macro Quant Screener V2")
     parser.add_argument("--report-date", type=str)
     parser.add_argument("--valuation-formula-max", type=float, default=10.0)
     parser.add_argument("--dividend-yield-min", type=float, default=3.0)
     parser.add_argument("--market-cap-min-yi", type=float, default=100.0)
-    parser.add_argument("--avg-net-profit-margin-min", type=float, default=10.0)
+    parser.add_argument(
+        "--avg-net-profit-margin-min",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--require-continuous-growth",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Require revenue and net profit YoY growth in each of the latest 3 annual reports",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--peg-max", type=float, default=1.0)
     parser.add_argument("--profit-cagr-min", type=float, default=5.0)
-    parser.add_argument("--dividend-roe-min", type=float, default=10.0)
+    parser.add_argument(
+        "--dividend-roe-min",
+        type=float,
+        default=DIVIDEND_AVG_ROE_MIN,
+    )
     parser.add_argument("--growth-roe-min", type=float, default=10.0)
     parser.add_argument("--growth-yoy-min", type=float, default=30.0)
     parser.add_argument("--max-stocks", type=int, default=10)
@@ -508,11 +569,27 @@ def main(argv=None):
     parser.add_argument("--quote-min-coverage", type=float, default=0.99)
     parser.add_argument("--financial-min-coverage", type=float, default=0.90)
     parser.add_argument("--dividend-min-data-coverage", type=float, default=0.95)
-    parser.add_argument("--disable-llm", action="store_true", help="Disable LLM secondary filtering")
+    llm_group = parser.add_mutually_exclusive_group()
+    llm_group.add_argument(
+        "--disable-llm",
+        dest="disable_llm",
+        action="store_true",
+        help="Disable LLM secondary filtering (safe default)",
+    )
+    llm_group.add_argument(
+        "--enable-llm",
+        dest="disable_llm",
+        action="store_false",
+        help="Explicitly allow candidate and holding context to leave the process",
+    )
+    parser.set_defaults(disable_llm=True)
     from config import PROJECT_ROOT
     parser.add_argument("--output-file", type=str, default=os.path.join(PROJECT_ROOT, "global_screen.json"))
+    return parser
 
-    args = parser.parse_args(argv)
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
     from core.clock import clock
     from core.logger import get_quant_logger
 
@@ -526,16 +603,14 @@ def main(argv=None):
         logger.info("Running strict offline fixture version %s", GLOBAL_SCREEN_FIXTURE_VERSION)
         return _run_offline_fixture(args, load_global_screen_fixture(fixture_path))
 
-    snapshot_date = clock.now().strftime("%Y-%m-%d")
     as_of_date = clock.today()
+    snapshot_date = as_of_date.isoformat()
 
     # Init Strategy classes
     strategies = {
         "dividend_a_stock": ADividendStrategy(args.dividend_max_results),
         "growth_a_stock": AGrowthStrategy(args.max_stocks),
-        "dividend_us_stock": USHKQuantStrategy("dividend_us_stock", args.max_stocks),
         "growth_us_stock": USHKQuantStrategy("growth_us_stock", args.max_stocks),
-        "dividend_hk_stock": USHKQuantStrategy("dividend_hk_stock", args.max_stocks),
         "growth_hk_stock": USHKQuantStrategy("growth_hk_stock", args.max_stocks),
     }
     for hs in ["hot_spot_a_stock", "hot_spot_us_stock", "hot_spot_hk_stock"]:
@@ -548,8 +623,8 @@ def main(argv=None):
     a_tickers = load_code_name_table()["股票代码"].tolist()
 
     div_a_df, gro_a_df, a_prices = None, None, {}
-    div_us_df, gro_us_df = None, None
-    div_hk_df, gro_hk_df = None, None
+    gro_us_df = None
+    gro_hk_df = None
 
     import concurrent.futures
     with concurrent.futures.ProcessPoolExecutor(max_workers=3) as executor:
@@ -558,8 +633,8 @@ def main(argv=None):
         future_hk = executor.submit(screen_us_hk, universes["HK"], args, "HK")
 
         div_a_df, gro_a_df, a_prices = future_a.result()
-        div_us_df, gro_us_df = future_us.result()
-        div_hk_df, gro_hk_df = future_hk.result()
+        _, gro_us_df = future_us.result()
+        _, gro_hk_df = future_hk.result()
 
     # Load old portfolio early to prevent flapping
     old_portfolio, _ = db_utils.load_portfolio_and_trades()
@@ -568,9 +643,7 @@ def main(argv=None):
     results = {
         "dividend_a_stock": strategies["dividend_a_stock"].get_signals(df=div_a_df, previous_holdings=list(old_portfolio.get("dividend_a_stock", {}).keys())),
         "growth_a_stock": strategies["growth_a_stock"].get_signals(df=gro_a_df, previous_holdings=list(old_portfolio.get("growth_a_stock", {}).keys())),
-        "dividend_us_stock": strategies["dividend_us_stock"].get_signals(df=div_us_df, previous_holdings=list(old_portfolio.get("dividend_us_stock", {}).keys())),
         "growth_us_stock": strategies["growth_us_stock"].get_signals(df=gro_us_df, previous_holdings=list(old_portfolio.get("growth_us_stock", {}).keys())),
-        "dividend_hk_stock": strategies["dividend_hk_stock"].get_signals(df=div_hk_df, previous_holdings=list(old_portfolio.get("dividend_hk_stock", {}).keys())),
         "growth_hk_stock": strategies["growth_hk_stock"].get_signals(df=gro_hk_df, previous_holdings=list(old_portfolio.get("growth_hk_stock", {}).keys())),
     }
 
@@ -603,7 +676,7 @@ def main(argv=None):
 
     appendix = {s: [] for s in STRATEGIES}
 
-    for strat in ["growth_a_stock", "growth_us_stock", "growth_hk_stock"]:
+    for strat in LLM_SECONDARY_GROWTH_STRATEGIES:
         if len(results[strat]) > 10:
             if call_llm:
                 print(f"Applying LLM secondary filter for {strat} ({len(results[strat])} -> 10)...")
@@ -667,58 +740,14 @@ Please return the selected top candidates (maximum 10) as a JSON array of their 
                 appendix[strat] = results[strat][10:]
                 results[strat] = results[strat][:10]
 
-    final_limits = {strategy: 10 for strategy in STRATEGIES}
-    final_limits["dividend_a_stock"] = args.dividend_max_results
-    for strat in STRATEGIES:
-        limit = final_limits[strat]
-        if len(results[strat]) > limit:
-            if not appendix.get(strat):
-                appendix[strat] = results[strat][limit:]
-            else:
-                appendix[strat].extend(results[strat][limit:])
-            results[strat] = results[strat][:limit]
+    apply_final_result_limits(results, appendix, args)
 
-    # Phase 2: Transactional Portfolio Update via PortfolioManager
-    pm = PortfolioManager(db_utils)
-
-    # Build a superset of old and new targets to fetch current prices
+    # Phase 2: Persist market-aware intents. Screening never claims a fill.
     strategy_targets = {strat: [get_key(r, strat) for r in results[strat]] for strat in STRATEGIES}
-
-    all_portfolio = {s: {} for s in STRATEGIES}
-    for s in STRATEGIES:
-        if s in old_portfolio:
-            all_portfolio[s].update(old_portfolio[s])
-        for target in strategy_targets[s]:
-            all_portfolio[s][target] = {}
-
-    # Inject Hot Spot A-share/ETF prices into a_prices so get_current_prices_for_portfolio can map them
-    for hs_key, items in hot_spot_data.items():
-        if '_a_' in hs_key:
-            for item in items:
-                if "股票代码" in item and "最新价" in item:
-                    a_prices[item["股票代码"]] = item["最新价"]
-
-    current_prices = get_current_prices_for_portfolio(all_portfolio, a_prices)
-
-    # 修改 P0.3：将周末判断按市场区分，不再进行全局一刀切跳过
-    strategy_targets_market_filtered = {}
-    from core.market import AShareMarket, HKMarket, USMarket
-    for strat, targets in strategy_targets.items():
-        if "_us_" in strat:
-            m = USMarket()
-        elif "_hk_" in strat:
-            m = HKMarket()
-        else:
-            m = AShareMarket()
-        # Instead of completely skipping the run, we keep targets empty if the market is closed for weekend/holiday.
-        # This prevents accidental drops or fake transactions.
-        if not m.is_trading_time() and m.get_current_time().weekday() >= 5 and os.environ.get("FORCE_RUN") != "1":
-            # If weekend, we do not update this strategy's target (keep it exactly as old_portfolio)
-            strategy_targets_market_filtered[strat] = list(old_portfolio.get(strat, {}).keys())
-        else:
-            strategy_targets_market_filtered[strat] = targets
-
-    portfolio, new_trades, diff = pm.diff_and_update(strategy_targets_market_filtered, current_prices, snapshot_date)
+    diff, intent_summary = _plan_trade_intents(
+        strategy_targets, snapshot_date, old_portfolio
+    )
+    portfolio = old_portfolio
 
     # Inject entry_price and ROI back into results for display
     inject_portfolio_metrics(results, portfolio, snapshot_date)
@@ -730,7 +759,8 @@ Please return the selected top candidates (maximum 10) as a JSON array of their 
         "stage_counts": {s: len(results[s]) for s in STRATEGIES},
         "results": results,
         "appendix": appendix,
-        "diff": diff
+        "diff": diff,
+        "trade_intents": intent_summary,
     }
 
     # P3.24: 将大 JSON 保存逻辑从统一的 meta_data 表迁移到按日期和策略拆分的专用表中
