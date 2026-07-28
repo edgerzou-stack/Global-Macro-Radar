@@ -2,7 +2,7 @@ import yaml
 import os
 import json
 import tempfile
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from ingest import fetch_rss_feeds, load_rss_fixture
 from score import score_article
 from dotenv import load_dotenv
@@ -16,6 +16,60 @@ from cache_manager import (
 import smtplib
 from email.message import EmailMessage
 import markdown
+from run_date import logical_date_text, logical_today
+
+
+def _aware_utc_timestamp(value, field_name):
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(f"{field_name} must be a valid ISO timestamp") from exc
+    else:
+        raise ValueError(f"{field_name} must be a timezone-aware timestamp")
+    if parsed.tzinfo is None:
+        raise ValueError(f"{field_name} must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def rss_reference_time_utc():
+    """Return one stable reference instant for a live RSS collection stage."""
+    configured = os.environ.get("MOCK_NOW_UTC")
+    if configured:
+        return _aware_utc_timestamp(configured, "MOCK_NOW_UTC")
+    return datetime.now(timezone.utc)
+
+
+def validate_rss_fixture_effective_date(articles, health, effective_date):
+    """Reject fixture content that was not available by the logical run date."""
+    if not isinstance(effective_date, date):
+        raise TypeError("effective_date must be a date")
+    cutoff = datetime.combine(
+        effective_date + timedelta(days=1), time.min, tzinfo=timezone.utc
+    )
+    for index, article in enumerate(articles):
+        published_at = _aware_utc_timestamp(
+            article.get("published_at"), f"articles[{index}].published_at"
+        )
+        if published_at >= cutoff:
+            raise ValueError(
+                "RSS fixture contains post-effective-date article: "
+                f"{article.get('title', '<untitled>')} at {published_at.isoformat()}"
+            )
+    for index, item in enumerate(health):
+        newest = item.get("newest_published_at")
+        if newest is None:
+            continue
+        newest_at = _aware_utc_timestamp(
+            newest, f"health[{index}].newest_published_at"
+        )
+        if newest_at >= cutoff:
+            raise ValueError(
+                "RSS fixture health contains post-effective-date content: "
+                f"{item.get('url', '<unknown>')} at {newest_at.isoformat()}"
+            )
 
 
 def scoring_cache_config(config):
@@ -38,7 +92,7 @@ def configured_scoring_identities(config):
     defaults = {
         "gemini": "gemini-2.5-flash",
         "openai": "gpt-4.1-mini",
-        "deepseek": config.get("output", {}).get("model", "deepseek-chat"),
+        "deepseek": config.get("output", {}).get("model", "deepseek-v4-flash"),
     }
     llm_config = config.get("llm", {})
     provider_config = llm_config.get("providers", {})
@@ -48,6 +102,17 @@ def configured_scoring_identities(config):
         enabled = settings.get("enabled", True)
         if enabled and os.getenv(provider_keys.get(provider, "")):
             identities.append((provider, settings.get("model", defaults.get(provider, "unknown"))))
+    return identities
+
+
+def validate_scoring_configuration(config):
+    identities = configured_scoring_identities(config)
+    if not identities:
+        raise ValueError(
+            "CRITICAL ERROR: No enabled LLM provider has a configured API key. "
+            "Check llm.order, llm.providers.*.enabled, and the corresponding "
+            "GEMINI_API_KEY, OPENAI_API_KEY, or DEEPSEEK_API_KEY."
+        )
     return identities
 
 
@@ -151,6 +216,7 @@ def validate_rss_health(
     min_configured_sources=1,
     article_count=None,
     critical_source_groups=None,
+    reference_time=None,
 ):
     """Validate that RSS coverage is usable, not merely reachable.
 
@@ -193,6 +259,9 @@ def validate_rss_health(
     healthy_ratio = len(healthy) / len(health)
     reasons = []
     critical_group_summaries = []
+    reference_time = _aware_utc_timestamp(
+        reference_time or datetime.now(timezone.utc), "reference_time"
+    )
 
     if len(health) < min_configured_sources:
         reasons.append(
@@ -248,17 +317,33 @@ def validate_rss_health(
             raise ValueError(
                 f"critical source group {name} must contain unique source URLs"
             )
-        min_group_healthy = group.get("min_healthy_sources", 1)
-        min_group_fresh = group.get("min_fresh_sources", 1)
+        legacy_healthy_gate = "min_available_sources" not in group
+        legacy_fresh_gate = "min_current_sources" not in group
+        min_group_available = group.get(
+            "min_available_sources", group.get("min_healthy_sources", 1)
+        )
+        min_group_current = group.get(
+            "min_current_sources", group.get("min_fresh_sources", 1)
+        )
         for setting_name, value in (
-            ("min_healthy_sources", min_group_healthy),
-            ("min_fresh_sources", min_group_fresh),
+            ("min_available_sources", min_group_available),
+            ("min_current_sources", min_group_current),
         ):
             if type(value) is not int or not 0 <= value <= len(sources):
                 raise ValueError(
                     f"critical source group {name} {setting_name} must be between "
                     f"0 and {len(sources)}"
                 )
+        content_max_age_hours = group.get("content_max_age_hours")
+        if content_max_age_hours is not None and (
+            isinstance(content_max_age_hours, bool)
+            or not isinstance(content_max_age_hours, (int, float))
+            or content_max_age_hours <= 0
+        ):
+            raise ValueError(
+                f"critical source group {name} content_max_age_hours "
+                "must be a positive number"
+            )
 
         group_health = [health_by_url[url] for url in sources if url in health_by_url]
         missing = [url for url in sources if url not in health_by_url]
@@ -268,25 +353,64 @@ def validate_rss_health(
             and int(item.get("fresh_entries") or 0) > 0
             for item in group_health
         )
+        group_available = sum(
+            item.get("status") != "failed"
+            and int(item.get("total_entries") or 0) > 0
+            for item in group_health
+        )
+        if content_max_age_hours is None:
+            group_current = group_fresh
+        else:
+            group_current = 0
+            maximum_age = timedelta(hours=float(content_max_age_hours))
+            for item in group_health:
+                if item.get("status") == "failed":
+                    continue
+                newest = item.get("newest_published_at")
+                if not newest:
+                    continue
+                newest_at = _aware_utc_timestamp(
+                    newest,
+                    f"critical source group {name} newest_published_at",
+                )
+                age = reference_time - newest_at
+                if -timedelta(minutes=5) <= age <= maximum_age:
+                    group_current += 1
         if missing:
             reasons.append(
                 f"critical source group {name} missing {len(missing)} configured sources"
             )
-        if group_healthy < min_group_healthy:
+        availability_count = (
+            group_healthy if legacy_healthy_gate else group_available
+        )
+        availability_label = (
+            "healthy sources" if legacy_healthy_gate else "available sources"
+        )
+        current_count = group_fresh if legacy_fresh_gate else group_current
+        current_label = "fresh sources" if legacy_fresh_gate else "current sources"
+        if availability_count < min_group_available:
             reasons.append(
-                f"critical source group {name} healthy sources {group_healthy} below "
-                f"minimum {min_group_healthy}"
+                f"critical source group {name} {availability_label} "
+                f"{availability_count} below "
+                f"minimum {min_group_available}"
             )
-        if group_fresh < min_group_fresh:
+        if current_count < min_group_current:
             reasons.append(
-                f"critical source group {name} fresh sources {group_fresh} below "
-                f"minimum {min_group_fresh}"
+                f"critical source group {name} {current_label} {current_count} below "
+                f"minimum {min_group_current}"
             )
         critical_group_summaries.append(
             {
                 "name": name,
                 "configured_sources": len(group_health),
                 "expected_sources": len(sources),
+                "available_sources": group_available,
+                "current_sources": group_current,
+                "content_max_age_hours": (
+                    float(content_max_age_hours)
+                    if content_max_age_hours is not None
+                    else None
+                ),
                 "healthy_sources": group_healthy,
                 "fresh_sources": group_fresh,
             }
@@ -402,18 +526,19 @@ def generate_markdown_report(
 ):
     output_dir = output_dir or os.environ.get("RADAR_REPORTS_DIR", "reports")
     os.makedirs(output_dir, exist_ok=True)
-    date_str = datetime.now().strftime("%Y-%m-%d")
+    report_date = logical_today()
+    date_str = report_date.isoformat()
     report_path = os.path.join(output_dir, f"industry_report_{date_str}.md")
     
     min_score = config.get("output", {}).get("min_score_to_keep", 6)
     lookback_days = config.get("output", {}).get("report_days_lookback", 2)
     
-    cutoff_date_str = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    cutoff_date_str = (report_date - timedelta(days=lookback_days)).isoformat()
     
     high_scoring = []
     for a in scored_articles:
         pub_date = a.get('published_at', '')[:10]
-        if pub_date and pub_date < cutoff_date_str:
+        if pub_date and (pub_date < cutoff_date_str or pub_date > date_str):
             continue
             
         sd = a.get('score_data', {})
@@ -628,7 +753,7 @@ def send_email(report_path, config):
     </html>
     """
 
-    date_str = datetime.now().strftime("%Y-%m-%d")
+    date_str = logical_date_text()
     msg = EmailMessage()
     msg['Subject'] = f"🚀 科技产业情报雷达 - {date_str}"
     msg['From'] = sender
@@ -659,9 +784,22 @@ def main():
     if rss_fixture:
         print(f"Loading deterministic RSS fixture: {rss_fixture}", flush=True)
         articles, rss_health = load_rss_fixture(rss_fixture)
+        effective_date = logical_today()
+        validate_rss_fixture_effective_date(
+            articles, rss_health, effective_date
+        )
+        rss_reference_time = datetime.combine(
+            effective_date + timedelta(days=1),
+            time.min,
+            tzinfo=timezone.utc,
+        ) - timedelta(microseconds=1)
     else:
+        rss_reference_time = rss_reference_time_utc()
         articles, rss_health = fetch_rss_feeds(
-            config.get("rss_feeds", []), hours_back=hours_back, return_health=True
+            config.get("rss_feeds", []),
+            hours_back=hours_back,
+            now=rss_reference_time,
+            return_health=True,
         )
     save_json_atomic(os.path.join(reports_dir, "rss_health.json"), rss_health)
     validate_rss_health(
@@ -683,6 +821,7 @@ def main():
         ),
         article_count=len(articles),
         critical_source_groups=config.get("rss_critical_source_groups", []),
+        reference_time=rss_reference_time,
     )
     print(f"Fetched {len(articles)} articles.", flush=True)
     
@@ -719,9 +858,8 @@ def main():
     cache_data = load_cache()
     cache_updates = 0
     
-    if not os.getenv("GEMINI_API_KEY") and not os.getenv("DEEPSEEK_API_KEY") and not os.getenv("OPENAI_API_KEY"):
-        raise ValueError("CRITICAL ERROR: No LLM API Key is configured. Please configure GEMINI_API_KEY, DEEPSEEK_API_KEY, or OPENAI_API_KEY in .env.")
-    else:
+    scoring_identities = validate_scoring_configuration(config)
+    if scoring_identities:
         scored_articles = []
         print(f"Loaded {len(cache_data)} articles from incremental cache.", flush=True)
         print("Scoring articles using Dual-Track LLM...", flush=True)

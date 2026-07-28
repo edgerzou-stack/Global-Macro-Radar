@@ -29,15 +29,15 @@ except ImportError as e:
 
 
 # The quant pipeline must never infer Gemini availability merely from a key in
-# the parent process.  Gemini is explicitly disabled; DeepSeek is the primary
-# provider and OpenAI remains an optional configured fallback.
+# the parent process. Gemini and OpenAI are explicitly disabled; DeepSeek is
+# the only provider authorized to process quant hot-spot context.
 QUANT_LLM_CONFIG = {
     "llm": {
         "order": ["deepseek", "openai"],
         "providers": {
             "gemini": {"enabled": False},
             "deepseek": {"enabled": True},
-            "openai": {"enabled": True},
+            "openai": {"enabled": False},
         },
     }
 }

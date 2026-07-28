@@ -1,4 +1,6 @@
 akshare==1.18.60
+mini-racer==0.12.4
+setuptools==69.5.1
 aiohttp==3.13.5
 beautifulsoup4==4.14.3
 feedparser==6.0.12
@@ -15,3 +17,4 @@ Markdown==3.9
 schedule==1.2.2
 matplotlib==3.9.4
 baostock==0.9.3
+pypdf>=4.0.0,<5.0.0

@@ -181,6 +181,7 @@ class RunContext:
     created_at: dt.datetime
     delivery_mode: DeliveryMode = DeliveryMode.SINK
     fixture_paths: tuple[tuple[str, str], ...] = ()
+    database_source_sha256: Optional[str] = None
 
     @classmethod
     def create(
@@ -195,6 +196,7 @@ class RunContext:
         created_at: Optional[Any] = None,
         delivery_mode: Any = DeliveryMode.SINK,
         fixture_paths: Optional[Mapping[str, os.PathLike]] = None,
+        database_source_sha256: Optional[str] = None,
     ) -> "RunContext":
         try:
             normalized_mode = mode if isinstance(mode, RunMode) else RunMode(str(mode))
@@ -248,17 +250,25 @@ class RunContext:
             created_at=_parse_created_at(created_at),
             delivery_mode=normalized_delivery_mode,
             fixture_paths=normalized_fixture_paths,
+            database_source_sha256=(
+                str(database_source_sha256).lower()
+                if database_source_sha256
+                else None
+            ),
         )
 
     @property
     def identity(self) -> dict[str, str]:
-        return {
+        identity = {
             "run_id": self.run_id,
             "effective_date": self.effective_date.isoformat(),
             "config_hash": self.config_hash,
             "mode": self.mode.value,
             "database_path": str(self.database_path),
         }
+        if self.database_source_sha256:
+            identity["database_source_sha256"] = self.database_source_sha256
+        return identity
 
     def child_environment(self) -> dict[str, str]:
         database_environment = {
@@ -281,6 +291,10 @@ class RunContext:
             "QUANT_DB_ENV": database_environment,
             "DELIVERY_MODE": self.delivery_mode.value,
         }
+        if self.database_source_sha256:
+            values[
+                "PIPELINE_EXPECTED_DB_SOURCE_SHA256"
+            ] = self.database_source_sha256
         if self.mode is RunMode.OFFLINE:
             # Offline fixtures represent a completed end-of-day snapshot.  Four
             # UTC hours into the following date is after the effective session
@@ -291,12 +305,13 @@ class RunContext:
                 dt.time(4, 0),
                 tzinfo=dt.timezone.utc,
             ).isoformat()
-        elif self.mode is RunMode.SHADOW:
-            # Shadow uses the logical effective date for artifacts but the
-            # timezone-aware creation instant for market-open/close decisions.
-            # A date-only midnight would shift New York to the previous day.
+        elif self.mode in {RunMode.SHADOW, RunMode.LIVE_SHADOW}:
+            # Shadow modes use the logical effective date for persisted facts
+            # and artifacts, but retain the timezone-aware creation instant for
+            # market-open/close and cache-age decisions.  A date-only midnight
+            # would shift New York to the previous day.
             values["MOCK_DATE"] = self.effective_date.isoformat()
-            values["MOCK_NOW_UTC"] = dt.datetime.combine(self.effective_date, dt.time(12, 0), tzinfo=dt.timezone.utc).isoformat()
+            values["MOCK_NOW_UTC"] = self.created_at.isoformat()
         if self.mode is not RunMode.PRODUCTION:
             values.update(
                 {
@@ -427,6 +442,22 @@ class CheckpointStore:
         if command_key not in completed:
             completed.append(command_key)
         payload["status"] = "running"
+        for key in (
+            "interrupted_at",
+            "error_type",
+            "error_message",
+            "failed_command",
+            "return_code",
+        ):
+            payload.pop(key, None)
+        self.save(payload)
+
+    def mark_interrupted(
+        self, payload: dict[str, Any], error_payload: Mapping[str, Any]
+    ) -> None:
+        payload.setdefault("completed_steps", [])
+        payload["status"] = "interrupted"
+        payload.update(dict(error_payload))
         self.save(payload)
 
     def clear(self) -> None:

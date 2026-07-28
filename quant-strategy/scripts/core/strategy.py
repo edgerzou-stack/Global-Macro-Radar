@@ -28,10 +28,7 @@ class ADividendStrategy(Strategy):
         previous_holdings = kwargs.get("previous_holdings", [])
         
         # Buffer zone logic to prevent flapping
-        has_composite_score = (
-            "红利综合评分" in df.columns and df["红利综合评分"].notna().any()
-        )
-        rank_column = "红利综合评分" if has_composite_score else "TTM股息率"
+        rank_column = "TTM股息率"
         df = df.sort_values(by=rank_column, ascending=False)
         if previous_holdings:
             buffer_n = self.top_n * 2

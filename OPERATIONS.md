@@ -12,16 +12,30 @@ run executes, in order:
 
 1. stock API health check;
 2. read-only database integrity check;
-3. radar RSS ingest and news scoring;
-4. universe refresh, hot-spot screen and global quantitative screen;
-5. ledger settlement and NAV calculation;
-6. post-market double-entry sanity check;
-7. PnL chart generation;
-8. report generation and delivery.
+3. settle previously due v7 market intents at exact-session raw opens;
+4. radar RSS ingest and news scoring;
+5. universe refresh, hot-spot screen and global quantitative screen; this creates
+   next-session intents but never claims immediate fills;
+6. NAV calculation;
+7. post-market ledger and intent sanity check;
+8. PnL chart generation;
+9. report generation and delivery.
 
 The runner creates an SQLite Online Backup before changing an existing target
 database, holds a database writer fence, and writes an identity-bound manifest.
 A failed run keeps an identity-bound checkpoint for an explicit resume.
+
+Settlement is market-specific and idempotent. Missing A/HK/US raw opens leave only
+that intent pending. SELL intents run before BUY intents, failed exits retain their
+holding slots, each strategy remains capped at ten actual positions, and A-share
+same-session exits are rescheduled for T+1. HTML separates research candidates,
+actual legacy positions and pending v7 intents.
+
+The report date is a settlement cutoff, not a fill date. Each intent keeps the
+`eligible_session` fixed when it is created. A run one, two, or seven days later
+(including a weekend run) still requests that original session's unadjusted open.
+If authoritative evidence is unavailable, the intent stays `PENDING`; a later
+screen cannot cancel it, and pending buys count toward the ten-position capacity.
 
 ## Test and coverage gates
 
@@ -35,7 +49,7 @@ integrity and ledger `check_*.py` scripts are included in that denominator.
 ```bash
 python -m pytest -q -p no:cacheprovider \
   -m "not live and not llm_eval and not slow" \
-  --disable-socket
+  --disable-socket --allow-unix-socket
 ```
 
 The combined floor is a regression gate, not a reliability target. Add focused
@@ -48,14 +62,15 @@ instead of excluding low-coverage production modules.
 | --- | --- | --- | --- |
 | `offline` | isolated backtest database only | real orders disabled; delivery sink | `--fixture-root` required |
 | `shadow` | isolated test database only | real orders disabled; delivery sink | optional |
-| `live-shadow` | isolated test database only | real orders disabled; delivery sink | optional |
+| `live-shadow` | isolated test database only | real orders disabled; delivery sink | current date optional; historical date requires `--rss-fixture` |
 | `production` | canonical `quant-strategy/quant_system.db` only | production fences apply; delivery defaults to sink | optional |
 
-`live-shadow` has the same write and delivery safety profile as `shadow`. With no
-fixture variables it runs the real RSS, market-data and configured LLM adapters;
-with fixtures it uses those explicit inputs. Unlike `offline` and `shadow`, live
-modes do not export a date-only `MOCK_DATE`, because doing so can fabricate a
-cross-time-zone market session. `PIPELINE_EFFECTIVE_DATE` still binds artifacts.
+`live-shadow` has the same write and delivery safety profile as `shadow`. A
+current-date run without fixtures uses the real RSS, market-data and configured
+LLM adapters. A historical live-shadow must provide `--rss-fixture`; the fixture
+path and SHA-256 are included in the run identity while market and financial
+sources remain live. `PIPELINE_EFFECTIVE_DATE` binds persisted facts and
+artifacts, while the timezone-aware run instant controls live-session checks.
 
 ### Offline fixture bundle
 
@@ -105,7 +120,7 @@ sqlite3 quant-strategy/quant_system.db \
 The current legacy production database contains audit-selected anomalies and
 must not use that direct seed for a full-flow acceptance. First run the release
 coordinator in its default copy-only mode. It creates `working_copy.db`, applies
-v6 and additive quarantine only to the copy, and verifies legacy row counts:
+v6, v7 and additive quarantine only to the copy, and verifies legacy row counts:
 
 ```bash
 python3 quant-strategy/scripts/production_release.py \
@@ -139,7 +154,13 @@ Then run shadow or live-shadow with an explicit identity and sink delivery:
   --delivery-mode sink
 ```
 
-Do not set any fixture variables for a real live-shadow acceptance. Success
+For a historical effective date, add an archived point-in-time RSS snapshot:
+
+```bash
+  --rss-fixture /absolute/fixtures/radar_rss_YYYY-MM-DD.json
+```
+
+Do not set unbound fixture environment variables manually. Success
 requires a `completed` release manifest, a `completed` run manifest, a `sink`
 delivery journal, `integrity_check=ok`, zero active non-positive entry prices,
 and an unchanged production database hash. `shadow_runner.py --allow-live-api`
@@ -150,6 +171,20 @@ session is never treated as if its daily close already exists. If strict OHLC
 validation fails only because of an unrelated open field, NAV performs a fresh
 close-only read: close must remain positive, finite and bounded by high/low, and
 the degraded row is not written into the OHLC cache.
+
+Reporting is not gated on immediate settlement legality. A closed market,
+pre-open run, or unavailable exact raw open leaves the affected intent
+`PENDING` and records the per-market settlement outcome. NAV is certified per
+strategy: a successful valuation writes a fresh snapshot; a market-data-only
+failure may disclose the latest non-quarantined snapshot that satisfies
+`nav = cash + holdings_value`; a strategy without such a snapshot is reported
+as unavailable. The HTML validator checks these statuses and dates against the
+run-bound database before delivery. Ledger-integrity failures remain blocking.
+
+`run_all.sh` prefers the repository `.venv/bin/python` when present, and every
+child stage inherits that same interpreter. Set `QUANT_PYTHON` or
+`RADAR_PYTHON` only for an intentional override; production currently targets
+Python 3.11 rather than the EOL macOS system Python 3.9.
 
 Production requires both the explicit mode and a second write acknowledgement.
 It also rejects every database path except the canonical production path:
@@ -204,11 +239,16 @@ python3 quant-strategy/scripts/send_unified_email.py \
 ```
 
 Live delivery converts base64 data images to related CID parts for broader mail
-client compatibility. A connection, TLS or login failure is recorded as
-`failed_pre_send` and may be retried with the same run ID. A failure after the
-journal enters `sending` remains ambiguous and must never be automatically
-retried. A successful journal must end in `delivered` and record the intended
-recipient, HTML hash and inline image count.
+client compatibility and emits RFC `Date` plus a stable `Message-ID`. A
+connection, TLS or login failure is recorded as `failed_pre_send`; an explicit
+recipient refusal is `rejected_by_smtp`. A failure after the journal enters
+`sending` remains ambiguous and must never be automatically retried. When
+`SMTP.send_message()` returns no refused recipients, the journal becomes
+`accepted_by_smtp` and records the SMTP endpoint, Message-ID, acceptance time,
+recipient, HTML hash and inline image count. This proves outbound-server
+acceptance only, not inbox delivery. After the recipient confirms receipt, use
+the reconciliation command to record `confirmed_received`. Legacy `delivered`
+journals remain terminal solely to prevent duplicates.
 
 Before a production run, verify the database backup destination, delivery
 recipients, API credentials, market date and that no release or other writer

@@ -1,9 +1,9 @@
 import os
 import json
 import math
-from datetime import datetime
 from dotenv import load_dotenv
 from llm_router import _call_llm_with_fallback
+from run_date import logical_date_text
 
 load_dotenv()
 
@@ -15,7 +15,7 @@ class ScoreValidationError(ValueError):
 
 
 def _current_date_text():
-    return datetime.now().astimezone().strftime("%Y-%m-%d")
+    return logical_date_text()
 
 
 def _strict_rubric(config, current_date):

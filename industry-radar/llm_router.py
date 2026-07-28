@@ -67,7 +67,7 @@ def _model_for(config, provider, is_heavy):
     defaults = {
         "gemini": "gemini-2.5-flash",
         "openai": "gpt-4.1-mini",
-        "deepseek": (config or {}).get("output", {}).get("model", "deepseek-chat"),
+        "deepseek": (config or {}).get("output", {}).get("model", "deepseek-v4-flash"),
     }
     return defaults[provider]
 

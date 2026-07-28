@@ -53,7 +53,13 @@ if [ -n "${PIPELINE_EFFECTIVE_DATE:-}" ] && [ -n "${EFFECTIVE_DATE:-}" ] \
     exit 2
 fi
 
-python_spec="${QUANT_PYTHON:-python3}"
+if [ -n "${QUANT_PYTHON:-}" ]; then
+    python_spec="$QUANT_PYTHON"
+elif [ -x "$ROOT_DIR/.venv/bin/python" ]; then
+    python_spec="$ROOT_DIR/.venv/bin/python"
+else
+    python_spec="python3"
+fi
 read -r -a python_command <<< "$python_spec"
 if [ "${#python_command[@]}" -eq 0 ]; then
     echo "run_all.sh: QUANT_PYTHON resolved to an empty command" >&2

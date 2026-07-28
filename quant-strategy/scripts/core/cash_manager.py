@@ -3,6 +3,7 @@ import os
 
 from db_utils import get_db_path, normalize_db_path
 from core.quarantine import quarantined_primary_keys
+from core.strategy_registry import assert_strategy_not_retired
 
 
 class QuarantinedStrategyError(RuntimeError):
@@ -42,6 +43,7 @@ class CashManager:
 
     def initialize_strategy(self, strategy_id: str, cursor=None):
         """Inject 1M initial capital if strategy account does not exist."""
+        assert_strategy_not_retired(strategy_id)
         c = cursor
         conn = None
         if c is None:

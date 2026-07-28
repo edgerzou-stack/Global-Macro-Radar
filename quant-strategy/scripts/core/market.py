@@ -13,17 +13,31 @@ class Market:
         from core.clock import clock
         return clock.now(self.tz)
 
-    def is_trading_day(self) -> bool:
-        """Check if today is a trading day using market calendar."""
-        if not self.calendar:
-            now = self.get_current_time()
-            return now.weekday() < 5
+    def is_trading_date(self, target_date: datetime.date) -> bool:
+        """Return whether ``target_date`` is an exchange trading session.
 
-        now = self.get_current_time()
-        date_str = now.strftime('%Y-%m-%d')
-        # Check if today is in the valid trading days
+        This deliberately does not read the global clock.  Pipeline run identity
+        dates and the physical instant at which a run executes are separate
+        concepts: a Friday end-of-day run may legitimately be started on
+        Saturday without turning the Friday identity into a weekend.
+        """
+        if isinstance(target_date, datetime.datetime):
+            target_date = target_date.date()
+        elif isinstance(target_date, str):
+            target_date = datetime.date.fromisoformat(target_date)
+        if not isinstance(target_date, datetime.date):
+            raise TypeError("target_date must be a date, datetime, or ISO date string")
+
+        if not self.calendar:
+            return target_date.weekday() < 5
+
+        date_str = target_date.isoformat()
         schedule = self.calendar.valid_days(start_date=date_str, end_date=date_str)
         return len(schedule) > 0
+
+    def is_trading_day(self) -> bool:
+        """Check the market-local current date using the exchange calendar."""
+        return self.is_trading_date(self.get_current_time().date())
 
     def is_trading_time(self) -> bool:
         """Determine if it is currently trading hours. Override in subclasses."""

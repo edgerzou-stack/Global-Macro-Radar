@@ -1,13 +1,18 @@
 import yfinance as yf
 import pandas as pd
-import concurrent.futures
+import multiprocessing
 import json
 import time
 import random
 from data_provider import disk_cache
 import os
 import requests
+import hashlib
+import pickle
+import tempfile
+from collections import Counter
 from dataclasses import dataclass
+from datetime import date, datetime
 from functools import lru_cache
 
 
@@ -17,6 +22,319 @@ class FetchOutcome:
     status: str
     row: dict = None
     reason: str = ""
+    period_end: str = ""
+    filing_date: str = ""
+    source_document: str = ""
+    financial_attempted: bool = None
+    financial_usable: bool = None
+
+
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".cache")
+CACHE_SCHEMA_VERSION = 4
+DEFAULT_US_HK_MAX_WORKERS = 4
+DEFAULT_US_HK_STAGE_TIMEOUT_SECONDS = 900.0
+DEFAULT_US_SECONDS_PER_TICKER_BUDGET = 15.0
+DEFAULT_HK_SECONDS_PER_TICKER_BUDGET = 120.0
+DEFAULT_MIN_FINANCIAL_USABLE_COVERAGE = {
+    "US": 0.80,
+    "HK": 0.45,
+}
+DEFAULT_MAX_FINANCIAL_CONFLICT_RATE = {
+    "US": 0.10,
+    "HK": 0.10,
+}
+
+
+def _cache_file(source, ticker, as_of_date):
+    effective_date = as_of_date.isoformat() if isinstance(as_of_date, date) else str(as_of_date or "live")
+    key = f"v{CACHE_SCHEMA_VERSION}_{source}_{ticker}_{effective_date}"
+    digest = hashlib.md5(key.encode("utf-8")).hexdigest()
+    return os.path.join(CACHE_DIR, f"{digest}.pkl")
+
+
+def _has_data(value):
+    if value is None:
+        return False
+    if isinstance(value, pd.DataFrame):
+        return not value.empty
+    if isinstance(value, (list, tuple, dict, set)):
+        return bool(value)
+    return True
+
+
+def _read_cache(path):
+    try:
+        with open(path, "rb") as handle:
+            value = pickle.load(handle)
+        if not _has_data(value):
+            raise ValueError("cached value is empty")
+        return value
+    except Exception:
+        quarantine_path = f"{path}.corrupt-{int(time.time())}"
+        try:
+            os.replace(path, quarantine_path)
+        except OSError:
+            pass
+        return None
+
+
+def _write_cache_atomic(path, value):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=os.path.dirname(path)
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            pickle.dump(value, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    except Exception:
+        try:
+            os.unlink(temporary_path)
+        except OSError:
+            pass
+        raise
+
+
+def get_cached_or_fetch(
+    source,
+    ticker,
+    fetch_func,
+    *,
+    as_of_date=None,
+    expire_hours=24,
+    max_stale_hours=24 * 7,
+):
+    """Use an effective-date-isolated cache and never return unbounded stale data."""
+    cache_path = _cache_file(source, ticker, as_of_date)
+    stale_data = None
+    cache_age_hours = None
+    if os.path.exists(cache_path):
+        cache_age_hours = (time.time() - os.path.getmtime(cache_path)) / 3600.0
+        cached = _read_cache(cache_path)
+        if cached is not None and cache_age_hours < expire_hours:
+            return cached
+        if cached is not None and cache_age_hours <= max_stale_hours:
+            stale_data = cached
+
+    try:
+        fresh = fetch_func()
+        if not _has_data(fresh):
+            raise ValueError("provider returned empty data")
+        _write_cache_atomic(cache_path, fresh)
+        return fresh
+    except Exception:
+        if stale_data is not None:
+            return stale_data
+        raise
+
+
+@dataclass(frozen=True)
+class QuarterlyFinancialAssessment:
+    usable: bool
+    reason: str = ""
+    latest_qoq_dual_growth: bool = False
+    reporting_frequency: str = ""
+    required_growth_intervals: int = 0
+    latest_period: str = ""
+    previous_period: str = ""
+    latest_revenue_yoy: float = None
+    latest_net_income_yoy: float = None
+
+
+def _infer_reporting_frequency(dated_columns, declared_frequency=""):
+    if len(dated_columns) < 2:
+        return None
+    first_gap = (dated_columns[0][0] - dated_columns[1][0]).days
+    inferred = None
+    if 60 <= first_gap <= 120:
+        inferred = "quarterly"
+    elif 140 <= first_gap <= 230:
+        inferred = "semiannual"
+    if declared_frequency in {"quarterly", "semiannual"}:
+        return declared_frequency if inferred in {None, declared_frequency} else None
+    return inferred
+
+
+def wrap_yahoo_statement(ticker, frame, *, as_of_date):
+    """Attach explicit aggregator provenance without pretending Yahoo is a filing."""
+    from free_financials import FinancialDataUnavailableError
+
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        raise FinancialDataUnavailableError("Yahoo returned an empty statement")
+    wrapped = frame.copy()
+    dated_columns = []
+    for column in wrapped.columns:
+        parsed = pd.to_datetime(column, errors="coerce")
+        if not pd.isna(parsed) and parsed.date() <= as_of_date:
+            dated_columns.append((parsed.date(), column))
+    dated_columns = sorted(dated_columns, key=lambda item: item[0], reverse=True)
+    frequency = _infer_reporting_frequency(dated_columns)
+    if frequency is None:
+        raise FinancialDataUnavailableError(
+            "Cannot infer Yahoo statement reporting frequency"
+        )
+    wrapped = wrapped[[column for _date, column in dated_columns]]
+    wrapped.attrs.update(
+        source="yahoo_finance_unofficial",
+        reporting_frequency=frequency,
+        source_documents=[f"yfinance://Ticker/{ticker}/quarterly_income_stmt"],
+        fetched_at=datetime.now().astimezone().isoformat(),
+        provenance_quality="aggregator_unverified",
+        point_in_time_safe=False,
+    )
+    return wrapped
+
+
+def assess_quarterly_financials(stmt, *, as_of_date: date, market_type: str):
+    """Evaluate cadence-aware continuous growth and filing-derived latest YoY."""
+    if market_type not in {"US", "HK"}:
+        raise ValueError(f"Unsupported market type: {market_type!r}")
+    if stmt is None or not isinstance(stmt, pd.DataFrame) or stmt.empty:
+        return QuarterlyFinancialAssessment(False, "quarterly_financials_empty")
+    required_rows = {"Total Revenue", "Net Income"}
+    if not required_rows.issubset(stmt.index):
+        return QuarterlyFinancialAssessment(
+            False, "quarterly_financials_missing_required_rows"
+        )
+
+    dated_columns = []
+    for column in stmt.columns:
+        parsed = pd.to_datetime(column, errors="coerce")
+        if pd.isna(parsed):
+            continue
+        report_date = parsed.date()
+        if report_date <= as_of_date:
+            dated_columns.append((report_date, column))
+    dated_columns = sorted(set(dated_columns), key=lambda item: item[0], reverse=True)
+    if len(dated_columns) < 2:
+        return QuarterlyFinancialAssessment(
+            False, "quarterly_financials_insufficient_periods"
+        )
+
+    frequency = _infer_reporting_frequency(
+        dated_columns, getattr(stmt, "attrs", {}).get("reporting_frequency", "")
+    )
+    if frequency == "quarterly":
+        frequency = "quarterly"
+        minimum_gap, maximum_gap = 60, 120
+        required_intervals = 3
+        yoy_lag = 4
+    elif frequency == "semiannual":
+        frequency = "semiannual"
+        minimum_gap, maximum_gap = 140, 230
+        required_intervals = 2
+        yoy_lag = 2
+    else:
+        return QuarterlyFinancialAssessment(
+            False, "quarterly_financials_unsupported_frequency"
+        )
+
+    required_periods = required_intervals + 1
+    if len(dated_columns) < required_periods:
+        return QuarterlyFinancialAssessment(
+            False,
+            "quarterly_financials_insufficient_periods",
+            reporting_frequency=frequency,
+            required_growth_intervals=required_intervals,
+        )
+    selected = dated_columns[:required_periods]
+    gaps = [
+        (selected[index][0] - selected[index + 1][0]).days
+        for index in range(required_intervals)
+    ]
+    if any(gap < minimum_gap or gap > maximum_gap for gap in gaps):
+        return QuarterlyFinancialAssessment(
+            False,
+            "quarterly_financials_nonconsecutive_periods",
+            reporting_frequency=frequency,
+            required_growth_intervals=required_intervals,
+        )
+
+    generic_max_age = os.environ.get("US_HK_FINANCIAL_MAX_AGE_DAYS")
+    if generic_max_age is not None:
+        max_age_days = int(generic_max_age)
+    elif frequency == "quarterly":
+        max_age_days = int(os.environ.get("US_HK_QUARTERLY_MAX_AGE_DAYS", "180"))
+    else:
+        max_age_days = int(os.environ.get("US_HK_SEMIANNUAL_MAX_AGE_DAYS", "270"))
+    if max_age_days <= 0:
+        raise ValueError("US/HK financial maximum age must be positive")
+    if (as_of_date - selected[0][0]).days > max_age_days:
+        return QuarterlyFinancialAssessment(
+            False,
+            "quarterly_financials_stale",
+            reporting_frequency=frequency,
+            required_growth_intervals=required_intervals,
+        )
+
+    selected_columns = [column for _date, column in selected]
+    revenue = pd.to_numeric(
+        stmt.loc["Total Revenue", selected_columns], errors="coerce"
+    )
+    net_income = pd.to_numeric(
+        stmt.loc["Net Income", selected_columns], errors="coerce"
+    )
+    if revenue.isna().any() or net_income.isna().any():
+        return QuarterlyFinancialAssessment(
+            False,
+            "quarterly_financials_missing_values",
+            reporting_frequency=frequency,
+            required_growth_intervals=required_intervals,
+        )
+    continuous_growth = all(
+        revenue.iloc[index] > revenue.iloc[index + 1]
+        and net_income.iloc[index] > net_income.iloc[index + 1]
+        for index in range(required_intervals)
+    )
+    latest_revenue_yoy = None
+    latest_net_income_yoy = None
+    if len(dated_columns) > yoy_lag:
+        latest_column = dated_columns[0][1]
+        year_ago_column = dated_columns[yoy_lag][1]
+        latest_revenue = pd.to_numeric(
+            pd.Series([stmt.at["Total Revenue", latest_column]]), errors="coerce"
+        ).iloc[0]
+        prior_revenue = pd.to_numeric(
+            pd.Series([stmt.at["Total Revenue", year_ago_column]]), errors="coerce"
+        ).iloc[0]
+        latest_income = pd.to_numeric(
+            pd.Series([stmt.at["Net Income", latest_column]]), errors="coerce"
+        ).iloc[0]
+        prior_income = pd.to_numeric(
+            pd.Series([stmt.at["Net Income", year_ago_column]]), errors="coerce"
+        ).iloc[0]
+        if pd.notna(latest_revenue) and pd.notna(prior_revenue) and prior_revenue > 0:
+            latest_revenue_yoy = (float(latest_revenue) / float(prior_revenue) - 1.0) * 100.0
+        if pd.notna(latest_income) and pd.notna(prior_income) and prior_income > 0:
+            latest_net_income_yoy = (float(latest_income) / float(prior_income) - 1.0) * 100.0
+    return QuarterlyFinancialAssessment(
+        True,
+        latest_qoq_dual_growth=bool(continuous_growth),
+        reporting_frequency=frequency,
+        required_growth_intervals=required_intervals,
+        latest_period=selected[0][0].isoformat(),
+        previous_period=selected[1][0].isoformat(),
+        latest_revenue_yoy=latest_revenue_yoy,
+        latest_net_income_yoy=latest_net_income_yoy,
+    )
+
+
+def passes_growth_valuation(assessment, pe):
+    try:
+        pe = float(pe)
+        revenue_yoy = float(assessment.latest_revenue_yoy)
+        income_yoy = float(assessment.latest_net_income_yoy)
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        assessment.usable
+        and assessment.latest_qoq_dual_growth
+        and pe > 0
+        and revenue_yoy > pe
+        and income_yoy > pe
+    )
 
 
 LAST_SCREEN_HEALTH = {}
@@ -52,7 +370,14 @@ def _load_outcome_fixture_cached(path, mtime_ns):
         if not isinstance(ticker, str) or not ticker.strip() or not isinstance(raw, dict):
             raise ValueError("US/HK fixture contains an invalid ticker outcome")
         status = raw.get("status")
-        if status not in {"accepted", "rejected", "source_error"}:
+        if status not in {
+            "accepted",
+            "rejected",
+            "strategy_rejected",
+            "financial_unavailable",
+            "financial_conflict",
+            "source_error",
+        }:
             raise ValueError(f"US/HK fixture {ticker} has invalid status")
         reason = raw.get("reason", "")
         if not isinstance(reason, str):
@@ -71,7 +396,32 @@ def _load_outcome_fixture_cached(path, mtime_ns):
             row = dict(row)
         elif row is not None:
             raise ValueError(f"US/HK fixture {ticker} non-accepted row must be null")
-        validated[ticker] = FetchOutcome(ticker, status, row=row, reason=reason)
+        default_attempted = status in {
+            "accepted",
+            "financial_unavailable",
+            "financial_conflict",
+        }
+        default_usable = status == "accepted"
+        financial_attempted = raw.get("financial_attempted", default_attempted)
+        financial_usable = raw.get("financial_usable", default_usable)
+        if not isinstance(financial_attempted, bool) or not isinstance(
+            financial_usable, bool
+        ):
+            raise ValueError(
+                f"US/HK fixture {ticker} financial flags must be boolean"
+            )
+        if financial_usable and not financial_attempted:
+            raise ValueError(
+                f"US/HK fixture {ticker} cannot be usable without an attempt"
+            )
+        validated[ticker] = FetchOutcome(
+            ticker,
+            status,
+            row=row,
+            reason=reason,
+            financial_attempted=financial_attempted,
+            financial_usable=financial_usable,
+        )
     return validated
 
 
@@ -137,6 +487,7 @@ def fetch_yf_data(ticker_symbol, args):
     if fixture is not None:
         return fixture
     max_retries = 3
+    financial_attempted = False
     for attempt in range(max_retries):
         try:
             info = fetch_yf_info_cached(ticker_symbol)
@@ -165,62 +516,155 @@ def fetch_yf_data(ticker_symbol, args):
             debt_to_asset = (total_debt / total_assets * 100) if total_debt and total_assets and total_assets > 0 else None
             market_cap = info.get("marketCap")
             
-            revenue_growth = info.get("revenueGrowth")
-            earnings_growth = info.get("earningsGrowth")
             net_margin = info.get("profitMargins")
             if net_margin is not None:
                 net_margin = net_margin * 100
     
             # ---- Early Reject Logic ----
             valuation_val = (pe * (pb - 1) / pb) if pe and pb and pb != 0 else None
-            
-            # 1. Dividend Pre-check
-            pass_div_precheck = False
-            if market_cap is not None and market_cap / 1e8 > args.market_cap_min_yi:
-                if valuation_val is not None and valuation_val < args.valuation_formula_max:
-                    if div_yield is not None and div_yield > args.dividend_yield_min:
-                        if net_margin is not None and net_margin > args.avg_net_profit_margin_min:
-                            pass_div_precheck = True
-                        
-            # 2. Growth Pre-check
-            pass_gro_precheck = False
-            latest_qoq_dual_growth = False
-            if market_cap is not None and market_cap / 1e8 > args.market_cap_min_yi:
-                if roe is not None and roe > args.growth_roe_min:
-                    if net_margin is not None and net_margin > args.avg_net_profit_margin_min:
-                        if revenue_growth is not None and revenue_growth > 0:
-                                if earnings_growth is not None and earnings_growth > 0:
-                                    # YoY passed. Now check QoQ
-                                    try:
-                                        # Use yfinance for both US and HK stocks for QoQ check to avoid FMP Free Plan limits
-                                        stmt = fetch_yf_quarterly_income_stmt_cached(ticker_symbol)
-                                        if stmt is not None and not stmt.empty and stmt.shape[1] >= 2:
-                                            if 'Total Revenue' in stmt.index and 'Net Income' in stmt.index:
-                                                rev = stmt.loc['Total Revenue'].values
-                                                net = stmt.loc['Net Income'].values
-                                                if len(rev) >= 2 and len(net) >= 2:
-                                                    import math
-                                                    if not math.isnan(rev[0]) and not math.isnan(rev[1]) and not math.isnan(net[0]) and not math.isnan(net[1]):
-                                                        if rev[0] > rev[1] and net[0] > net[1]:
-                                                            latest_qoq_dual_growth = True
-                                            else:
-                                                latest_qoq_dual_growth = False
-                                        else:
-                                            latest_qoq_dual_growth = False
-                                    except Exception as e:
-                                        import logging
-                                        logging.error(f"Failed to calculate QoQ dual growth for {ticker_symbol}: {e}", exc_info=True)
-                                        latest_qoq_dual_growth = False # DO NOT fallback on error! Reject instead.
-                                    
-                                    if latest_qoq_dual_growth:
-                                        pass_gro_precheck = True
-                        
-            if not pass_div_precheck and not pass_gro_precheck:
-                # Skip fetching 3-year financials
+            pass_growth_fundamentals = bool(
+                market_cap is not None
+                and market_cap / 1e8 > args.market_cap_min_yi
+                and pe is not None
+                and pe > 0
+            )
+            if not pass_growth_fundamentals:
                 return FetchOutcome(
                     ticker=ticker_symbol,
-                    status="rejected",
+                    status="strategy_rejected",
                     reason="fundamental_precheck",
+                    financial_attempted=False,
+                    financial_usable=False,
+                )
+
+            financial_attempted = True
+            try:
+                from free_financials import load_free_financial_statement
+                import sec_financials
+                import hkex_financials
+                from core.clock import clock
+
+                market = "HK" if ticker_symbol.upper().endswith(".HK") else "US"
+
+                def primary_loader(ticker, as_of_date):
+                    def fetch_primary():
+                        if market == "US":
+                            return sec_financials.load_sec_financials(ticker, as_of_date)
+                        return hkex_financials.load_hkex_financials(ticker, as_of_date)
+
+                    obs = get_cached_or_fetch(
+                        "SEC" if market == "US" else "HKEX",
+                        ticker,
+                        fetch_primary,
+                        as_of_date=as_of_date,
+                        expire_hours=24,
+                    )
+                    from free_financials import (
+                        FinancialDataUnavailableError,
+                        normalize_cumulative_observations_detailed,
+                        observations_to_dataframe,
+                    )
+                    normalization = normalize_cumulative_observations_detailed(obs)
+                    normalization.raise_for_blocking_issues()
+                    frame = observations_to_dataframe(
+                        normalization.observations,
+                        normalization_diagnostics=normalization,
+                    )
+                    if frame.empty:
+                        raise FinancialDataUnavailableError(
+                            "Official filing observations did not form a usable statement"
+                        )
+                    return frame
+
+                def yahoo_loader(ticker):
+                    from free_financials import FinancialDataUnavailableError
+
+                    try:
+                        stmt_frame = get_cached_or_fetch(
+                            "YAHOO_STMT",
+                            ticker,
+                            lambda: fetch_yf_quarterly_income_stmt_cached(ticker),
+                            as_of_date=clock.today(),
+                            expire_hours=24 * 30,
+                        )
+                    except ValueError as exc:
+                        if str(exc) != "provider returned empty data":
+                            raise
+                        raise FinancialDataUnavailableError(
+                            "Yahoo returned an empty statement"
+                        ) from exc
+                    return wrap_yahoo_statement(
+                        ticker, stmt_frame, as_of_date=clock.today()
+                    )
+
+                stmt = load_free_financial_statement(
+                    ticker_symbol,
+                    clock.today(),
+                    primary_loader=primary_loader,
+                    yahoo_loader=yahoo_loader
+                )
+            except Exception as error:
+                from free_financials import (
+                    FinancialConflictError,
+                    FinancialDataUnavailableError,
+                )
+
+                if isinstance(error, FinancialConflictError):
+                    return FetchOutcome(
+                        ticker=ticker_symbol,
+                        status="financial_conflict",
+                        reason=f"financial_conflict:{error}",
+                        financial_attempted=True,
+                        financial_usable=False,
+                    )
+                if isinstance(error, FinancialDataUnavailableError):
+                    return FetchOutcome(
+                        ticker=ticker_symbol,
+                        status="financial_unavailable",
+                        reason=f"financial_data_unavailable:{error}",
+                        financial_attempted=True,
+                        financial_usable=False,
+                    )
+                return FetchOutcome(
+                    ticker=ticker_symbol,
+                    status="source_error",
+                    reason=(
+                        "quarterly_financials_source_error:"
+                        f"{type(error).__name__}: {error}"
+                    ),
+                    financial_attempted=True,
+                    financial_usable=False,
+                )
+            from core.clock import clock
+
+            financials = assess_quarterly_financials(
+                stmt,
+                as_of_date=clock.today(),
+                market_type="HK" if ticker_symbol.upper().endswith(".HK") else "US",
+            )
+            if not financials.usable:
+                return FetchOutcome(
+                    ticker=ticker_symbol,
+                    status="financial_unavailable",
+                    reason=financials.reason,
+                    financial_attempted=True,
+                    financial_usable=False,
+                )
+            if not financials.latest_qoq_dual_growth:
+                return FetchOutcome(
+                    ticker=ticker_symbol,
+                    status="strategy_rejected",
+                    reason="continuous_report_growth_not_met",
+                    financial_attempted=True,
+                    financial_usable=True,
+                )
+            if not passes_growth_valuation(financials, pe):
+                return FetchOutcome(
+                    ticker=ticker_symbol,
+                    status="strategy_rejected",
+                    reason="latest_statement_yoy_not_above_pe",
+                    financial_attempted=True,
+                    financial_usable=True,
                 )
     
             return FetchOutcome(ticker=ticker_symbol, status="accepted", row={
@@ -233,13 +677,19 @@ def fetch_yf_data(ticker_symbol, args):
                 "总市值(亿元)": market_cap / 1e8 if market_cap else None, # USD/HKD to Yi, rough
                 "净资产收益率": roe,
                 "销售净利率": net_margin,
-                "净利润同比增长率": earnings_growth * 100 if earnings_growth else None,
-                "营业总收入同比增长率": revenue_growth * 100 if revenue_growth else None,
-                "最新单季环比双增": latest_qoq_dual_growth,
+                "净利润同比增长率": financials.latest_net_income_yoy,
+                "营业总收入同比增长率": financials.latest_revenue_yoy,
+                "最新单季环比双增": financials.latest_qoq_dual_growth,
+                "财报披露频率": financials.reporting_frequency,
+                "连续环比增长次数": financials.required_growth_intervals,
+                "最新财务报告期": financials.latest_period,
+                "上一财务报告期": financials.previous_period,
                 "资产负债率": debt_to_asset,
                 "最新价": info.get("currentPrice") or info.get("previousClose"),
-                "所处行业": info.get("sector")
-            })
+                "所处行业": info.get("sector"),
+                "财报来源": getattr(stmt, "attrs", {}).get("source", "unknown"),
+                "财报源文档": ", ".join(getattr(stmt, "attrs", {}).get("source_documents", []))
+            }, financial_attempted=True, financial_usable=True)
         except Exception as e:
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt + random.uniform(0, 1))
@@ -249,40 +699,292 @@ def fetch_yf_data(ticker_symbol, args):
                     ticker=ticker_symbol,
                     status="source_error",
                     reason=f"{type(e).__name__}: {e}",
+                    financial_attempted=financial_attempted,
+                    financial_usable=False,
                 )
 
 from tqdm import tqdm
 
+
+def _run_fetches_in_bounded_processes(tickers, args, *, max_workers, deadline):
+    """Run provider calls in killable workers so a stuck curl cannot outlive the stage."""
+    start_method = os.environ.get("US_HK_WORKER_START_METHOD", "spawn")
+    try:
+        context = multiprocessing.get_context(start_method)
+    except ValueError as error:
+        raise ValueError(
+            f"Unsupported US_HK_WORKER_START_METHOD: {start_method}"
+        ) from error
+
+    pool = context.Pool(processes=max_workers)
+    pending = {
+        ticker: pool.apply_async(fetch_yf_data, (ticker, args))
+        for ticker in tickers
+    }
+    completed = []
+    deadline_at = time.monotonic() + deadline
+    terminate = False
+    try:
+        while pending and time.monotonic() < deadline_at:
+            made_progress = False
+            for ticker, result in list(pending.items()):
+                if not result.ready():
+                    continue
+                made_progress = True
+                del pending[ticker]
+                try:
+                    completed.append(result.get(timeout=0))
+                except Exception as error:
+                    completed.append(
+                        FetchOutcome(
+                            ticker,
+                            "source_error",
+                            reason=f"{type(error).__name__}: {error}",
+                        )
+                    )
+            if not made_progress and pending:
+                time.sleep(min(0.05, max(0.0, deadline_at - time.monotonic())))
+
+        if pending:
+            terminate = True
+            completed.extend(
+                FetchOutcome(ticker, "source_error", reason="stage_timeout")
+                for ticker in pending
+            )
+        return completed
+    finally:
+        if terminate:
+            # Thread workers cannot be stopped while curl/yfinance is blocked.
+            # A process pool gives the stage a real wall-clock upper bound.
+            pool.terminate()
+        else:
+            pool.close()
+        pool.join()
+
+
+def _stage_timeout_seconds(ticker_count, max_workers, market_type):
+    if ticker_count < 0 or max_workers <= 0:
+        raise ValueError("US/HK ticker count and worker count are invalid")
+    if market_type not in {"US", "HK"}:
+        raise ValueError(f"Unsupported US/HK market type: {market_type}")
+    floor_raw = os.environ.get(
+        f"US_HK_{market_type}_STAGE_TIMEOUT_SECONDS",
+        os.environ.get(
+            "US_HK_STAGE_TIMEOUT_SECONDS",
+            str(DEFAULT_US_HK_STAGE_TIMEOUT_SECONDS),
+        ),
+    )
+    default_per_ticker = (
+        DEFAULT_US_SECONDS_PER_TICKER_BUDGET
+        if market_type == "US"
+        else DEFAULT_HK_SECONDS_PER_TICKER_BUDGET
+    )
+    per_ticker_raw = os.environ.get(
+        f"US_HK_{market_type}_SECONDS_PER_TICKER_BUDGET",
+        str(default_per_ticker),
+    )
+    floor = float(floor_raw)
+    per_ticker = float(per_ticker_raw)
+    if floor <= 0 or per_ticker <= 0:
+        raise ValueError("US/HK stage and per-ticker budgets must be positive")
+    batches = (ticker_count + max_workers - 1) // max_workers
+    return max(floor, batches * per_ticker)
+
+
+def _canonical_outcome_status(outcome):
+    if outcome.status != "rejected":
+        return outcome.status
+    if str(outcome.reason).startswith(
+        ("quarterly_financials_", "financial_data_unavailable:")
+    ):
+        return "financial_unavailable"
+    return "strategy_rejected"
+
+
+def _outcome_financial_attempted(outcome, status):
+    if outcome.financial_attempted is not None:
+        return bool(outcome.financial_attempted)
+    if status in {"accepted", "financial_unavailable", "financial_conflict"}:
+        return True
+    return status == "strategy_rejected" and outcome.reason != "fundamental_precheck"
+
+
+def _outcome_financial_usable(outcome, status):
+    if outcome.financial_usable is not None:
+        return bool(outcome.financial_usable)
+    return status in {"accepted", "strategy_rejected"} and (
+        outcome.reason != "fundamental_precheck"
+    )
+
+
+def _build_screen_health(outcomes, market_type, *, attempted):
+    canonical = [(outcome, _canonical_outcome_status(outcome)) for outcome in outcomes]
+    status_counts = Counter(status for _outcome, status in canonical)
+    source_errors = status_counts["source_error"]
+    strategy_decisions = (
+        status_counts["accepted"] + status_counts["strategy_rejected"]
+    )
+    financial_attempted = sum(
+        _outcome_financial_attempted(outcome, status)
+        for outcome, status in canonical
+    )
+    financial_usable = sum(
+        _outcome_financial_usable(outcome, status)
+        for outcome, status in canonical
+    )
+    financial_unavailable = status_counts["financial_unavailable"]
+    financial_conflicts = status_counts["financial_conflict"]
+    transport_coverage = (
+        (attempted - source_errors) / attempted if attempted else 1.0
+    )
+    decision_coverage = strategy_decisions / attempted if attempted else 1.0
+    financial_usable_coverage = (
+        financial_usable / financial_attempted if financial_attempted else 1.0
+    )
+    financial_conflict_rate = (
+        financial_conflicts / financial_attempted if financial_attempted else 0.0
+    )
+
+    def reasons_for(status_name):
+        return dict(
+            sorted(
+                Counter(
+                    outcome.reason or "unspecified"
+                    for outcome, status in canonical
+                    if status == status_name
+                ).items()
+            )
+        )
+
+    reporting_frequencies = dict(
+        sorted(
+            Counter(
+                str(outcome.row.get("财报披露频率"))
+                for outcome, status in canonical
+                if status == "accepted"
+                and isinstance(outcome.row, dict)
+                and outcome.row.get("财报披露频率")
+            ).items()
+        )
+    )
+    return {
+        "market": market_type,
+        "attempted": attempted,
+        # Compatibility fields now use honest decision/transport semantics.
+        "evaluated": strategy_decisions,
+        "accepted": status_counts["accepted"],
+        "rejected": (
+            status_counts["strategy_rejected"]
+            + financial_unavailable
+            + financial_conflicts
+        ),
+        "source_errors": source_errors,
+        "source_error_reasons": reasons_for("source_error"),
+        "coverage": transport_coverage,
+        "transport_coverage": transport_coverage,
+        "decision_coverage": decision_coverage,
+        "strategy_rejected": status_counts["strategy_rejected"],
+        "strategy_rejection_reasons": reasons_for("strategy_rejected"),
+        "financial_attempted": financial_attempted,
+        "financial_usable": financial_usable,
+        "financial_usable_coverage": financial_usable_coverage,
+        "financial_unavailable": financial_unavailable,
+        "financial_unavailable_reasons": reasons_for("financial_unavailable"),
+        "financial_conflicts": financial_conflicts,
+        "financial_conflict_rate": financial_conflict_rate,
+        "financial_conflict_reasons": reasons_for("financial_conflict"),
+        # Retained for report consumers that have not migrated yet.
+        "rejection_reasons": {
+            **reasons_for("strategy_rejected"),
+            **reasons_for("financial_unavailable"),
+            **reasons_for("financial_conflict"),
+        },
+        "accepted_reporting_frequencies": reporting_frequencies,
+    }
+
+
+def _coverage_setting(name, market_type, *, fallback=None):
+    market_name = f"US_HK_{market_type}_{name}"
+    generic_name = f"US_HK_{name}"
+    raw = os.environ.get(market_name, os.environ.get(generic_name, fallback))
+    if raw is None:
+        return None
+    value = float(raw)
+    if value < 0.0 or value > 1.0:
+        raise ValueError(f"{market_name}/{generic_name} must be between 0 and 1")
+    return value
+
+
+def _enforce_screen_health(health):
+    market_type = health["market"]
+    minimum_transport = _coverage_setting(
+        "MIN_TRANSPORT_COVERAGE",
+        market_type,
+        fallback=os.environ.get("US_HK_MIN_DATA_COVERAGE", "0.80"),
+    )
+    if health["attempted"] and health["transport_coverage"] < minimum_transport:
+        raise ConnectionError(
+            f"{market_type} transport coverage "
+            f"{health['transport_coverage']:.1%} is below "
+            f"the required {minimum_transport:.1%}"
+        )
+
+    minimum_financial = _coverage_setting(
+        "MIN_FINANCIAL_USABLE_COVERAGE",
+        market_type,
+        fallback=str(DEFAULT_MIN_FINANCIAL_USABLE_COVERAGE[market_type]),
+    )
+    if (
+        minimum_financial is not None
+        and health["financial_attempted"]
+        and health["financial_usable_coverage"] < minimum_financial
+    ):
+        raise ConnectionError(
+            f"{market_type} financial usable coverage "
+            f"{health['financial_usable_coverage']:.1%} is below "
+            f"the required {minimum_financial:.1%}"
+        )
+
+    maximum_conflicts = _coverage_setting(
+        "MAX_FINANCIAL_CONFLICT_RATE",
+        market_type,
+        fallback=str(DEFAULT_MAX_FINANCIAL_CONFLICT_RATE[market_type]),
+    )
+    if (
+        maximum_conflicts is not None
+        and health["financial_attempted"]
+        and health["financial_conflict_rate"] > maximum_conflicts
+    ):
+        raise ConnectionError(
+            f"{market_type} financial conflict rate "
+            f"{health['financial_conflict_rate']:.1%} exceeds "
+            f"the allowed {maximum_conflicts:.1%}"
+        )
+
+
 def screen_us_hk(tickers, args, market_type="US"):
     frames = []
-    outcomes = []
     tickers = list(dict.fromkeys(str(ticker) for ticker in tickers))
+    outcomes = []
     if tickers:
         max_workers = min(
-            len(tickers), int(os.environ.get("US_HK_MAX_WORKERS", "8"))
+            len(tickers),
+            int(os.environ.get("US_HK_MAX_WORKERS", str(DEFAULT_US_HK_MAX_WORKERS))),
         )
-        deadline = float(os.environ.get("US_HK_STAGE_TIMEOUT_SECONDS", "180"))
+        deadline = _stage_timeout_seconds(len(tickers), max_workers, market_type)
         if max_workers <= 0 or deadline <= 0:
             raise ValueError("US/HK worker count and stage timeout must be positive")
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-        future_to_ticker = {
-            executor.submit(fetch_yf_data, ticker, args): ticker for ticker in tickers
-        }
-        done, pending = concurrent.futures.wait(
-            future_to_ticker, timeout=deadline
+        raw_outcomes = _run_fetches_in_bounded_processes(
+            tickers,
+            args,
+            max_workers=max_workers,
+            deadline=deadline,
         )
-        for future in tqdm(done, total=len(tickers), desc=f"Scanning {market_type} stocks"):
-            try:
-                res = future.result()
-            except Exception as error:
-                outcomes.append(
-                    FetchOutcome(
-                        future_to_ticker[future],
-                        "source_error",
-                        reason=f"{type(error).__name__}: {error}",
-                    )
-                )
-                continue
+        for res in tqdm(
+            raw_outcomes,
+            total=len(tickers),
+            desc=f"Scanning {market_type} stocks",
+        ):
             if isinstance(res, FetchOutcome):
                 outcomes.append(res)
                 if res.status == "accepted":
@@ -294,43 +996,17 @@ def screen_us_hk(tickers, args, market_type="US"):
             else:
                 outcomes.append(
                     FetchOutcome(
-                        future_to_ticker[future],
+                        "unknown",
                         "source_error",
                         reason="invalid outcome",
                     )
                 )
-        for future in pending:
-            ticker = future_to_ticker[future]
-            future.cancel()
-            outcomes.append(FetchOutcome(ticker, "source_error", reason="stage_timeout"))
-        # Do not let a stuck provider call hold the screen function forever.
-        # Running threads cannot be force-killed, so providers still need their
-        # own request timeouts; this bounds the stage decision and fails health.
-        executor.shutdown(wait=False, cancel_futures=True)
 
     attempted = len(tickers)
-    evaluated = sum(
-        outcome.status in {"accepted", "rejected"} for outcome in outcomes
-    )
-    source_errors = sum(outcome.status == "source_error" for outcome in outcomes)
-    coverage = evaluated / attempted if attempted else 1.0
-    health = {
-        "market": market_type,
-        "attempted": attempted,
-        "evaluated": evaluated,
-        "accepted": len(frames),
-        "rejected": sum(outcome.status == "rejected" for outcome in outcomes),
-        "source_errors": source_errors,
-        "coverage": coverage,
-    }
+    health = _build_screen_health(outcomes, market_type, attempted=attempted)
     LAST_SCREEN_HEALTH[market_type] = health
     print(f"{market_type} data health: {health}")
-    minimum_coverage = float(os.environ.get("US_HK_MIN_DATA_COVERAGE", "0.80"))
-    if attempted and coverage < minimum_coverage:
-        raise ConnectionError(
-            f"{market_type} data coverage {coverage:.1%} is below "
-            f"the required {minimum_coverage:.1%}"
-        )
+    _enforce_screen_health(health)
 
     if not frames:
         return pd.DataFrame(), pd.DataFrame()
@@ -347,7 +1023,9 @@ def screen_us_hk(tickers, args, market_type="US"):
         & df["净利润同比增长率"].notna() 
         & df["营业总收入同比增长率"].notna() 
         & (df["最新单季环比双增"] == True)
-        & (df["PE"].isna() | ((df["PE"] < df["净利润同比增长率"]) & (df["PE"] < df["营业总收入同比增长率"])))
+        & df["PE"].notna() & (df["PE"] > 0)
+        & (df["PE"] < df["净利润同比增长率"])
+        & (df["PE"] < df["营业总收入同比增长率"])
     )
     
     df_growth = df[mask_gro].copy()

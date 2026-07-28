@@ -25,8 +25,6 @@ def recover():
     
     strat_map_rev = {
         "A股核心红利精选": "dividend_a_stock",
-        "美股核心红利精选": "dividend_us_stock",
-        "港股核心红利精选": "dividend_hk_stock",
         "A股高增成长精选": "growth_a_stock",
         "美股高增成长精选": "growth_us_stock",
         "港股高增成长精选": "growth_hk_stock",
