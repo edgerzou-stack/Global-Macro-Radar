@@ -18,6 +18,7 @@ from core.run_context import (
     RunContext,
     RunContextError,
     RunMode,
+    read_artifact_envelope,
     write_artifact_envelope,
 )
 from core.writer_lock import writer_fence
@@ -646,6 +647,20 @@ def _run_pipeline_inner(context, checkpoint_path=None, popen_factory=subprocess.
 
 def run_pipeline(context, checkpoint_path=None, popen_factory=subprocess.Popen):
     """Run with scoped environment so one invocation cannot poison the next."""
+    completed_manifest = (
+        context.artifact_root / context.run_id / "run-manifest.json"
+    )
+    if completed_manifest.is_file():
+        envelope = read_artifact_envelope(completed_manifest)
+        context.assert_envelope_identity(envelope)
+        if envelope["payload"].get("status") == "completed":
+            logger.info(
+                "Run %s is already completed; returning its durable manifest "
+                "without repeating database writes or delivery.",
+                context.run_id,
+            )
+            return completed_manifest
+
     scoped_values = context.child_environment()
     scoped_keys = set(scoped_values) | {"QUANT_RUN_BACKUP_COMPLETED"}
     previous_values = {key: os.environ.get(key) for key in scoped_keys}

@@ -305,11 +305,11 @@ class RunContext:
                 dt.time(4, 0),
                 tzinfo=dt.timezone.utc,
             ).isoformat()
-        elif self.mode in {RunMode.SHADOW, RunMode.LIVE_SHADOW}:
-            # Shadow modes use the logical effective date for persisted facts
-            # and artifacts, but retain the timezone-aware creation instant for
-            # market-open/close and cache-age decisions.  A date-only midnight
-            # would shift New York to the previous day.
+        elif self.mode is RunMode.SHADOW:
+            # Deterministic shadow fixtures may pin the logical date.  Live
+            # shadow deliberately does not export MOCK_DATE: it uses the
+            # effective date for persisted facts while all market-calendar and
+            # cache-age decisions retain the real timezone-aware instant.
             values["MOCK_DATE"] = self.effective_date.isoformat()
             values["MOCK_NOW_UTC"] = self.created_at.isoformat()
         if self.mode is not RunMode.PRODUCTION:
