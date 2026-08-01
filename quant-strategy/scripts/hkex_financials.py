@@ -17,6 +17,8 @@ from free_financials import (
     FinancialDataUnavailableError,
     FinancialSourceError,
 )
+from core.run_telemetry import metric_line
+from hkex_document_cache import HKEXDocumentCache
 
 
 HKEX_BASE_URL = "https://www1.hkexnews.hk"
@@ -28,8 +30,20 @@ MAX_EXTRACTED_TEXT_CHARS = 1_000_000
 # Eight recent result announcements cover at least five discrete quarters or
 # three half-year periods, including the YoY comparison required by the screen.
 MAX_RESULT_DOCUMENTS = 8
+HKEX_PARSER_VERSION = "2026-07-29.1"
 _ACTIVE_STOCK_IDS = None
 _ACTIVE_STOCK_IDS_LOCK = threading.Lock()
+
+
+def _emit_hkex_cache_metric(**counters):
+    print(
+        metric_line(
+            "hkex_document_cache",
+            counters,
+            dimensions={"parser_version": HKEX_PARSER_VERSION},
+        ),
+        flush=True,
+    )
 
 RESULT_TITLE = re.compile(
     r"(?:ANNUAL|INTERIM|HALF[- ]YEAR|FIRST QUARTER(?:LY)?|"
@@ -696,6 +710,49 @@ def _download_pdf_text(session, url: str, headers: dict):
     return text, digest
 
 
+def _load_or_parse_document(session, item: dict, ticker: str, headers: dict):
+    """Reuse immutable HKEX parse evidence without caching transport failures."""
+    cache = HKEXDocumentCache(HKEX_PARSER_VERSION)
+    with cache.lock_for(item):
+        cached = cache.read(item)
+        if cached is not None:
+            outcome, value = cached
+            if outcome == "success":
+                _emit_hkex_cache_metric(hit=1, saved_external_calls=1)
+                return value
+            _emit_hkex_cache_metric(negative_hit=1, saved_external_calls=1)
+            raise FinancialSourceError(
+                f"cached HKEX parse failure ({HKEX_PARSER_VERSION}): {value}"
+            )
+
+        _emit_hkex_cache_metric(miss=1)
+        text, digest = _download_pdf_text(session, item["pdf_url"], headers)
+        source_document = f"{item['pdf_url']}#sha256={digest}"
+        try:
+            observation = parse_hkex_financial_text(
+                text,
+                ticker,
+                item["released_at"].date(),
+                source_document,
+                announcement_title=item["title"],
+            )
+        except FinancialSourceError as exc:
+            cache.write(
+                item,
+                digest,
+                error=str(exc),
+            )
+            _emit_hkex_cache_metric(negative_write=1)
+            raise
+        cache.write(
+            item,
+            digest,
+            observation=observation,
+        )
+        _emit_hkex_cache_metric(write=1)
+        return observation
+
+
 def _align_fiscal_years(observations):
     annuals = sorted(
         (observation for observation in observations if observation.period_code == "FY"),
@@ -782,13 +839,8 @@ def load_hkex_financials(
     errors = []
     for item in candidates:
         try:
-            text, digest = _download_pdf_text(session, item["pdf_url"], headers)
-            observation = parse_hkex_financial_text(
-                text,
-                ticker,
-                item["released_at"].date(),
-                f"{item['pdf_url']}#sha256={digest}",
-                announcement_title=item["title"],
+            observation = _load_or_parse_document(
+                session, item, ticker, headers
             )
             observations.append(observation)
         except (FinancialSourceError, requests.RequestException) as exc:

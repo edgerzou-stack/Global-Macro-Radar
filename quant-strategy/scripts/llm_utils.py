@@ -42,6 +42,37 @@ QUANT_LLM_CONFIG = {
     }
 }
 
+
+def configured_quant_llm_identities():
+    defaults = {
+        "gemini": "gemini-2.5-flash",
+        "openai": "gpt-4.1-mini",
+        "deepseek": QUANT_LLM_CONFIG.get("output", {}).get(
+            "model", "deepseek-v4-flash"
+        ),
+    }
+    key_names = {
+        "gemini": "GEMINI_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "deepseek": "DEEPSEEK_API_KEY",
+    }
+    providers = QUANT_LLM_CONFIG.get("llm", {}).get("providers", {})
+    identities = []
+    for provider in QUANT_LLM_CONFIG.get("llm", {}).get("order", []):
+        settings = providers.get(provider, {})
+        if not settings.get("enabled", True):
+            continue
+        if not os.environ.get(key_names.get(provider, "")):
+            continue
+        identities.append(
+            (
+                provider,
+                settings.get("model", defaults[provider]),
+            )
+        )
+    return identities
+
+
 def call_llm(prompt, require_json=False):
     """
     Systematically routes all LLM calls through industry-radar's Triple-Tier Cascade Router.

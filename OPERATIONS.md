@@ -24,6 +24,14 @@ run executes, in order:
 The runner creates an SQLite Online Backup before changing an existing target
 database, holds a database writer fence, and writes an identity-bound manifest.
 A failed run keeps an identity-bound checkpoint for an explicit resume.
+The completed manifest keeps `status=completed` for checkpoint/idempotency
+compatibility and records the health result separately as `outcome=completed`
+or `outcome=completed_degraded`. It also contains the pre-run backup path and
+SHA-256, per-command and per-phase durations, child cache counters, and a
+run-bound settlement/NAV degradation summary. `stage_inputs` records only each
+known input artifact's absolute path, byte size, SHA-256 and coarse JSON shape;
+it does not duplicate report, account, position or news content. A failed
+manifest retains the available backup evidence and partial telemetry.
 
 Settlement is market-specific and idempotent. Missing A/HK/US raw opens leave only
 that intent pending. SELL intents run before BUY intents, failed exits retain their
@@ -36,15 +44,34 @@ The report date is a settlement cutoff, not a fill date. Each intent keeps the
 (including a weekend run) still requests that original session's unadjusted open.
 If authoritative evidence is unavailable, the intent stays `PENDING`; a later
 screen cannot cancel it, and pending buys count toward the ten-position capacity.
+New intents use the signal's timezone-aware timestamp and the exchange calendar's
+official open: a signal observed before that session's open is eligible for that
+same session; a signal at or after the open starts with the next session.
+Legacy date-only planning intentionally retains its next-session behavior.
+Settlement applies the same official-open boundary. If an eligible session is
+the market-local current day but the official open is still in the future, it
+is counted as `not_yet_due`; no open-price request is made and the market is not
+reported as degraded. A due session becomes deferred only after an authoritative
+raw open cannot be obtained.
+
+Retained positions use a fixed-tranche averaging rule only when the current
+screen has verified holding-period return evidence: one tranche may add at
+-10%, two tranches may add at -15.5%, and three tranches is the hard cap.
+`ADD_TRANCHE` settlement uses the same immutable eligible-session raw-open and
+v8 evidence gates as new buys. Cash debit, harmonic average cost, tranche count,
+position snapshot and intent state commit atomically.
 
 ## Test and coverage gates
 
 The default `pytest` discovery includes the quant, root, and Industry Radar
 offline suites. Offline tests fail closed on socket access; a real external
 probe must be explicitly marked `live` and is excluded from the default suite.
-CI runs on Python 3.11 with branch coverage enabled and enforces a combined
-50% floor across `quant-strategy/scripts` and `industry-radar`. Production
-integrity and ledger `check_*.py` scripts are included in that denominator.
+The executable release check runs on Python 3.11 with branch coverage enabled.
+It preserves the measured whole-runtime baseline at 23% and independently
+requires at least 50% for the named state-mutating, report, and delivery
+modules. Production integrity and ledger `check_*.py` scripts remain in the
+global denominator; low-coverage legacy modules are visible rather than
+silently omitted.
 
 ```bash
 python -m pytest -q -p no:cacheprovider \
@@ -52,9 +79,30 @@ python -m pytest -q -p no:cacheprovider \
   --disable-socket --allow-unix-socket
 ```
 
+Run the complete release gate with:
+
+```bash
+scripts/run_release_checks.sh
+```
+
 The combined floor is a regression gate, not a reliability target. Add focused
 branch tests and per-module gates for state-mutating or execution-critical code
 instead of excluding low-coverage production modules.
+
+Runner child processes may emit a single-line `PIPELINE_METRIC` JSON record.
+The coordinator validates and aggregates these records; malformed lines are
+ignored and cannot alter run control. Current counters cover HKEX document
+parsing, A-share close-pair validation, Deep Dive evidence, and optional report
+review caches. Metrics are observability only and never relax a data gate.
+
+Report generation opens SQLite through `mode=ro` plus `PRAGMA query_only=ON`;
+it does not use the state-initializing/writer connection helper. Portfolio,
+trade history, daily results, accounts, NAV/settlement status and execution
+counts, pending/filled intents, v8 execution evidence and linked legacy trades
+are loaded into one immutable snapshot inside one read transaction. Evidence
+SHA-256, exact eligible session, raw-open semantics and SELL_ALL/history links
+are validated before the snapshot is exposed. The renderer receives a detached
+mutable daily-results copy plus pure presentation views; it never queries SQLite.
 
 ## Run modes
 
@@ -222,6 +270,28 @@ The sender loads the repository `.env` by default. Use `--env-file` or
 also enforces `--confirm-live-delivery`; invoking it directly cannot bypass the
 second acknowledgement used by the unified runner.
 
+Every new prepared manifest carries its logical `effective_date`, and live
+subjects end in ` | YYYY-MM-DD`. Across run IDs, a terminal or ambiguous live
+journal for the same recipient and effective date blocks another SMTP
+submission. An exceptional, separately authorized resend must use the low-level
+sender's `--allow-duplicate-effective-date-delivery` flag; same-run idempotency
+and ambiguous-journal controls still apply.
+
+For a complete production rerun after the recipient explicitly confirms that an
+`accepted_by_smtp` message was not received, use the audited top-level entrypoint:
+
+```bash
+scripts/run_production_full_flow.sh --authorized-resend
+```
+
+This option creates a new run ID and records
+`duplicate_effective_date_override=true` in both the run manifest and delivery
+journal. It bypasses only the cross-run recipient/effective-date dedupe check.
+All production database, report validation, SMTP confirmation and same-run
+idempotency gates remain active. A generic rerun request is not sufficient
+authorization. After SMTP acceptance, wait for actual recipient confirmation
+and reconcile the new journal to `confirmed_received` before release.
+
 To send an exact HTML artifact that has already been reviewed, calculate its
 SHA-256 and give the delivery a new run ID. This path performs no database or
 strategy work:
@@ -238,8 +308,15 @@ python3 quant-strategy/scripts/send_unified_email.py \
   --expected-html-sha256 64_HEX_DIGEST
 ```
 
-Live delivery converts base64 data images to related CID parts for broader mail
-client compatibility and emits RFC `Date` plus a stable `Message-ID`. A
+Live delivery uses MIME schema v3 and the `icloud_safe_v1` profile. It converts
+base64 chart images to bounded related CID PNGs, resizes them to at most 1600
+pixels wide, limits each delivered image to 128 KiB, and refuses to submit a
+serialized message larger than 512 KiB. The default live subject is ASCII,
+while the useful plain-text alternative retains the report date, news titles
+and source links. These gates fail before SMTP rather than silently falling
+back to an incomplete report.
+
+The sender emits RFC `Date` plus a stable `Message-ID`. A
 connection, TLS or login failure is recorded as `failed_pre_send`; an explicit
 recipient refusal is `rejected_by_smtp`. A failure after the journal enters
 `sending` remains ambiguous and must never be automatically retried. When
@@ -249,6 +326,11 @@ recipient, HTML hash and inline image count. This proves outbound-server
 acceptance only, not inbox delivery. After the recipient confirms receipt, use
 the reconciliation command to record `confirmed_received`. Legacy `delivered`
 journals remain terminal solely to prevent duplicates.
+
+A minimal plain-text canary is a route diagnostic, not a report delivery. Its
+receipt must never be used to reconcile a production journal or authorize a
+release. Any canary or fixed-report SMTP submission requires its own explicit
+authorization.
 
 Before a production run, verify the database backup destination, delivery
 recipients, API credentials, market date and that no release or other writer

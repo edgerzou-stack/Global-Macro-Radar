@@ -34,7 +34,12 @@ rss_feeds:
   - "https://www.technologyreview.com/feed/" # MIT科技评论
   
   # 综合未来前沿科技 (Singularity, 脑机等)
-  - "https://singularityhub.com/feed/" # Singularity Hub (指数级增长科技，改变未来)
+  - "https://openai.com/news/rss.xml" # OpenAI News
+  - "https://huggingface.co/blog/feed.xml" # Hugging Face Blog
+  - "https://blog.google/technology/ai/rss/" # Google AI 官方
+  - "https://blogs.nvidia.com/feed/" # NVIDIA 官方技术博客
+  - "https://www.microsoft.com/en-us/research/feed/" # Microsoft Research
+  - "https://aws.amazon.com/blogs/machine-learning/feed/" # AWS Machine Learning
   
   # 全球顶级科技媒体 & 产业动态
   - "https://techcrunch.com/category/artificial-intelligence/feed/" # TechCrunch AI
@@ -73,9 +78,11 @@ rss_critical_source_groups:
   - name: "frontier-technology"
     sources:
       - "https://www.technologyreview.com/feed/"
-      - "https://techcrunch.com/category/artificial-intelligence/feed/"
+      - "https://blog.google/technology/ai/rss/"
+      - "https://blogs.nvidia.com/feed/"
+      - "https://www.microsoft.com/en-us/research/feed/"
       - "https://feeds.arstechnica.com/arstechnica/technology-lab"
-    min_available_sources: 2
+    min_available_sources: 3
     min_current_sources: 2
     content_max_age_hours: 168
 
@@ -103,10 +110,13 @@ output:
   rss_min_fresh_sources: 5
   rss_min_total_fresh_entries: 10
   rss_min_configured_sources: 10
+  rss_max_source_fresh_entry_share: 0.5
+  report_source_concentration_warning_ratio: 0.6
 
 delivery:
   enabled: true
   sender_email: "your_sender@example.com" # 填写你的发送邮箱地址
   recipient_email: "your_recipient@example.com"      # 接收报告的邮箱
+  subject: "Global Macro Radar Daily Report"
   smtp_server: "smtp.mail.me.com"
   smtp_port: 587

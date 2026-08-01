@@ -27,6 +27,64 @@ def _read_only_connection(database_path):
     return connection
 
 
+def _purchase_lifecycle_matches(
+    cursor,
+    *,
+    intent_id,
+    strategy_id,
+    symbol,
+    entry_session,
+    end_session,
+    ledger_entry_price,
+    ledger_shares,
+):
+    """Reconcile one position lifecycle to its filled fixed-cash purchases.
+
+    ``portfolio.entry_price`` is the harmonic average after ADD_TRANCHE fills,
+    not necessarily the original BUY_NEW execution price.  Replaying every
+    purchase in the lifecycle preserves the strict evidence check without
+    falsely rejecting a correctly averaged multi-tranche position.
+    """
+    purchases = cursor.execute(
+        """
+        SELECT i.intent_id,i.action,i.execution_price,i.tranche_quantity
+        FROM trade_intents i
+        WHERE i.state='FILLED'
+          AND i.strategy_id=? AND i.symbol=?
+          AND i.action IN ('BUY_NEW','ADD_TRANCHE')
+          AND i.eligible_session>=? AND i.eligible_session<=?
+          AND NOT EXISTS (
+              SELECT 1 FROM trade_intent_supersessions s
+              WHERE s.intent_id=i.intent_id
+          )
+        ORDER BY i.executed_at,i.created_at,i.intent_id
+        """,
+        (strategy_id, symbol, entry_session, end_session),
+    ).fetchall()
+    if sum(row[1] == "BUY_NEW" for row in purchases) != 1:
+        return False
+    if not any(row[0] == intent_id and row[1] == "BUY_NEW" for row in purchases):
+        return False
+
+    total_tranches = 0
+    reciprocal_cost = 0.0
+    for _, _, execution_price, tranche_quantity in purchases:
+        price = float(execution_price)
+        quantity = int(tranche_quantity)
+        if not math.isfinite(price) or price <= 0 or quantity <= 0:
+            return False
+        total_tranches += quantity
+        reciprocal_cost += quantity / price
+    if total_tranches <= 0 or reciprocal_cost <= 0:
+        return False
+
+    expected_entry_price = total_tranches / reciprocal_cost
+    return (
+        int(ledger_shares or 0) == total_tranches
+        and abs(float(ledger_entry_price) - expected_entry_price) < 0.01
+    )
+
+
 def check_ledger(database_path, effective_date):
     """Run post-market invariants against one explicit read-only ledger."""
     logger.info("Starting Post-Market Ledger Sanity Check...")
@@ -300,13 +358,13 @@ def check_ledger(database_path, effective_date):
             ).fetchall()
             for intent_id, strat_id, symbol, session, exec_price in filled_buys:
                 in_portfolio = cursor.execute(
-                    "SELECT entry_price,shares FROM portfolio "
+                    "SELECT entry_price,shares,NULL FROM portfolio "
                     "WHERE strategy=? AND name_or_code=? AND entry_date=?"
                     + portfolio_filter,
                     [strat_id, symbol, session] + list(portfolio_parameters),
                 ).fetchone()
                 in_history = cursor.execute(
-                    "SELECT entry_price,shares FROM trade_history "
+                    "SELECT entry_price,shares,exit_date FROM trade_history "
                     "WHERE strategy=? AND name_or_code=? AND entry_date=?"
                     + trade_filter,
                     [strat_id, symbol, session] + list(trade_parameters),
@@ -320,14 +378,22 @@ def check_ledger(database_path, effective_date):
                     in_history
                 )
                 if not any(
-                    abs(float(row[0]) - float(exec_price)) < 0.01
-                    and int(row[1] or 1) >= 1
+                    _purchase_lifecycle_matches(
+                        cursor,
+                        intent_id=intent_id,
+                        strategy_id=strat_id,
+                        symbol=symbol,
+                        entry_session=session,
+                        end_session=min(row[2] or today_str, today_str),
+                        ledger_entry_price=row[0],
+                        ledger_shares=row[1],
+                    )
                     for row in candidates
                 ):
                     raise RuntimeError(
                         f"FATAL: FILLED BUY_NEW intent {intent_id} "
-                        f"({strat_id}/{symbol} on {session}) has no ledger row "
-                        "with the exact execution price"
+                        f"({strat_id}/{symbol} on {session}) does not reconcile "
+                        "to a ledger purchase lifecycle"
                     )
 
         # 4. Double-Entry Validation (Cash Delta vs Traded Amount)

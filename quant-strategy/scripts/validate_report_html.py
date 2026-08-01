@@ -45,6 +45,25 @@ def _strategy_display(strategy_id):
     return f"{title} ({strategy_id})"
 
 
+def _retired_performance_chart_errors(soup):
+    report_text = soup.get_text(" ", strip=True)
+    errors = []
+    if soup.find("img", alt="pnl_chart_all.png") is not None:
+        errors.append(
+            "retired pnl_chart_all.png is present; cumulative performance must "
+            "come from certified NAV"
+        )
+    if (
+        "账户净值与回测曲线" in report_text
+        or "各策略等权累计净收益曲线综合对比" in report_text
+        or "Master Chart" in report_text
+    ):
+        errors.append(
+            "retired trade-return aggregation chart text is present"
+        )
+    return errors
+
+
 class ReportValidationError(RuntimeError):
     pass
 
@@ -89,6 +108,31 @@ def _table_cells(table):
         [cell.get_text(" ", strip=True) for cell in row.find_all("td")]
         for row in table.select("tbody tr")
     ]
+
+
+def _pending_intent_identity(cells):
+    """Project a rendered row onto immutable ledger identity fields.
+
+    Stock names and explanatory notes are presentation fields. They may be
+    localized without weakening validation of the underlying intent.
+    """
+    if len(cells) < 9:
+        raise ValueError("pending intent row must contain at least 9 cells")
+    return (
+        cells[0],
+        cells[1],
+        cells[2],
+        cells[3],
+        cells[4],
+        cells[6],
+        cells[7],
+        cells[8],
+    )
+
+
+def _pending_intent_rows_match(displayed, database):
+    """Compare ledger identities without coupling validity to display order."""
+    return sorted(displayed) == sorted(database)
 
 
 def _section_text(heading):
@@ -162,7 +206,7 @@ def validate_report(html_path, database_path):
     database_path = Path(database_path).expanduser().resolve()
     soup = BeautifulSoup(html_path.read_text(encoding="utf-8"), "html.parser")
     report_text = soup.get_text(" ", strip=True)
-    errors = []
+    errors = _retired_performance_chart_errors(soup)
 
     for claim in BANNED_LEDGER_CLAIMS:
         if claim in report_text:
@@ -489,7 +533,8 @@ def validate_report(html_path, database_path):
             if any(not cells[5] for cells in displayed_intents):
                 errors.append(f"{strategy_id} pending intent has no stock name")
             displayed_intent_keys = [
-                cells[:5] + cells[6:] for cells in displayed_intents
+                _pending_intent_identity(cells)
+                for cells in displayed_intents
             ]
 
             has_v7 = connection.execute(
@@ -522,7 +567,6 @@ def validate_report(html_path, database_path):
                         str(signal_date),
                         str(eligible),
                         "待交割",
-                        (f"{reason or ''}；来源运行={source_run_id}").strip("；"),
                     )
                     for (
                         intent_id,
@@ -544,7 +588,10 @@ def validate_report(html_path, database_path):
                         (strategy_id,),
                     )
                 ]
-                if displayed_intent_keys != database_intents:
+                if not _pending_intent_rows_match(
+                    displayed_intent_keys,
+                    database_intents,
+                ):
                     errors.append(
                         f"{strategy_id} pending intents mismatch: "
                         f"displayed={displayed_intent_keys}, database={database_intents}"

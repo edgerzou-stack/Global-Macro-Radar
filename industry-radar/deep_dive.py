@@ -1,4 +1,5 @@
 import requests
+import logging
 from bs4 import BeautifulSoup
 import os
 import json
@@ -6,6 +7,10 @@ import yaml
 from urllib.parse import urldefrag, urljoin
 
 from llm_router import _call_llm_with_fallback
+from provider_errors import log_provider_error
+
+
+logger = logging.getLogger(__name__)
 
 def fetch_full_text(url):
     try:
@@ -28,6 +33,14 @@ def fetch_full_text(url):
             
         return text[:20000], links
     except Exception as e:
+        log_provider_error(
+            logger,
+            e,
+            provider=url,
+            operation="article_fetch",
+            retryable=False,
+            degraded_allowed=True,
+        )
         print(f"Standard fetch failed for {url}: {e}. Falling back to Jina Reader...", flush=True)
         try:
             jina_url = f"https://r.jina.ai/{url}"
@@ -36,6 +49,14 @@ def fetch_full_text(url):
             resp.raise_for_status()
             return resp.text[:20000], []
         except Exception as jina_e:
+            log_provider_error(
+                logger,
+                jina_e,
+                provider="jina_reader",
+                operation="article_fetch",
+                retryable=False,
+                degraded_allowed=True,
+            )
             print(f"Jina fetch failed for {url}: {jina_e}", flush=True)
             return "", []
 

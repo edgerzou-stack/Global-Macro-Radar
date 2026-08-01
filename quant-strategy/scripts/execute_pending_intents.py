@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from core.data_gateway import DataGateway
+from core.clock import clock
 from core.market import AShareMarket, HKMarket, USMarket
 from core.trade_intents import TradeIntentLedger
 
@@ -264,8 +265,10 @@ def execute(
                 return None
 
         results = {}
+        observed_at = clock.now(dt.timezone.utc)
         for market in selected:
             calendar = MARKETS[market]()
+            execution_cutoff = session
             try:
                 cutoff_is_trading_session = bool(calendar.is_trading_date(session))
                 cutoff_calendar_status = (
@@ -274,6 +277,18 @@ def execute(
                     else "closed_session"
                 )
                 cutoff_calendar_reason = None
+                market_local_date = observed_at.astimezone(
+                    calendar.tz
+                ).date()
+                if dt.date.fromisoformat(session) >= market_local_date:
+                    effective_session = calendar.get_effective_trading_date()
+                    if effective_session < execution_cutoff:
+                        execution_cutoff = effective_session
+                        cutoff_calendar_status = (
+                            "trading_session_pre_open"
+                            if cutoff_is_trading_session
+                            else "closed_session_waiting"
+                        )
             except Exception as error:
                 # The report date is only a settlement cutoff. A failure to
                 # classify that date must not suppress historical intents whose
@@ -281,18 +296,28 @@ def execute(
                 # gateway.
                 cutoff_calendar_status = "calendar_unavailable"
                 cutoff_calendar_reason = str(error)
-            before_due = _active_due_intents(connection, market, session)
+            before_due = _active_due_intents(
+                connection,
+                market,
+                execution_cutoff,
+            )
             market_result = ledger.execute_market_session(
                 market=market,
-                session_date=session,
+                session_date=execution_cutoff,
                 price_loader=load_price,
             )
             strategy_breakdown = _strategy_breakdown(
-                connection, market, session, before_due, market_result
+                connection,
+                market,
+                execution_cutoff,
+                before_due,
+                market_result,
             )
             total_pending = _pending_intent_count(connection, market)
             not_yet_due = _not_yet_due_intent_count(
-                connection, market, session
+                connection,
+                market,
+                execution_cutoff,
             )
             if market_result["deferred"]:
                 status = "degraded_pending_prices"
@@ -309,6 +334,7 @@ def execute(
                 "pending": total_pending,
                 "not_yet_due": not_yet_due,
                 "cutoff_calendar_status": cutoff_calendar_status,
+                "execution_cutoff": execution_cutoff,
             }
             if cutoff_calendar_reason is not None:
                 results[market]["cutoff_calendar_reason"] = (
@@ -319,7 +345,7 @@ def execute(
             "environment": environment,
             "run_id": _run_id(session),
             "session_date": session,
-            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "generated_at": observed_at.isoformat(),
             "markets": results,
         }
         _persist_run_status(connection, result)

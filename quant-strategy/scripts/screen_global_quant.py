@@ -6,7 +6,7 @@ import sqlite3
 import hashlib
 import math
 import tempfile
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 
@@ -36,6 +36,7 @@ from core.portfolio_limits import MAX_HOLDINGS_PER_STRATEGY, ordered_unique_symb
 from core.strategy import ADividendStrategy, AGrowthStrategy, USHKQuantStrategy, HotSpotStrategy
 from core.quarantine import quarantine_filter
 from core.trade_intents import TradeIntentLedger
+from core.clock import clock
 
 
 GLOBAL_SCREEN_FIXTURE_ENV = "GLOBAL_SCREEN_FIXTURE"
@@ -43,7 +44,51 @@ GLOBAL_SCREEN_FIXTURE_VERSION = 1
 LLM_SECONDARY_GROWTH_STRATEGIES = ()
 
 
-def _plan_trade_intents(strategy_targets, snapshot_date, old_portfolio):
+def select_add_tranche_symbols(results, portfolio, snapshot_date):
+    """Select retained positions that crossed a fixed-tranche drawdown gate.
+
+    A missing or malformed return is never treated as a signal.  The first
+    add is allowed at -10%, the second at -15.5%, and three tranches is the
+    hard cap.  Same-day entries are excluded because they have no completed
+    holding-period price evidence yet.
+    """
+    selected = {}
+    for strategy, rows in results.items():
+        positions = portfolio.get(strategy) or {}
+        additions = []
+        for row in rows:
+            symbol = str(get_key(row, strategy) or "")
+            position = positions.get(symbol)
+            if not symbol or not position:
+                continue
+            if str(position.get("entry_date") or "")[:10] >= str(snapshot_date):
+                continue
+            shares = max(1, int(position.get("shares") or 1))
+            threshold = {1: -10.0, 2: -15.5}.get(shares)
+            if threshold is None:
+                continue
+            raw_return = row.get("累计涨跌幅")
+            try:
+                observed_return = float(
+                    str(raw_return).strip().rstrip("%")
+                )
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(observed_return):
+                continue
+            if observed_return <= threshold:
+                additions.append(symbol)
+        if additions:
+            selected[strategy] = ordered_unique_symbols(additions)
+    return selected
+
+
+def _plan_trade_intents(
+    strategy_targets,
+    snapshot_date,
+    old_portfolio,
+    add_tranche_by_strategy=None,
+):
     """Persist target changes without claiming that a market fill occurred."""
     run_id = (
         os.environ.get("PIPELINE_RUN_ID")
@@ -60,6 +105,7 @@ def _plan_trade_intents(strategy_targets, snapshot_date, old_portfolio):
                 (strategy,),
             )
         ledger = TradeIntentLedger(connection)
+        signal_timestamp = clock.now(timezone.utc)
         diff = {strategy: {"added": [], "removed": []} for strategy in STRATEGIES}
         summary = {strategy: [] for strategy in STRATEGIES}
         for strategy in STRATEGIES:
@@ -73,6 +119,10 @@ def _plan_trade_intents(strategy_targets, snapshot_date, old_portfolio):
                 ranked_targets=execution_targets,
                 reason="quantitative target change; awaiting eligible-session raw open",
                 manage_transaction=False,
+                signal_timestamp=signal_timestamp,
+                add_tranche_symbols=(
+                    (add_tranche_by_strategy or {}).get(strategy, [])
+                ),
             )
             for intent in intents:
                 item = {
@@ -82,6 +132,8 @@ def _plan_trade_intents(strategy_targets, snapshot_date, old_portfolio):
                     "state": intent["state"],
                     "eligible_session": intent["eligible_session"],
                     "reason": intent.get("reason") or "",
+                    "source_run_id": intent["source_run_id"],
+                    "signal_date": intent["signal_date"],
                 }
                 summary[strategy].append(item)
                 if intent["action"] == "SELL_ALL":
@@ -332,17 +384,28 @@ def _run_offline_fixture(args, fixture):
     snapshot_date = fixture["snapshot_date"]
     results = fixture["results"]
     old_portfolio, _ = db_utils.load_portfolio_and_trades()
+    portfolio = old_portfolio
+    inject_portfolio_metrics(
+        results,
+        portfolio,
+        snapshot_date,
+        gateway_instance=_OfflineFixtureGateway(),
+    )
 
     strategy_targets = {
         strategy: [get_key(row, strategy) for row in results[strategy]]
         for strategy in STRATEGIES
     }
-    diff, intent_summary = _plan_trade_intents(
-        strategy_targets, snapshot_date, old_portfolio
+    add_tranche_by_strategy = select_add_tranche_symbols(
+        results,
+        portfolio,
+        snapshot_date,
     )
-    portfolio = old_portfolio
-    inject_portfolio_metrics(
-        results, portfolio, snapshot_date, gateway_instance=_OfflineFixtureGateway()
+    diff, intent_summary = _plan_trade_intents(
+        strategy_targets,
+        snapshot_date,
+        old_portfolio,
+        add_tranche_by_strategy,
     )
 
     payload = {
@@ -742,15 +805,24 @@ Please return the selected top candidates (maximum 10) as a JSON array of their 
 
     apply_final_result_limits(results, appendix, args)
 
-    # Phase 2: Persist market-aware intents. Screening never claims a fill.
+    # Phase 2: attach auditable holding-period metrics before planning.  A
+    # missing adjusted-entry observation fails closed and cannot create an add.
+    portfolio = old_portfolio
+    inject_portfolio_metrics(results, portfolio, snapshot_date)
+    add_tranche_by_strategy = select_add_tranche_symbols(
+        results,
+        portfolio,
+        snapshot_date,
+    )
+
+    # Persist market-aware intents. Screening never claims a fill.
     strategy_targets = {strat: [get_key(r, strat) for r in results[strat]] for strat in STRATEGIES}
     diff, intent_summary = _plan_trade_intents(
-        strategy_targets, snapshot_date, old_portfolio
+        strategy_targets,
+        snapshot_date,
+        old_portfolio,
+        add_tranche_by_strategy,
     )
-    portfolio = old_portfolio
-
-    # Inject entry_price and ROI back into results for display
-    inject_portfolio_metrics(results, portfolio, snapshot_date)
 
     payload = {
         "mode": "global_12_grid",

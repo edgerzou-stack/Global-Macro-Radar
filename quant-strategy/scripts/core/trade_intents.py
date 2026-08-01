@@ -12,17 +12,34 @@ import sqlite3
 import uuid
 from collections.abc import Mapping
 from contextlib import nullcontext
+from zoneinfo import ZoneInfo
 
 from core.market import AShareMarket, HKMarket, USMarket
 from core.portfolio_limits import MAX_HOLDINGS_PER_STRATEGY
+from core.position_math import calculate_harmonic_average_cost
 from core.strategy_registry import assert_strategy_not_retired
 
 
 TRANCHE_AMOUNT = 33_000.0
 MARKET_SETTINGS = {
-    "A": {"currency": "CNY", "fee_rate": 0.001, "calendar": AShareMarket},
-    "HK": {"currency": "HKD", "fee_rate": 0.002, "calendar": HKMarket},
-    "US": {"currency": "USD", "fee_rate": 0.0, "calendar": USMarket},
+    "A": {
+        "currency": "CNY",
+        "fee_rate": 0.001,
+        "calendar": AShareMarket,
+        "timezone": "Asia/Shanghai",
+    },
+    "HK": {
+        "currency": "HKD",
+        "fee_rate": 0.002,
+        "calendar": HKMarket,
+        "timezone": "Asia/Hong_Kong",
+    },
+    "US": {
+        "currency": "USD",
+        "fee_rate": 0.0,
+        "calendar": USMarket,
+        "timezone": "America/New_York",
+    },
 }
 
 
@@ -69,6 +86,18 @@ def _execution_quote(value, *, symbol, market, session):
         if not isinstance(payload, Mapping):
             raise TradeIntentError(
                 f"Execution quote lacks an evidence payload for {symbol}/{session}"
+            )
+        payload_price = _positive_price(payload.get("open"))
+        if (
+            str(payload.get("symbol") or "") != str(symbol)
+            or str(payload.get("session") or "") != str(session)
+            or str(payload.get("price_field") or "") != price_field
+            or str(payload.get("adjustment") or "") != adjustment
+            or payload_price is None
+            or abs(payload_price - price) > 1e-9 * max(1.0, abs(price))
+        ):
+            raise TradeIntentError(
+                f"Execution quote payload does not bind to {symbol}/{session} price"
             )
         payload_json = json.dumps(
             dict(payload),
@@ -165,11 +194,68 @@ class TradeIntentLedger:
             )
         return {row["name_or_code"]: dict(row) for row in self.conn.execute(sql, (strategy_id,))}
 
+    def _quarantined_position_symbols(self, strategy_id):
+        if not self._table_exists("quarantine_key_index"):
+            return set()
+        return {
+            row[0]
+            for row in self.conn.execute(
+                "SELECT p.name_or_code FROM portfolio p "
+                "WHERE p.strategy=? AND EXISTS ("
+                "SELECT 1 FROM quarantine_key_index q "
+                "WHERE q.source_table='portfolio' AND q.key_arity=1 "
+                "AND q.key_1=CAST(p.id AS TEXT) AND q.key_2='')",
+                (strategy_id,),
+            )
+        }
+
     @staticmethod
-    def _eligible_session(signal_date, market):
+    def _eligible_session(signal_date, market, signal_timestamp=None):
+        """Resolve the first session whose official open follows the signal.
+
+        Date-only callers retain the historical next-session contract.  New
+        callers supply an aware timestamp so a pre-open signal can execute at
+        that same session's raw open instead of being delayed by one day.
+        """
         signal = dt.date.fromisoformat(str(signal_date))
         calendar = MARKET_SETTINGS[market]["calendar"]()
-        return calendar.get_next_trading_date(signal + dt.timedelta(days=1)).isoformat()
+        if signal_timestamp is None:
+            return calendar.get_next_trading_date(
+                signal + dt.timedelta(days=1)
+            ).isoformat()
+
+        if isinstance(signal_timestamp, str):
+            try:
+                signal_timestamp = dt.datetime.fromisoformat(
+                    signal_timestamp.replace("Z", "+00:00")
+                )
+            except ValueError as error:
+                raise TradeIntentError(
+                    "signal_timestamp must be an ISO-8601 datetime"
+                ) from error
+        if not isinstance(signal_timestamp, dt.datetime):
+            raise TradeIntentError("signal_timestamp must be a datetime")
+        if signal_timestamp.tzinfo is None:
+            raise TradeIntentError("signal_timestamp must include a timezone")
+
+        candidate = calendar.get_next_trading_date(signal)
+        schedule = calendar.calendar.schedule(
+            start_date=candidate,
+            end_date=candidate,
+        )
+        if schedule.empty:
+            raise TradeIntentError(
+                f"Unable to resolve official {market} market open for {candidate}"
+            )
+        official_open = schedule.iloc[0]["market_open"].to_pydatetime()
+        observed = signal_timestamp.astimezone(
+            ZoneInfo(MARKET_SETTINGS[market]["timezone"])
+        )
+        if observed < official_open.astimezone(observed.tzinfo):
+            return candidate.isoformat()
+        return calendar.get_next_trading_date(
+            candidate + dt.timedelta(days=1)
+        ).isoformat()
 
     def _account_cash(self, strategy_id):
         row = self.conn.execute(
@@ -192,6 +278,8 @@ class TradeIntentLedger:
         ranked_targets,
         reason="quantitative target change",
         manage_transaction=True,
+        signal_timestamp=None,
+        add_tranche_symbols=(),
     ):
         if not run_id:
             raise ValueError("run_id is required")
@@ -204,10 +292,32 @@ class TradeIntentLedger:
             )
         market = market_for_strategy(strategy_id)
         currency = MARKET_SETTINGS[market]["currency"]
-        eligible = self._eligible_session(signal_date, market)
+        eligible = self._eligible_session(
+            signal_date,
+            market,
+            signal_timestamp=signal_timestamp,
+        )
         positions = self._effective_positions(strategy_id)
         old_symbols = set(positions)
+        quarantined_symbols = self._quarantined_position_symbols(strategy_id)
         target_symbols = set(targets)
+        add_symbols = _ordered_unique(add_tranche_symbols)
+        invalid_additions = sorted(set(add_symbols) - (old_symbols & target_symbols))
+        if invalid_additions:
+            raise TradeIntentError(
+                f"{strategy_id} ADD_TRANCHE requires retained positions: "
+                f"{invalid_additions}"
+            )
+        over_limit_additions = sorted(
+            symbol
+            for symbol in add_symbols
+            if int(positions[symbol].get("shares") or 1) >= 3
+        )
+        if over_limit_additions:
+            raise TradeIntentError(
+                f"{strategy_id} ADD_TRANCHE exceeds three-tranche cap: "
+                f"{over_limit_additions}"
+            )
         timestamp = _utc_now_text()
         self._account_cash(strategy_id)
 
@@ -224,7 +334,9 @@ class TradeIntentLedger:
         pending_buy_symbols = {
             symbol
             for action, symbol in pending_by_action_symbol
-            if action in {"BUY_NEW", "ADD_TRANCHE"} and symbol not in old_symbols
+            if action in {"BUY_NEW", "ADD_TRANCHE"}
+            and symbol not in old_symbols
+            and symbol not in quarantined_symbols
         }
         pending_sell_symbols = {
             symbol
@@ -240,6 +352,10 @@ class TradeIntentLedger:
 
         intents = []
         sell_symbols = sorted(old_symbols - target_symbols)
+        if set(add_symbols) & set(sell_symbols):
+            raise TradeIntentError(
+                f"{strategy_id} cannot add and sell the same symbol"
+            )
         committed_future_symbols = (
             old_symbols - (pending_sell_symbols | set(sell_symbols))
         ) | pending_buy_symbols
@@ -249,7 +365,9 @@ class TradeIntentLedger:
         candidate_new_buys = [
             symbol
             for symbol in targets
-            if symbol not in old_symbols and symbol not in pending_buy_symbols
+            if symbol not in old_symbols
+            and symbol not in pending_buy_symbols
+            and symbol not in quarantined_symbols
         ]
         admitted_new_buys = set(candidate_new_buys[:available_slots])
         buy_symbols = [
@@ -263,6 +381,9 @@ class TradeIntentLedger:
             ("BUY_NEW", symbol, rank)
             for rank, symbol in enumerate(targets, start=1)
             if symbol in buy_symbols
+        } | {
+            ("ADD_TRANCHE", symbol, targets.index(symbol) + 1)
+            for symbol in add_symbols
         }
         existing_plan = {
             (row["action"], row["symbol"], row["target_rank"])
@@ -297,6 +418,43 @@ class TradeIntentLedger:
                         eligible_session=eligible,
                         reserved_cash=0.0,
                         reason=reason,
+                        timestamp=timestamp,
+                    )
+                )
+            for symbol in add_symbols:
+                rank = targets.index(symbol) + 1
+                existing = pending_by_action_symbol.get(
+                    ("ADD_TRANCHE", symbol)
+                )
+                if existing is not None:
+                    self.conn.execute(
+                        "UPDATE trade_intents SET target_rank=?,updated_at=? "
+                        "WHERE intent_id=? AND state='PENDING'",
+                        (rank, timestamp, existing["intent_id"]),
+                    )
+                    refreshed = self.conn.execute(
+                        "SELECT * FROM trade_intents WHERE intent_id=?",
+                        (existing["intent_id"],),
+                    ).fetchone()
+                    intents.append(dict(refreshed))
+                    continue
+                intents.append(
+                    self._create_intent(
+                        run_id=run_id,
+                        signal_date=signal_date,
+                        strategy_id=strategy_id,
+                        symbol=symbol,
+                        market=market,
+                        currency=currency,
+                        action="ADD_TRANCHE",
+                        quantity=1,
+                        rank=rank,
+                        eligible_session=eligible,
+                        reserved_cash=self.tranche_amount,
+                        reason=(
+                            "fixed-tranche drawdown rule met; awaiting "
+                            "eligible-session raw open"
+                        ),
                         timestamp=timestamp,
                     )
                 )
@@ -467,10 +625,58 @@ class TradeIntentLedger:
                     if fault_injector:
                         fault_injector("after_portfolio")
                     filled += 1
-                else:
+                elif row["action"] == "ADD_TRANCHE":
+                    position = self._effective_positions(
+                        row["strategy_id"]
+                    ).get(row["symbol"])
+                    if position is None:
+                        self._cancel_intent(row, "position already absent")
+                        continue
+                    current_shares = max(
+                        1, int(position.get("shares") or 1)
+                    )
+                    if (
+                        current_shares
+                        + int(row["tranche_quantity"])
+                        > 3
+                    ):
+                        self._cancel_intent(
+                            row, "maximum tranche count reached"
+                        )
+                        continue
+                    if price is None:
+                        pending += 1
+                        deferred.append(
+                            {
+                                "intent_id": row["intent_id"],
+                                "strategy_id": row["strategy_id"],
+                                "symbol": row["symbol"],
+                                "action": row["action"],
+                                "eligible_session": row["eligible_session"],
+                                "reason": "exact_session_open_unavailable",
+                            }
+                        )
+                        continue
+                    if not self._fill_add(
+                        row, position, quote, fill_session
+                    ):
+                        blocked += 1
+                        continue
+                    if fault_injector:
+                        fault_injector("after_portfolio")
+                    filled += 1
+                elif row["action"] == "BUY_NEW":
                     positions = self._effective_positions(row["strategy_id"])
                     if row["symbol"] in positions:
                         self._cancel_intent(row, "position already present")
+                        continue
+                    if row["symbol"] in self._quarantined_position_symbols(
+                        row["strategy_id"]
+                    ):
+                        self._cancel_intent(
+                            row,
+                            "quarantined legacy position blocks BUY_NEW",
+                        )
                         continue
                     if len(positions) >= MAX_HOLDINGS_PER_STRATEGY:
                         blocked += 1
@@ -494,6 +700,10 @@ class TradeIntentLedger:
                     if fault_injector:
                         fault_injector("after_portfolio")
                     filled += 1
+                else:
+                    raise TradeIntentError(
+                        f"Unsupported intent action: {row['action']}"
+                    )
             self.conn.commit()
         except Exception:
             self.conn.rollback()
@@ -557,6 +767,42 @@ class TradeIntentLedger:
             "(strategy,name_or_code,entry_date,entry_price,weight,shares) "
             "VALUES (?,?,?,?,0,?)",
             (strategy, intent["symbol"], session, price, quantity),
+        )
+        self.conn.execute(
+            "INSERT INTO portfolio_snapshots "
+            "(snapshot_date,strategy,name_or_code,weight) VALUES (?,?,?,0)",
+            (session, strategy, intent["symbol"]),
+        )
+        self._record_execution_evidence(intent, quote, session)
+        self._mark_filled(intent, price, 0.0, None, session)
+        return True
+
+    def _fill_add(self, intent, position, quote, session):
+        strategy = intent["strategy_id"]
+        price = quote["price"]
+        quantity = int(intent["tranche_quantity"])
+        cost = self.tranche_amount * quantity
+        result = self.conn.execute(
+            "UPDATE strategy_accounts SET available_cash=available_cash-? "
+            "WHERE strategy_id=? AND available_cash>=?",
+            (cost, strategy, cost),
+        )
+        if result.rowcount != 1:
+            return False
+        old_shares = max(1, int(position.get("shares") or 1))
+        new_average_cost = calculate_harmonic_average_cost(
+            old_shares,
+            float(position["entry_price"]),
+            quantity,
+            price,
+        )
+        self.conn.execute(
+            "UPDATE portfolio SET entry_price=?,shares=? WHERE id=?",
+            (
+                new_average_cost,
+                old_shares + quantity,
+                position["id"],
+            ),
         )
         self.conn.execute(
             "INSERT INTO portfolio_snapshots "
