@@ -21,6 +21,17 @@ from core.run_context import (
     read_artifact_envelope,
     write_artifact_envelope,
 )
+from core.run_telemetry import (
+    PipelineTelemetry,
+    build_degradation_summary,
+    read_json_status,
+    summarize_artifacts,
+)
+from core.telemetry_baseline import (
+    build_phase_baseline,
+    evaluate_phase_durations,
+    load_telemetry_snapshots,
+)
 from core.writer_lock import writer_fence
 
 # === Path Configuration ===
@@ -121,6 +132,14 @@ def build_parser():
         action="store_true",
         help="Required second acknowledgement for live SMTP delivery",
     )
+    parser.add_argument(
+        "--allow-duplicate-effective-date-delivery",
+        action="store_true",
+        help=(
+            "Explicit recipient-approved resend override for one new production "
+            "run; defaults to disabled"
+        ),
+    )
     return parser
 
 
@@ -176,6 +195,15 @@ def create_run_context(args):
     elif args.confirm_live_delivery:
         raise RunContextError(
             "--confirm-live-delivery is only valid with --delivery-mode live"
+        )
+    if args.allow_duplicate_effective_date_delivery and (
+        args.mode != RunMode.PRODUCTION.value
+        or delivery_mode is not DeliveryMode.LIVE
+        or not args.confirm_live_delivery
+    ):
+        raise RunContextError(
+            "--allow-duplicate-effective-date-delivery requires production "
+            "mode, --delivery-mode live, and --confirm-live-delivery"
         )
     if args.mode == RunMode.PRODUCTION.value:
         if not args.confirm_production_writes:
@@ -237,6 +265,9 @@ def create_run_context(args):
         "mode": args.mode,
         "database_path": database_path,
         "delivery_mode": delivery_mode.value,
+        "allow_duplicate_effective_date_delivery": (
+            args.allow_duplicate_effective_date_delivery
+        ),
         "database_source_sha256": expected_source_sha256,
         "fixtures": fixture_manifest,
     }
@@ -250,6 +281,9 @@ def create_run_context(args):
         delivery_mode=delivery_mode,
         fixture_paths=fixture_paths or None,
         database_source_sha256=expected_source_sha256,
+        allow_duplicate_effective_date_delivery=(
+            args.allow_duplicate_effective_date_delivery
+        ),
     )
 
 
@@ -348,6 +382,14 @@ def _pipeline_error_payload(error):
     return payload
 
 
+def delivery_authorization(context):
+    return {
+        "duplicate_effective_date_override": (
+            context.allow_duplicate_effective_date_delivery
+        )
+    }
+
+
 def record_pipeline_failure(context, checkpoint_path, error):
     """Persist a resumable interruption and a durable failed-run manifest."""
     resolved_checkpoint = _checkpoint_path(context, checkpoint_path)
@@ -365,9 +407,27 @@ def record_pipeline_failure(context, checkpoint_path, error):
             "resumable": True,
             "completed_steps": list(checkpoint_data["completed_steps"]),
             "error": error_payload,
+            "backup": checkpoint_data.get("backup"),
+            "telemetry": checkpoint_data.get("telemetry"),
+            "delivery_authorization": delivery_authorization(context),
         },
     )
     return manifest_path
+
+
+def build_delivery_command(quant_python, prepared_manifest, context):
+    command = list(quant_python) + [
+        os.path.join(SCRIPTS_DIR, "send_unified_email.py"),
+        "--prepared-manifest",
+        str(prepared_manifest),
+    ]
+    if context.delivery_mode is DeliveryMode.LIVE:
+        command.append("--confirm-live-delivery")
+    if context.allow_duplicate_effective_date_delivery:
+        command.append(
+            "--allow-duplicate-effective-date-delivery"
+        )
+    return command
 
 
 def _run_pipeline_inner(context, checkpoint_path=None, popen_factory=subprocess.Popen):
@@ -393,6 +453,7 @@ def _run_pipeline_inner(context, checkpoint_path=None, popen_factory=subprocess.
 
     # --- P0.0 Backup DB before processing ---
     db_path = str(context.database_path)
+    backup_evidence = None
     if os.path.exists(db_path):
         backup_dir = str(context.artifact_root / context.run_id / "backups")
         try:
@@ -400,6 +461,10 @@ def _run_pipeline_inner(context, checkpoint_path=None, popen_factory=subprocess.
                 db_path=db_path, backup_dir=backup_dir
             ).backup(prefix="quant_system")
             logger.info(f"Successfully backed up DB to {backup_path}")
+            backup_evidence = {
+                "path": str(Path(backup_path).expanduser().resolve()),
+                "sha256": _sha256_file(backup_path),
+            }
             os.environ["QUANT_RUN_BACKUP_COMPLETED"] = "1"
         except Exception as e:
             logger.error(f"Failed to backup DB: {e}")
@@ -459,11 +524,22 @@ def _run_pipeline_inner(context, checkpoint_path=None, popen_factory=subprocess.
     checkpoint_file = _checkpoint_path(context, checkpoint_path)
     checkpoint = CheckpointStore(checkpoint_file, context)
     checkpoint_data = checkpoint.load()
+    if backup_evidence is not None:
+        checkpoint_data["backup"] = backup_evidence
+        checkpoint.save(checkpoint_data)
+    telemetry = PipelineTelemetry.from_snapshot(checkpoint_data.get("telemetry"))
 
-    def run_cmd(cmd, cwd):
+    def save_telemetry(status):
+        checkpoint_data["telemetry"] = telemetry.snapshot(status=status)
+        checkpoint.save(checkpoint_data)
+
+    def run_cmd(cmd, cwd, phase):
         command_key = shlex.join(cmd)
         if command_key in checkpoint_data["completed_steps"]:
             logger.info("Skipping checkpointed command: %s", command_key)
+            if not telemetry.has_command(command_key):
+                telemetry.record_checkpoint_reuse(phase, command_key)
+                save_telemetry("running")
             return
         logger.info(f"Running: {command_key}")
 
@@ -475,23 +551,43 @@ def _run_pipeline_inner(context, checkpoint_path=None, popen_factory=subprocess.
         )
         env.update(context.child_environment())
 
-        process = popen_factory(
-            cmd,
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=env,
-        )
+        token = telemetry.begin_command(phase, command_key)
+        try:
+            process = popen_factory(
+                cmd,
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+            )
+        except Exception:
+            telemetry.finish_command(token, status="failed")
+            save_telemetry("failed")
+            raise
         for line in process.stdout:
-            logger.info(line.strip())
+            text = line.strip()
+            telemetry.consume_output_line(text)
+            logger.info(text)
         process.wait()
 
         if process.returncode != 0:
+            telemetry.finish_command(
+                token,
+                status="failed",
+                return_code=process.returncode,
+            )
+            save_telemetry("failed")
             logger.error(f"Command failed with exit code {process.returncode}")
             raise PipelineCommandError(command_key, process.returncode)
 
         # Record success
+        telemetry.finish_command(
+            token,
+            status="completed",
+            return_code=process.returncode,
+        )
+        checkpoint_data["telemetry"] = telemetry.snapshot(status="running")
         checkpoint.mark_completed(command_key, checkpoint_data)
         injected_stage = os.environ.get("PIPELINE_TEST_FAIL_AFTER")
         if injected_stage and injected_stage in command_key:
@@ -507,7 +603,11 @@ def _run_pipeline_inner(context, checkpoint_path=None, popen_factory=subprocess.
     quant_python = resolve_stage_python("QUANT_PYTHON")
 
     logger.info("=== Phase 1: API Cross-Check Enhancement ===")
-    run_cmd(quant_python + [os.path.join(SCRIPTS_DIR, "check_stock_apis.py")], PROJECT_DIR)
+    run_cmd(
+        quant_python + [os.path.join(SCRIPTS_DIR, "check_stock_apis.py")],
+        PROJECT_DIR,
+        "api_health",
+    )
 
     logger.info("=== Phase 2: Pre-Run DB Integrity & Capital Balancing ===")
     run_cmd(
@@ -518,6 +618,7 @@ def _run_pipeline_inner(context, checkpoint_path=None, popen_factory=subprocess.
             str(context.database_path),
         ],
         PROJECT_DIR,
+        "database_integrity",
     )
 
     logger.info("=== Phase 2B: Settle Due Market-Aware Trade Intents ===")
@@ -530,10 +631,10 @@ def _run_pipeline_inner(context, checkpoint_path=None, popen_factory=subprocess.
         ]
     if context.mode is RunMode.PRODUCTION:
         settlement_command.append("--allow-production")
-    run_cmd(settlement_command, PROJECT_DIR)
+    run_cmd(settlement_command, PROJECT_DIR, "settlement")
 
     logger.info("=== Phase 3: Radar News Fetching ===")
-    run_cmd(radar_python + ["main.py"], RADAR_DIR)
+    run_cmd(radar_python + ["main.py"], RADAR_DIR, "radar")
 
     logger.info("=== Phase 4: Global Quant Screening ===")
     run_cmd(
@@ -544,8 +645,13 @@ def _run_pipeline_inner(context, checkpoint_path=None, popen_factory=subprocess.
             PROJECT_DIR,
         ],
         PROJECT_DIR,
+        "quant_screen",
     )
-    run_cmd(quant_python + [os.path.join(SCRIPTS_DIR, "screen_hot_spot.py")], PROJECT_DIR)
+    run_cmd(
+        quant_python + [os.path.join(SCRIPTS_DIR, "screen_hot_spot.py")],
+        PROJECT_DIR,
+        "quant_screen",
+    )
     run_cmd(
         quant_python
         + [
@@ -555,10 +661,15 @@ def _run_pipeline_inner(context, checkpoint_path=None, popen_factory=subprocess.
             os.path.join(PROJECT_DIR, "global_screen.json"),
         ],
         PROJECT_DIR,
+        "quant_screen",
     )
 
     logger.info("=== Phase 5: Per-Strategy NAV Refresh & Certification ===")
-    run_cmd(quant_python + [os.path.join(SCRIPTS_DIR, "calc_nav.py")], PROJECT_DIR)
+    run_cmd(
+        quant_python + [os.path.join(SCRIPTS_DIR, "calc_nav.py")],
+        PROJECT_DIR,
+        "nav",
+    )
 
     logger.info("=== Phase 6: Post-Update Double-Entry Ledger Sanity Check ===")
     run_cmd(
@@ -571,10 +682,15 @@ def _run_pipeline_inner(context, checkpoint_path=None, popen_factory=subprocess.
             context.effective_date.isoformat(),
         ],
         PROJECT_DIR,
+        "ledger",
     )
 
     logger.info("=== Phase 7: Draw Backtest PnL Curves ===")
-    run_cmd(quant_python + [os.path.join(SCRIPTS_DIR, "plot_pnl.py")], PROJECT_DIR)
+    run_cmd(
+        quant_python + [os.path.join(SCRIPTS_DIR, "plot_pnl.py")],
+        PROJECT_DIR,
+        "charts",
+    )
 
     logger.info("=== Phase 8: Reporting & Email ===")
     os.makedirs(os.path.join(PROJECT_DIR, "reports"), exist_ok=True)
@@ -586,6 +702,7 @@ def _run_pipeline_inner(context, checkpoint_path=None, popen_factory=subprocess.
             os.path.join(PROJECT_DIR, "reports", "screening_results.md"),
         ],
         PROJECT_DIR,
+        "report_delivery",
     )
     prepared_html = (
         context.artifact_root / context.run_id / "prepared-report.html"
@@ -611,6 +728,7 @@ def _run_pipeline_inner(context, checkpoint_path=None, popen_factory=subprocess.
             context.effective_date.isoformat(),
         ],
         PROJECT_DIR,
+        "report_delivery",
     )
     run_cmd(
         quant_python
@@ -622,15 +740,75 @@ def _run_pipeline_inner(context, checkpoint_path=None, popen_factory=subprocess.
             str(context.database_path),
         ],
         PROJECT_DIR,
+        "report_delivery",
     )
-    delivery_command = quant_python + [
-        os.path.join(SCRIPTS_DIR, "send_unified_email.py"),
-        "--prepared-manifest",
-        str(prepared_manifest),
-    ]
-    if context.delivery_mode is DeliveryMode.LIVE:
-        delivery_command.append("--confirm-live-delivery")
-    run_cmd(delivery_command, PROJECT_DIR)
+    delivery_command = build_delivery_command(
+        quant_python,
+        prepared_manifest,
+        context,
+    )
+    run_cmd(delivery_command, PROJECT_DIR, "report_delivery")
+
+    settlement_status = read_json_status(
+        context.database_path,
+        "settlement_run_status:" + context.run_id,
+    )
+    nav_status = read_json_status(
+        context.database_path,
+        "nav_run_status:" + context.run_id,
+    )
+    degradation = build_degradation_summary(
+        context.run_id,
+        settlement_status,
+        nav_status,
+    )
+    outcome = degradation["status"]
+    radar_reports_dir = Path(
+        os.environ.get(
+            "RADAR_REPORTS_DIR",
+            os.path.join(RADAR_DIR, "reports"),
+        )
+    )
+    industry_report = (
+        radar_reports_dir
+        / f"industry_report_{context.effective_date.isoformat()}.md"
+    )
+    stage_inputs = {
+        "quant_screen": summarize_artifacts(
+            {
+                "industry_report": industry_report,
+                "hot_spot": Path(PROJECT_DIR) / "hot_spot_today.json",
+            }
+        ),
+        "report_delivery": summarize_artifacts(
+            {
+                "global_screen": Path(PROJECT_DIR) / "global_screen.json",
+                "industry_report": industry_report,
+                "prepared_recipient_html": prepared_html,
+                "prepared_audit_html": prepared_audit_html,
+                "prepared_manifest": prepared_manifest,
+            }
+        ),
+    }
+    telemetry_snapshot = telemetry.snapshot(status=outcome)
+    try:
+        baseline_min_samples = max(
+            3,
+            int(os.environ.get("PIPELINE_BASELINE_MIN_SAMPLES", "10")),
+        )
+    except ValueError:
+        baseline_min_samples = 10
+    baseline = build_phase_baseline(
+        load_telemetry_snapshots(
+            context.artifact_root,
+            exclude_run_id=context.run_id,
+        ),
+        min_samples=baseline_min_samples,
+    )
+    performance_evaluation = evaluate_phase_durations(
+        telemetry_snapshot,
+        baseline,
+    )
 
     manifest_path = context.artifact_root / context.run_id / "run-manifest.json"
     write_artifact_envelope(
@@ -639,8 +817,16 @@ def _run_pipeline_inner(context, checkpoint_path=None, popen_factory=subprocess.
         "pipeline-run-manifest",
         {
             "status": "completed",
+            "outcome": outcome,
             "completed_steps": list(checkpoint_data["completed_steps"]),
             "database_input": database_input,
+            "backup": backup_evidence,
+            "degradation": degradation,
+            "stage_inputs": stage_inputs,
+            "telemetry": telemetry_snapshot,
+            "performance_baseline": baseline,
+            "performance_evaluation": performance_evaluation,
+            "delivery_authorization": delivery_authorization(context),
         },
     )
     checkpoint.clear()

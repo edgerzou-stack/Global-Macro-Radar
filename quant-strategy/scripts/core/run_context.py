@@ -182,6 +182,7 @@ class RunContext:
     delivery_mode: DeliveryMode = DeliveryMode.SINK
     fixture_paths: tuple[tuple[str, str], ...] = ()
     database_source_sha256: Optional[str] = None
+    allow_duplicate_effective_date_delivery: bool = False
 
     @classmethod
     def create(
@@ -197,6 +198,7 @@ class RunContext:
         delivery_mode: Any = DeliveryMode.SINK,
         fixture_paths: Optional[Mapping[str, os.PathLike]] = None,
         database_source_sha256: Optional[str] = None,
+        allow_duplicate_effective_date_delivery: bool = False,
     ) -> "RunContext":
         try:
             normalized_mode = mode if isinstance(mode, RunMode) else RunMode(str(mode))
@@ -217,6 +219,18 @@ class RunContext:
             and normalized_delivery_mode is DeliveryMode.LIVE
         ):
             raise RunContextError("Live delivery is only allowed in production mode")
+        if type(allow_duplicate_effective_date_delivery) is not bool:
+            raise RunContextError(
+                "allow_duplicate_effective_date_delivery must be boolean"
+            )
+        if allow_duplicate_effective_date_delivery and (
+            normalized_mode is not RunMode.PRODUCTION
+            or normalized_delivery_mode is not DeliveryMode.LIVE
+        ):
+            raise RunContextError(
+                "Duplicate effective-date delivery override requires "
+                "production mode with live delivery"
+            )
 
         normalized_run_id = run_id or str(uuid.uuid4())
         if not RUN_ID_PATTERN.fullmatch(normalized_run_id):
@@ -255,6 +269,9 @@ class RunContext:
                 if database_source_sha256
                 else None
             ),
+            allow_duplicate_effective_date_delivery=(
+                allow_duplicate_effective_date_delivery
+            ),
         )
 
     @property
@@ -291,6 +308,8 @@ class RunContext:
             "QUANT_DB_ENV": database_environment,
             "DELIVERY_MODE": self.delivery_mode.value,
         }
+        if self.allow_duplicate_effective_date_delivery:
+            values["PIPELINE_AUTHORIZED_RESEND"] = "1"
         if self.database_source_sha256:
             values[
                 "PIPELINE_EXPECTED_DB_SOURCE_SHA256"

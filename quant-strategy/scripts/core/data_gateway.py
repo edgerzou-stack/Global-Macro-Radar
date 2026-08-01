@@ -4,116 +4,66 @@ import math
 import json
 import hashlib
 import re
-import threading
-from contextlib import contextmanager
+import time as time_module
 import pandas as pd
 from core.data_anomaly import DataAnomalyError
+from core.market_data_adapters import (
+    A_SHARE_CLOSE_HTTP_TIMEOUT,
+    BAOSTOCK_SOCKET_TIMEOUT_SECONDS,
+    SINA_HTTP_TIMEOUT,
+    SINA_A_SHARE_QUOTE_URL,
+    TENCENT_A_SHARE_KLINE_URL,
+    AShareQuoteAdapter,
+    MarketDataAdapters,
+    _bounded_baostock_session,
+    _call_sina_with_bounded_http,
+    baostock_constants,
+    baostock_context,
+    baostock_socket_util,
+)
+from core.market_data_contracts import (
+    CircuitBreakerError,
+    DataIntegrityError,
+    FatalSystemError,
+    InvalidMarketDataRequest,
+)
+from core.market_data_normalization import (
+    require_exact_close_range,
+    validate_closing_prices,
+    validate_prices,
+)
+from core.market_symbols import (
+    to_baostock_symbol,
+    to_sina_symbol,
+    to_tencent_symbol,
+    to_yfinance_symbol,
+)
+from core.provider_errors import log_provider_error
+from core.run_telemetry import metric_line
 
 import datetime
 import requests
-import yfinance as yf
-import akshare as ak
-import baostock as bs
-import baostock.util.socketutil as baostock_socket_util
-import baostock.common.context as baostock_context
-import baostock.common.contants as baostock_constants
 import logging
-from tenacity import (
-    retry,
-    retry_if_not_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
 from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 HISTORICAL_PRICE_FIXTURE_SCHEMA_VERSION = 1
-SINA_HTTP_TIMEOUT = (5.0, 10.0)
-_SINA_REQUEST_PATCH_LOCK = threading.Lock()
-BAOSTOCK_SOCKET_TIMEOUT_SECONDS = 10.0
-_BAOSTOCK_SESSION_LOCK = threading.Lock()
-A_SHARE_CLOSE_HTTP_TIMEOUT = (5.0, 10.0)
-TENCENT_A_SHARE_KLINE_URL = (
-    "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
-)
-SINA_A_SHARE_QUOTE_URL = "https://hq.sinajs.cn/list={market_symbol}"
+A_SHARE_CLOSE_FALLBACK_ERROR_TTL_SECONDS = 30.0
+A_SHARE_CLOSE_CACHE_POLICY_VERSION = "validated-close-pair-v1"
 A_SHARE_CLOSE_RELATIVE_TOLERANCE = 0.001
 
 
-def _call_sina_with_bounded_http(fetch, *args, **kwargs):
-    """Call AkShare's Sina adapter while supplying its missing HTTP timeout.
-
-    ``ak.stock_zh_a_daily`` currently performs several module-level
-    ``requests.get`` calls without a timeout.  A single half-open response can
-    therefore block a worker and its parent future forever.  Serialize this
-    narrow compatibility patch so concurrent Sina calls cannot restore each
-    other's function pointer out of order.
-    """
-
-    with _SINA_REQUEST_PATCH_LOCK:
-        original_get = requests.get
-
-        def bounded_get(*get_args, **get_kwargs):
-            get_kwargs.setdefault("timeout", SINA_HTTP_TIMEOUT)
-            return original_get(*get_args, **get_kwargs)
-
-        requests.get = bounded_get
-        try:
-            return fetch(*args, **kwargs)
-        finally:
-            requests.get = original_get
-
-
-@contextmanager
-def _bounded_baostock_session():
-    """Serialize Baostock's global socket and add a finite socket timeout.
-
-    The upstream SDK stores one ``default_socket`` in module-global state, so
-    concurrent login/query/logout sequences corrupt each other.  Its socket is
-    blocking by default as well.  Keep the entire session behind one lock and
-    patch only the SDK's connection method while that lock is held.
-    """
-
-    with _BAOSTOCK_SESSION_LOCK:
-        original_connect = baostock_socket_util.SocketUtil.connect
-
-        def bounded_connect(_socket_util):
-            client = baostock_socket_util.socket.socket(
-                baostock_socket_util.socket.AF_INET,
-                baostock_socket_util.socket.SOCK_STREAM,
-            )
-            client.settimeout(BAOSTOCK_SOCKET_TIMEOUT_SECONDS)
-            client.connect(
-                (
-                    baostock_constants.BAOSTOCK_SERVER_IP,
-                    baostock_constants.BAOSTOCK_SERVER_PORT,
-                )
-            )
-            setattr(baostock_context, "default_socket", client)
-
-        baostock_socket_util.SocketUtil.connect = bounded_connect
-        try:
-            yield
-        finally:
-            baostock_socket_util.SocketUtil.connect = original_connect
-
-class DataIntegrityError(Exception):
-    """Raised when fetched data fails integrity checks (e.g., price <= 0)."""
-    pass
-
-
-class InvalidMarketDataRequest(DataIntegrityError):
-    """Raised for a locally invalid range before any provider is contacted."""
-    pass
-
-class CircuitBreakerError(Exception):
-    """Raised when a data source triggers a circuit breaker."""
-    pass
-
-class FatalSystemError(Exception):
-    """Raised when all data sources are broken (double circuit breaker)."""
-    pass
-
+def _emit_a_share_close_cache_metric(**counters):
+    print(
+        metric_line(
+            "a_share_close_pair_cache",
+            counters,
+            dimensions={
+                "policy_version": A_SHARE_CLOSE_CACHE_POLICY_VERSION
+            },
+        ),
+        flush=True,
+    )
 
 @lru_cache(maxsize=8)
 def _load_historical_fixture_cached(path, mtime_ns):
@@ -231,6 +181,22 @@ class DataGateway:
             "yfinance": CircuitBreaker("yfinance", threshold=10),
         }
         self._a_share_close_fallback_cache = {}
+        self._a_share_close_fallback_errors = {}
+        self.adapters = MarketDataAdapters(
+            ensure_source_available=lambda source: (
+                self._ensure_source_available(source)
+            ),
+            record_success=lambda source: self.breakers[
+                source
+            ].record_success(),
+            record_failure=lambda source: self.breakers[
+                source
+            ].record_failure(),
+            logger=logger,
+        )
+        self.a_share_quote_adapter = AShareQuoteAdapter(
+            validate_prices=self._validate_prices,
+        )
         if self.db_path is not None:
             self._init_db()
 
@@ -301,46 +267,7 @@ class DataGateway:
 
     @staticmethod
     def _validate_prices(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
-        """Return normalized price data or fail closed on any corrupt row."""
-        if df is None or df.empty:
-            raise DataIntegrityError(f"Empty market data for {symbol}")
-
-        required = ["日期", "开盘", "收盘", "最高", "最低", "成交量"]
-        missing = [column for column in required if column not in df.columns]
-        if missing:
-            raise DataIntegrityError(
-                f"Market data for {symbol} is missing columns: {', '.join(missing)}"
-            )
-
-        result = df.copy()
-        result["日期"] = result["日期"].astype(str).str.replace("-", "", regex=False).str[:8]
-        if result["日期"].eq("").any() or result["日期"].duplicated().any():
-            raise DataIntegrityError(f"Invalid or duplicate dates in market data for {symbol}")
-        if not result["日期"].is_monotonic_increasing:
-            raise DataIntegrityError(f"Market data dates are not monotonic for {symbol}")
-
-        numeric_columns = ["开盘", "收盘", "最高", "最低", "成交量"]
-        for column in numeric_columns:
-            result[column] = pd.to_numeric(result[column], errors="coerce")
-            if not result[column].map(lambda value: math.isfinite(float(value))).all():
-                raise DataIntegrityError(
-                    f"Non-finite {column} value in market data for {symbol}"
-                )
-
-        if (result[["开盘", "收盘", "最高", "最低"]] <= 0).any().any():
-            raise DataIntegrityError(f"Non-positive OHLC value in market data for {symbol}")
-        if (result["成交量"] < 0).any():
-            raise DataIntegrityError(f"Negative volume in market data for {symbol}")
-        if (
-            (result["最低"] > result["开盘"])
-            | (result["最低"] > result["收盘"])
-            | (result["最高"] < result["开盘"])
-            | (result["最高"] < result["收盘"])
-            | (result["最低"] > result["最高"])
-        ).any():
-            raise DataIntegrityError(f"Inconsistent OHLC values in market data for {symbol}")
-
-        return result
+        return validate_prices(df, symbol)
 
     @staticmethod
     def _validate_closing_prices(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
@@ -351,58 +278,18 @@ class DataGateway:
         the open, so it may isolate that field; close/high/low integrity stays
         mandatory and the degraded row is never written to the OHLC cache.
         """
-        if df is None or df.empty:
-            raise DataIntegrityError(f"Empty closing-price data for {symbol}")
-        required = ["日期", "收盘", "最高", "最低"]
-        missing = [column for column in required if column not in df.columns]
-        if missing:
-            raise DataIntegrityError(
-                f"Closing-price data for {symbol} is missing columns: {', '.join(missing)}"
-            )
-
-        result = df.copy()
-        result["日期"] = result["日期"].astype(str).str.replace("-", "", regex=False).str[:8]
-        if result["日期"].eq("").any() or result["日期"].duplicated().any():
-            raise DataIntegrityError(f"Invalid or duplicate closing dates for {symbol}")
-        if not result["日期"].is_monotonic_increasing:
-            raise DataIntegrityError(f"Closing-price dates are not monotonic for {symbol}")
-        for column in ("收盘", "最高", "最低"):
-            result[column] = pd.to_numeric(result[column], errors="coerce")
-            if not result[column].map(lambda value: math.isfinite(float(value))).all():
-                raise DataIntegrityError(f"Non-finite {column} value for {symbol}")
-            if (result[column] <= 0).any():
-                raise DataIntegrityError(f"Non-positive {column} value for {symbol}")
-        if (
-            (result["最低"] > result["收盘"])
-            | (result["最高"] < result["收盘"])
-            | (result["最低"] > result["最高"])
-        ).any():
-            raise DataIntegrityError(f"Inconsistent close/high/low values for {symbol}")
-        return result[["日期", "收盘"]]
+        return validate_closing_prices(df, symbol)
 
     @staticmethod
     def _require_exact_close_range(
         frame: pd.DataFrame, symbol: str, start_date: str, end_date: str
     ) -> pd.DataFrame:
-        """Reject a non-empty but stale series that omits a requested endpoint."""
-        if frame is None or frame.empty or not {"日期", "收盘"}.issubset(frame.columns):
-            raise DataIntegrityError(
-                f"Closing-price range is empty or incomplete for {symbol}"
-            )
-        closes = frame[["日期", "收盘"]].copy()
-        closes["日期"] = (
-            closes["日期"].astype(str).str.replace("-", "", regex=False).str[:8]
+        return require_exact_close_range(
+            frame,
+            symbol,
+            start_date,
+            end_date,
         )
-        available = set(closes["日期"])
-        missing = [
-            date for date in dict.fromkeys((start_date, end_date)) if date not in available
-        ]
-        if missing:
-            raise DataIntegrityError(
-                f"Closing-price range for {symbol} is missing exact endpoint(s): "
-                + ", ".join(missing)
-            )
-        return closes
 
     def _init_db(self):
         with sqlite3.connect(self.db_path, timeout=30.0) as conn:
@@ -443,190 +330,36 @@ class DataGateway:
             conn.commit()
 
     def _to_yf_symbol(self, symbol: str) -> str:
-        if '.' in symbol and symbol.upper().endswith(('HK', 'US', 'SS', 'SZ', 'BJ')):
-            return symbol
-        symbol_str = str(symbol)
-        if len(symbol_str) == 6 and symbol_str.isdigit():
-            if symbol_str.startswith('6'):
-                return f"{symbol_str}.SS"
-            elif symbol_str.startswith(('8', '4', '9')):
-                return f"{symbol_str}.BJ"
-            else:
-                return f"{symbol_str}.SZ"
-        return symbol
+        return to_yfinance_symbol(symbol)
 
     def _to_bs_symbol(self, symbol: str) -> str:
         """Converts internal symbol (like 600519) to baostock symbol (sh.600519)."""
-        symbol_str = str(symbol)
-        if len(symbol_str) == 6 and symbol_str.isdigit():
-            if symbol_str.startswith('6'):
-                return f"sh.{symbol_str}"
-            elif symbol_str.startswith(('8', '4', '9')):
-                return f"bj.{symbol_str}"
-            else:
-                return f"sz.{symbol_str}"
-        return symbol
+        return to_baostock_symbol(symbol)
 
     def _to_sina_symbol(self, symbol: str) -> str:
         """Converts internal symbol (like 600519) to sina symbol (sh600519)."""
-        symbol_str = str(symbol)
-        if len(symbol_str) == 6 and symbol_str.isdigit():
-            if symbol_str.startswith('6'):
-                return f"sh{symbol_str}"
-            elif symbol_str.startswith(('8', '4', '9')):
-                return f"bj{symbol_str}"
-            else:
-                return f"sz{symbol_str}"
-        return symbol
+        return to_sina_symbol(symbol)
 
     def _to_tencent_symbol(self, symbol: str) -> str:
         """Convert an internal A-share code to Tencent's market prefix."""
-        symbol_str = str(symbol)
-        if len(symbol_str) != 6 or not symbol_str.isdigit():
-            raise InvalidMarketDataRequest(
-                f"Tencent A-share fallback cannot route symbol {symbol!r}"
-            )
-        if symbol_str.startswith("6"):
-            return f"sh{symbol_str}"
-        if symbol_str.startswith(("8", "4", "9")):
-            return f"bj{symbol_str}"
-        return f"sz{symbol_str}"
+        return to_tencent_symbol(symbol)
 
     @staticmethod
     def _quote_number(value, field, symbol):
-        try:
-            number = float(value)
-        except (TypeError, ValueError) as error:
-            raise DataIntegrityError(
-                f"Invalid {field} in close snapshot for {symbol}"
-            ) from error
-        if not math.isfinite(number) or number <= 0:
-            raise DataIntegrityError(
-                f"Invalid {field} in close snapshot for {symbol}"
-            )
-        return number
+        return AShareQuoteAdapter._quote_number(value, field, symbol)
 
     def _fetch_tencent_a_share_daily(
         self, symbol: str, start_date: str, end_date: str, adjust: str
     ):
-        """Fetch Tencent daily bars plus its timestamped quote envelope."""
-        if adjust not in {"", "hfq"}:
-            raise InvalidMarketDataRequest(
-                f"Unsupported Tencent adjustment mode {adjust!r}"
-            )
-        market_symbol = self._to_tencent_symbol(symbol)
-        start_fmt = datetime.datetime.strptime(start_date, "%Y%m%d").strftime(
-            "%Y-%m-%d"
+        return self.a_share_quote_adapter.fetch_tencent_daily(
+            symbol,
+            start_date,
+            end_date,
+            adjust,
         )
-        end_fmt = datetime.datetime.strptime(end_date, "%Y%m%d").strftime(
-            "%Y-%m-%d"
-        )
-        response = requests.get(
-            TENCENT_A_SHARE_KLINE_URL,
-            params={
-                "param": (
-                    f"{market_symbol},day,{start_fmt},{end_fmt},"
-                    f"640,{adjust}"
-                )
-            },
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Referer": "https://gu.qq.com/",
-            },
-            timeout=A_SHARE_CLOSE_HTTP_TIMEOUT,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("code") != 0:
-            raise DataIntegrityError(
-                f"Tencent close endpoint rejected {symbol}: {payload.get('msg', '')}"
-            )
-        data = (payload.get("data") or {}).get(market_symbol) or {}
-        series_key = "hfqday" if adjust == "hfq" else "day"
-        rows = data.get(series_key) or []
-        if not rows:
-            raise DataIntegrityError(
-                f"Tencent returned no {adjust or 'raw'} daily bars for {symbol}"
-            )
-        normalized_rows = []
-        corporate_action = None
-        for row in rows:
-            if not isinstance(row, list) or len(row) < 6:
-                raise DataIntegrityError(
-                    f"Tencent returned a malformed daily bar for {symbol}"
-                )
-            normalized_rows.append(row[:6])
-            row_date = str(row[0]).replace("-", "")
-            if row_date == end_date and len(row) > 6 and isinstance(row[6], dict):
-                corporate_action = dict(row[6])
-        frame = pd.DataFrame(
-            normalized_rows,
-            columns=["日期", "开盘", "收盘", "最高", "最低", "成交量"],
-        )
-        frame["日期"] = frame["日期"].astype(str).str.replace("-", "", regex=False)
-        frame = self._validate_prices(frame, symbol)
-
-        quote_values = ((data.get("qt") or {}).get(market_symbol) or [])
-        if len(quote_values) < 35:
-            raise DataIntegrityError(
-                f"Tencent returned an incomplete quote envelope for {symbol}"
-            )
-        timestamp = str(quote_values[30])
-        if not re.fullmatch(r"\d{14}", timestamp):
-            raise DataIntegrityError(
-                f"Tencent returned an invalid quote timestamp for {symbol}"
-            )
-        quote = {
-            "symbol": str(quote_values[2]).zfill(6),
-            "date": timestamp[:8],
-            "time": f"{timestamp[8:10]}:{timestamp[10:12]}:{timestamp[12:14]}",
-            "open": self._quote_number(quote_values[5], "open", symbol),
-            "close": self._quote_number(quote_values[3], "close", symbol),
-            "high": self._quote_number(quote_values[33], "high", symbol),
-            "low": self._quote_number(quote_values[34], "low", symbol),
-            "previous_close": self._quote_number(
-                quote_values[4], "previous close", symbol
-            ),
-            "corporate_action": corporate_action,
-        }
-        return frame, quote
 
     def _fetch_sina_a_share_quote(self, symbol: str):
-        """Fetch a second, independently timestamped A-share close snapshot."""
-        market_symbol = self._to_sina_symbol(symbol)
-        response = requests.get(
-            SINA_A_SHARE_QUOTE_URL.format(market_symbol=market_symbol),
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Referer": "https://finance.sina.com.cn/",
-            },
-            timeout=A_SHARE_CLOSE_HTTP_TIMEOUT,
-        )
-        response.raise_for_status()
-        text = response.content.decode("gb18030", errors="strict")
-        match = re.search(r'=\s*"(.*)";\s*$', text.strip())
-        if not match:
-            raise DataIntegrityError(
-                f"Sina returned an invalid quote envelope for {symbol}"
-            )
-        values = match.group(1).split(",")
-        if len(values) < 32:
-            raise DataIntegrityError(
-                f"Sina returned an incomplete quote envelope for {symbol}"
-            )
-        date_text = str(values[30]).replace("-", "")
-        return {
-            "symbol": str(symbol).zfill(6),
-            "date": date_text,
-            "time": str(values[31]),
-            "open": self._quote_number(values[1], "open", symbol),
-            "close": self._quote_number(values[3], "close", symbol),
-            "high": self._quote_number(values[4], "high", symbol),
-            "low": self._quote_number(values[5], "low", symbol),
-            "previous_close": self._quote_number(
-                values[2], "previous close", symbol
-            ),
-        }
+        return self.a_share_quote_adapter.fetch_sina_quote(symbol)
 
     @staticmethod
     def _relative_gap(left, right):
@@ -684,15 +417,42 @@ class DataGateway:
         cache_key = (str(symbol), start_date, end_date)
         cached = self._a_share_close_fallback_cache.get(cache_key)
         if cached is not None:
+            _emit_a_share_close_cache_metric(hit=1, saved_external_calls=3)
             return {key: value.copy() for key, value in cached.items()}
+        errors = getattr(self, "_a_share_close_fallback_errors", {})
+        self._a_share_close_fallback_errors = errors
+        cached_error = errors.get(cache_key)
+        if cached_error is not None:
+            failed_at, error_text = cached_error
+            if (
+                time_module.monotonic() - failed_at
+                < A_SHARE_CLOSE_FALLBACK_ERROR_TTL_SECONDS
+            ):
+                _emit_a_share_close_cache_metric(
+                    negative_hit=1,
+                    saved_external_calls=3,
+                )
+                raise DataIntegrityError(
+                    f"cached A-share close-pair failure for {symbol}: {error_text}"
+                )
+            errors.pop(cache_key, None)
 
-        raw, tencent_quote = self._fetch_tencent_a_share_daily(
-            symbol, start_date, end_date, ""
-        )
-        hfq, hfq_quote = self._fetch_tencent_a_share_daily(
-            symbol, start_date, end_date, "hfq"
-        )
-        sina_quote = self._fetch_sina_a_share_quote(symbol)
+        _emit_a_share_close_cache_metric(miss=1)
+        try:
+            raw, tencent_quote = self._fetch_tencent_a_share_daily(
+                symbol, start_date, end_date, ""
+            )
+            hfq, hfq_quote = self._fetch_tencent_a_share_daily(
+                symbol, start_date, end_date, "hfq"
+            )
+            sina_quote = self._fetch_sina_a_share_quote(symbol)
+        except (DataIntegrityError, requests.RequestException, ValueError) as error:
+            errors[cache_key] = (
+                time_module.monotonic(),
+                f"{type(error).__name__}: {error}",
+            )
+            _emit_a_share_close_cache_metric(negative_write=1)
+            raise
 
         tencent_values = self._validate_a_share_close_quote(
             tencent_quote, symbol, end_date, "Tencent"
@@ -787,6 +547,8 @@ class DataGateway:
         self._a_share_close_fallback_cache[cache_key] = {
             key: value.copy() for key, value in pair.items()
         }
+        _emit_a_share_close_cache_metric(write=1)
+        errors.pop(cache_key, None)
         return pair
 
     
@@ -998,136 +760,29 @@ class DataGateway:
                 """, to_insert)
                 conn.commit()
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_not_exception_type(CircuitBreakerError),
-    )
     def _fetch_from_baostock(self, symbol: str, start_date: str, end_date: str, adjust: str) -> pd.DataFrame:
-        self._ensure_source_available("baostock")
-        bs_sym = self._to_bs_symbol(symbol)
-        start_fmt = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]}"
-        end_fmt = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:]}"
-        
-        # adjustflag: '1': hfq (post-adjust), '2': qfq (pre-adjust), '3': non-adjust
-        flag = "2" if adjust == "qfq" else ("1" if adjust == "hfq" else "3")
-        
-        with _bounded_baostock_session():
-            try:
-                login_result = bs.login()
-                if getattr(login_result, "error_code", None) != "0":
-                    raise ConnectionError(
-                        "BaoStock login failed: "
-                        f"{getattr(login_result, 'error_msg', 'unknown error')}"
-                    )
-                rs = bs.query_history_k_data_plus(
-                    bs_sym, "date,open,high,low,close,volume",
-                    start_date=start_fmt, end_date=end_fmt, frequency="d", adjustflag=flag
-                )
+        return self.adapters.fetch_baostock(
+            symbol,
+            start_date,
+            end_date,
+            adjust,
+        )
 
-                if rs.error_code != '0':
-                    raise ValueError(f"BaoStock query error: {rs.error_msg}")
-
-                data_list = []
-                while (rs.error_code == '0') & rs.next():
-                    data_list.append(rs.get_row_data())
-
-                if not data_list:
-                    raise ValueError(f"BaoStock returned empty dataframe for {bs_sym}")
-
-                df = pd.DataFrame(data_list, columns=rs.fields)
-                df = df.rename(columns={
-                    'date': '日期', 'open': '开盘', 'close': '收盘',
-                    'high': '最高', 'low': '最低', 'volume': '成交量'
-                })
-                df['日期'] = df['日期'].str.replace('-', '')
-
-                # Numeric conversion
-                for col in ['开盘', '收盘', '最高', '最低', '成交量']:
-                    if col in df.columns:
-                        df[col] = pd.to_numeric(df[col], errors='coerce')
-
-                self.breakers["baostock"].record_success()
-                return df
-            except Exception as e:
-                if not isinstance(e, CircuitBreakerError):
-                    self.breakers["baostock"].record_failure()
-                raise e
-            finally:
-                bs.logout()
-
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_not_exception_type(CircuitBreakerError),
-    )
     def _fetch_from_sina(self, symbol: str, start_date: str, end_date: str, adjust: str) -> pd.DataFrame:
-        self._ensure_source_available("sina")
-        sina_sym = self._to_sina_symbol(symbol)
-        try:
-            df = _call_sina_with_bounded_http(
-                ak.stock_zh_a_daily,
-                symbol=sina_sym,
-                start_date=start_date,
-                end_date=end_date,
-                adjust=adjust,
-            )
-            if df.empty:
-                raise ValueError(f"Sina returned empty dataframe for {sina_sym}")
-            
-            df = df.reset_index()
-            if 'date' in df.columns:
-                df = df.rename(columns={
-                    'date': '日期', 'open': '开盘', 'close': '收盘',
-                    'high': '最高', 'low': '最低', 'volume': '成交量'
-                })
-                # Check if it's datetime or str
-                if pd.api.types.is_datetime64_any_dtype(df['日期']):
-                    df['日期'] = df['日期'].dt.strftime('%Y%m%d')
-                else:
-                    df['日期'] = df['日期'].astype(str).str.replace('-', '')
-            
-            self.breakers["sina"].record_success()
-            return df
-        except Exception as e:
-            if not isinstance(e, CircuitBreakerError):
-                self.breakers["sina"].record_failure()
-            raise e
+        return self.adapters.fetch_sina(
+            symbol,
+            start_date,
+            end_date,
+            adjust,
+        )
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_not_exception_type(CircuitBreakerError),
-    )
     def _fetch_from_yfinance(self, symbol: str, start_date: str, end_date: str, adjust: str = "") -> pd.DataFrame:
-        self._ensure_source_available("yfinance")
-        yf_sym = self._to_yf_symbol(symbol)
-        start_fmt = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]}"
-        end_dt = datetime.datetime.strptime(end_date, "%Y%m%d") + datetime.timedelta(days=1)
-        end_fmt = end_dt.strftime("%Y-%m-%d")
-        
-        auto_adj = True if adjust == "hfq" else False
-        try:
-            ticker = yf.Ticker(yf_sym)
-            df = ticker.history(start=start_fmt, end=end_fmt, auto_adjust=auto_adj)
-            
-            if df.empty:
-                raise ValueError(f"YFinance returned empty dataframe for {yf_sym}")
-                
-            df = df.reset_index()
-            if 'Date' in df.columns:
-                df = df.rename(columns={
-                    'Date': '日期', 'Open': '开盘', 'Close': '收盘',
-                    'High': '最高', 'Low': '最低', 'Volume': '成交量'
-                })
-                df['日期'] = df['日期'].dt.strftime('%Y%m%d')
-                
-            self.breakers["yfinance"].record_success()
-            return df
-        except Exception as e:
-            if not isinstance(e, CircuitBreakerError):
-                self.breakers["yfinance"].record_failure()
-            raise e
+        return self.adapters.fetch_yfinance(
+            symbol,
+            start_date,
+            end_date,
+            adjust,
+        )
 
     def get_historical_prices(self, symbol: str, start_date: str, end_date: str, adjust: str = "") -> pd.DataFrame:
         start_date = str(start_date).replace('-', '')
@@ -1192,6 +847,16 @@ class DataGateway:
                     symbol, start_date, end_date, adjust
                 )
             except Exception as e_bs:
+                log_provider_error(
+                    logger,
+                    e_bs,
+                    provider="baostock",
+                    operation="historical_prices_fallback",
+                    retryable=False,
+                    degraded_allowed=True,
+                    symbol=symbol,
+                    effective_date=end_date,
+                )
                 logger.warning(f"DataGateway: baostock failed for {symbol}: {e_bs}. Falling back to Sina.")
                 try:
                     df_new = self._fetch_validated_source(
@@ -1199,6 +864,16 @@ class DataGateway:
                         symbol, start_date, end_date, adjust
                     )
                 except Exception as e_sina:
+                    log_provider_error(
+                        logger,
+                        e_sina,
+                        provider="sina_akshare",
+                        operation="historical_prices_fallback",
+                        retryable=False,
+                        degraded_allowed=adjust != "hfq",
+                        symbol=symbol,
+                        effective_date=end_date,
+                    )
                     logger.warning(f"DataGateway: Sina failed for {symbol}: {e_sina}. Falling back to YFinance.")
                     if adjust == "hfq":
                         logger.error(f"DataGateway: Cannot use YFinance for A-Share HFQ data for {symbol}. It returns unadjusted prices and causes cache poisoning.")
@@ -1209,6 +884,17 @@ class DataGateway:
                             symbol, start_date, end_date, adjust
                         )
                     except Exception as e_yf:
+                        log_provider_error(
+                            logger,
+                            e_yf,
+                            provider="yfinance",
+                            operation="historical_prices_fallback",
+                            retryable=False,
+                            degraded_allowed=False,
+                            symbol=symbol,
+                            effective_date=end_date,
+                            level="error",
+                        )
                         logger.error(f"DataGateway: All A-share sources failed for {symbol}.")
                         raise FatalSystemError(
                             f"All A-share data sources failed for {symbol}. Aborting pipeline."
@@ -1225,6 +911,17 @@ class DataGateway:
                 # an explicitly narrower close-only valuation policy.
                 raise
             except Exception as e:
+                log_provider_error(
+                    logger,
+                    e,
+                    provider="yfinance",
+                    operation="historical_prices",
+                    retryable=False,
+                    degraded_allowed=False,
+                    symbol=symbol,
+                    effective_date=end_date,
+                    level="error",
+                )
                 logger.error(f"DataGateway: YFinance failed for {symbol}: {e}.")
                 raise FatalSystemError(
                     f"YFinance failed for non-A-share asset {symbol}. Aborting pipeline."
@@ -1291,6 +988,17 @@ class DataGateway:
                 except InvalidMarketDataRequest:
                     raise
                 except Exception as fallback_error:
+                    log_provider_error(
+                        logger,
+                        fallback_error,
+                        provider="tencent_sina_crosscheck",
+                        operation="exact_close_pair",
+                        retryable=False,
+                        degraded_allowed=False,
+                        symbol=symbol,
+                        effective_date=end_date,
+                        level="error",
+                    )
                     raise FatalSystemError(
                         f"Cross-checked exact-session A-share closes are "
                         f"unavailable for {symbol}: {fallback_error}"
@@ -1326,6 +1034,17 @@ class DataGateway:
                 closes, str(symbol), start_date, end_date
             )
         except Exception as error:
+            log_provider_error(
+                logger,
+                error,
+                provider="yfinance",
+                operation="validated_close_only",
+                retryable=False,
+                degraded_allowed=False,
+                symbol=symbol,
+                effective_date=end_date,
+                level="error",
+            )
             raise FatalSystemError(
                 f"Validated closing prices are unavailable for {symbol}"
             ) from error
@@ -1355,6 +1074,16 @@ class DataGateway:
         except FatalSystemError:
             raise
         except Exception as e:
+            log_provider_error(
+                logger,
+                e,
+                provider="market_data_chain",
+                operation="legacy_open_price",
+                retryable=False,
+                degraded_allowed=True,
+                symbol=symbol,
+                effective_date=exact_date_str,
+            )
             logger.error(f"Failed to get open price for {symbol} around {target_date}: {e}")
             
         return 0.0
@@ -1426,7 +1155,16 @@ class DataGateway:
                 f"Expected one raw open for {symbol_text}/{target}; found {len(exact)}"
             )
         row = exact.iloc[0]
-        price = self.get_exact_open_price(symbol_text, target.isoformat())
+        try:
+            price = float(row["开盘"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise DataIntegrityError(
+                f"Invalid raw open for {symbol_text}/{target}"
+            ) from error
+        if not math.isfinite(price) or price <= 0:
+            raise DataIntegrityError(
+                f"Invalid raw open for {symbol_text}/{target}: {price!r}"
+            )
         payload = {
             "schema_version": 1,
             "symbol": symbol_text,
@@ -1475,6 +1213,16 @@ class DataGateway:
         except DataIntegrityError:
             raise
         except Exception as e:
+            log_provider_error(
+                logger,
+                e,
+                provider="market_data_chain",
+                operation="current_price",
+                retryable=False,
+                degraded_allowed=True,
+                symbol=symbol,
+                effective_date=effective_date_str,
+            )
             logger.error(f"Failed to get current price for {symbol}: {e}")
             
         return 0.0

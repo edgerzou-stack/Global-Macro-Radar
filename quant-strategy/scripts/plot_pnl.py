@@ -48,56 +48,20 @@ def load_active_nav_records(db_path):
         for row in rows
     ]
 
-def build_timeseries_pnl(trades: list) -> pd.Series:
-    """
-    Convert a list of trades into a true cumulative PNL time series.
-    """
-    if not trades:
-        return pd.Series(dtype=float)
-        
-    records = []
-    for t in trades:
-        if "exit_date" in t and "pnl" in t:
-            try:
-                date = pd.to_datetime(t["exit_date"].split()[0])
-                pnl_percent = t["pnl"] * 100
-                records.append({"date": date, "pnl": pnl_percent})
-            except Exception as e:
-                import logging
-                logging.error(f"Failed to parse pnl record for strat {strat}, line {row}: {e}", exc_info=True)
-                
-    if not records:
-        return pd.Series(dtype=float)
-        
-    # Sort by date and calculate running sum
-    df = pd.DataFrame(records).sort_values("date")
-    
-    # We aggregate PNL per day in case multiple trades exit on the same day
-    daily_pnl = df.groupby("date")["pnl"].sum()
-    cum_pnl = daily_pnl.cumsum()
-    
-    # Prepend 0 to start the curve nicely
-    start_date = cum_pnl.index[0] - pd.Timedelta(days=1)
-    cum_pnl.loc[start_date] = 0.0
-    cum_pnl = cum_pnl.sort_index()
-    
-    return cum_pnl
-
 def plot_strategy(strat_id, name, trades, output_file, color, artifact_dir, nav_records=None):
-    # Fallback to trade naive sum if no nav_records (for backward compatibility during transition)
+    # A strategy return chart is valid only when backed by certified NAV. A
+    # direct sum of trade-level percentage returns is not a portfolio return
+    # and can produce misleading values below -100%.
+    if not nav_records:
+        return False
+
     total = len(trades)
-    
-    if nav_records:
-        df = pd.DataFrame(nav_records)
-        df['date'] = pd.to_datetime(df['date'])
-        df = df.sort_values('date')
-        df['nav_pct'] = (df['nav'] / 1000000.0 - 1) * 100
-        ts = df.set_index('date')['nav_pct']
-        cum_pnl_val = df['nav_pct'].iloc[-1] if not df.empty else 0.0
-    else:
-        ts = build_timeseries_pnl(trades)
-        from functools import reduce
-        cum_pnl_val = (reduce(lambda acc, t: acc * (1 + t["pnl"]), trades, 1.0) - 1) * 100
+    df = pd.DataFrame(nav_records)
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date')
+    df['nav_pct'] = (df['nav'] / 1000000.0 - 1) * 100
+    ts = df.set_index('date')['nav_pct']
+    cum_pnl_val = df['nav_pct'].iloc[-1] if not df.empty else 0.0
     
     fig, (ax_table, ax_curve) = plt.subplots(1, 2, figsize=(12, 5), gridspec_kw={'width_ratios': [1, 2.5]})
     
@@ -144,104 +108,7 @@ def plot_strategy(strat_id, name, trades, output_file, color, artifact_dir, nav_
     if os.path.exists(artifact_dir):
         artifact_path = os.path.join(artifact_dir, f"pnl_chart_{strat_id}.png")
         shutil.copy2(output_file, artifact_path)
-
-def plot_all(strategy_trades, output_file, strat_colors, artifact_dir, all_nav_records=None):
-    fig, (ax_table, ax_curve) = plt.subplots(1, 2, figsize=(18, 8), gridspec_kw={'width_ratios': [1, 2.5]})
-    
-    cell_text = []
-    row_labels = []
-    row_colors = []
-    
-    strat_metrics = []
-    
-    if all_nav_records:
-        df = pd.DataFrame(all_nav_records)
-        df['date'] = pd.to_datetime(df['date'])
-        
-        for strat, group in df.groupby('strategy_id'):
-            if strat not in STRAT_NAMES:
-                continue
-            group = group.sort_values('date')
-            nav_pct = (group['nav'] / 1000000.0 - 1) * 100
-            cum_pnl = nav_pct.iloc[-1] if not nav_pct.empty else 0.0
-            total_trades = len(strategy_trades.get(strat, []))
-            
-            strat_metrics.append({
-                "strat": strat, 
-                "cum_pnl": cum_pnl, 
-                "total": total_trades, 
-                "dates": group['date'],
-                "nav_pct": nav_pct
-            })
-    else:
-        for strat, trades in strategy_trades.items():
-            if strat not in STRAT_NAMES:
-                continue
-            from functools import reduce
-            cum_pnl = (reduce(lambda acc, t: acc * (1 + t["pnl"]), trades, 1.0) - 1) * 100
-            strat_metrics.append({"strat": strat, "cum_pnl": cum_pnl, "total": len(trades), "trades": trades})
-            
-    strat_metrics.sort(key=lambda x: x["cum_pnl"], reverse=True)
-    
-    for m in strat_metrics:
-        strat = m["strat"]
-        cum_pnl_val = m["cum_pnl"]
-        total = m["total"]
-        name = STRAT_NAMES.get(strat, strat)
-        color = strat_colors.get(strat, '#999999')
-        
-        if "nav_pct" in m:
-            if not m["dates"].empty:
-                marker = 'o' if len(m["dates"]) <= 30 else None
-                markersize = 3 if len(m["dates"]) <= 30 else 0
-                ax_curve.plot(m["dates"], m["nav_pct"], color=color, linewidth=1.5, 
-                              linestyle='-', marker=marker, markersize=markersize, 
-                              alpha=0.8, label=f"{name} ({cum_pnl_val:+.2f}%)")
-                row_labels.append(name)
-                cell_text.append([f"{total}", f"{cum_pnl_val:+.2f}%"])
-                row_colors.append(color)
-        else:
-            trades = m["trades"]
-            ts = build_timeseries_pnl(trades)
-            if not ts.empty:
-                marker = 'o' if len(ts) <= 30 else None
-                markersize = 3 if len(ts) <= 30 else 0
-                
-                ax_curve.plot(ts.index, ts.values, color=color, linewidth=1.5, 
-                              linestyle='-', marker=marker, markersize=markersize, 
-                              alpha=0.8, label=f"{name} ({cum_pnl_val:+.2f}%)")
-                              
-                row_labels.append(name)
-                cell_text.append([f"{total}", f"{cum_pnl_val:+.2f}%"])
-                row_colors.append(color)
-
-    ax_curve.axhline(0, color='gray', linestyle='dashed', linewidth=1)
-    ax_curve.set_title('各策略等权累计净收益曲线综合对比 (Master Chart)', fontsize=16)
-    ax_curve.set_xlabel('平仓日期', fontsize=12)
-    ax_curve.set_ylabel('累计净收益率 (%)', fontsize=12)
-    ax_curve.tick_params(axis='x', rotation=45)
-    
-    ax_curve.legend(loc='upper left', bbox_to_anchor=(1.02, 1), borderaxespad=0.)
-    ax_curve.grid(True, alpha=0.3)
-    
-    ax_table.axis('tight')
-    ax_table.axis('off')
-    ax_table.set_title('综合指标统计', fontsize=14, pad=20)
-    
-    if cell_text:
-        col_labels = ['已平仓总数(笔)', '当前全局净值收益(%)']
-        table = ax_table.table(cellText=cell_text, rowLabels=row_labels, rowColours=row_colors, colLabels=col_labels, loc='center', cellLoc='center')
-        table.auto_set_font_size(False)
-        table.set_fontsize(10)
-        table.scale(1, 2.0)
-    
-    plt.tight_layout()
-    plt.savefig(output_file, dpi=300, bbox_inches="tight")
-    plt.close()
-    
-    if os.path.exists(artifact_dir):
-        artifact_path = os.path.join(artifact_dir, "pnl_chart_all.png")
-        shutil.copy2(output_file, artifact_path)
+    return True
 
 def plot_nav_all(nav_records, output_file, strat_colors, artifact_dir):
     """
@@ -257,16 +124,22 @@ def plot_nav_all(nav_records, output_file, strat_colors, artifact_dir):
     
     fig, ax = plt.subplots(figsize=(12, 6))
     
+    strat_groups = []
     for strat, group in df.groupby('strategy_id'):
+        group = group.copy()
+        group['nav_pct'] = (group['nav'] / 1000000.0 - 1) * 100
+        latest_pct = group['nav_pct'].iloc[-1] if not group.empty else -999999.0
+        strat_groups.append((latest_pct, strat, group))
+
+    strat_groups.sort(key=lambda x: x[0], reverse=True)
+
+    for latest_pct, strat, group in strat_groups:
         name = STRAT_NAMES.get(strat, strat)
         color = strat_colors.get(strat, '#999999')
         
-        # Calculate percentage return relative to initial capital (1,000,000)
-        group['nav_pct'] = (group['nav'] / 1000000.0 - 1) * 100
-        
         ax.plot(group['date'], group['nav_pct'], color=color, linewidth=2, 
                 linestyle='-', marker='o' if len(group) <= 30 else None, markersize=4,
-                alpha=0.9, label=f"{name} ({group['nav_pct'].iloc[-1]:+.2f}%)")
+                alpha=0.9, label=f"{name} ({latest_pct:+.2f}%)")
                 
     ax.axhline(0, color='gray', linestyle='dashed', linewidth=1)
     ax.set_title('全球多策略沙盒 - 真实净值收益率走势 (True NAV Curve)', fontsize=16)
@@ -344,9 +217,6 @@ def main():
             # Pass the nav records for this specific strategy
             plot_strategy(strat, STRAT_NAMES.get(strat), strategy_trades[strat], out_file, strat_colors[strat], artifact_dir, nav_records=strategy_navs.get(strat, None))
             
-    out_file_all = os.path.join(reports_dir, "pnl_chart_all.png")
-    plot_all(strategy_trades, out_file_all, strat_colors, artifact_dir, all_nav_records=all_nav_records)
-    
     # Plot combined NAV chart
     if all_nav_records:
         out_nav_file = os.path.join(reports_dir, "nav_chart_all.png")

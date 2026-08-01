@@ -1,13 +1,36 @@
 import json
+import logging
 import os
 import threading
 import time
 
-from google import genai
-from openai import OpenAI
+from provider_errors import log_provider_error
 
 
 llm_semaphore = threading.Semaphore(10)
+logger = logging.getLogger(__name__)
+
+
+class _LazyGeminiModule:
+    def Client(self, **kwargs):
+        from google import genai as module
+
+        return module.Client(**kwargs)
+
+    @property
+    def types(self):
+        from google import genai as module
+
+        return module.types
+
+
+genai = _LazyGeminiModule()
+
+
+def OpenAI(**kwargs):
+    from openai import OpenAI as client_type
+
+    return client_type(**kwargs)
 
 
 def _provider_config(config, provider):
@@ -118,7 +141,17 @@ def _call_openai_compatible(
             )
             return json.loads(response.choices[0].message.content)
         except Exception as exc:
-            if attempt + 1 >= max_retries or not _is_transient_error(exc):
+            transient = _is_transient_error(exc)
+            will_retry = attempt + 1 < max_retries and transient
+            log_provider_error(
+                logger,
+                exc,
+                provider=provider,
+                operation="chat_completion",
+                retryable=will_retry,
+                degraded_allowed=True,
+            )
+            if not will_retry:
                 raise
             delay = base_delay * (2 ** attempt)
             print(
@@ -144,7 +177,17 @@ def _call_gemini(client, model, prompt, system_prompt, config, title_context):
             )
             return json.loads(response.text)
         except Exception as exc:
-            if attempt + 1 >= max_retries or not _is_transient_error(exc):
+            transient = _is_transient_error(exc)
+            will_retry = attempt + 1 < max_retries and transient
+            log_provider_error(
+                logger,
+                exc,
+                provider="gemini",
+                operation="generate_content",
+                retryable=will_retry,
+                degraded_allowed=True,
+            )
+            if not will_retry:
                 raise
             delay = base_delay * (2 ** attempt)
             print(
@@ -211,6 +254,14 @@ def _call_llm_with_fallback(
                 return result
         except Exception as exc:
             last_error = exc
+            log_provider_error(
+                logger,
+                exc,
+                provider=provider,
+                operation="scoring_with_fallback",
+                retryable=False,
+                degraded_allowed=index + 1 < len(enabled_order),
+            )
             next_provider = (
                 enabled_order[index + 1]
                 if index + 1 < len(enabled_order)

@@ -67,6 +67,13 @@ v7 成交只能标记为低保证 legacy 证据，不能伪装成已验证原始
   持仓数量、成交价或历史 NAV 恒等式损坏仍会使整次运行失败。
 - 休市、盘前、跨市场尚未开盘或权威 raw open 缺失只会延期对应
   `trade_intents`，不会阻止生成经过数据库反查的正式报告或邮件 artifact。
+- 当 eligible session 就是市场本地当天但尚未到官方开盘时，该意图计入
+  `not_yet_due`，执行器不会调用开盘价接口；开盘后仍缺 raw open 才属于
+  `degraded_pending_prices`。
+- 固定份额加仓只适用于仍在本次候选中的既有持仓：1 份累计回撤达到 -10% 时生成
+  1 笔 `ADD_TRANCHE`，2 份累计回撤达到 -15.5% 时再生成 1 笔，最多 3 份。
+  持有期收益缺失或不可解析时 fail closed；成交后以固定资金份额的调和均价更新成本，
+  并与现金扣减、快照、v8 原始开盘证据在同一事务提交。
 
 ### 红利旧账恢复
 
@@ -169,6 +176,9 @@ journal 正常且生产数据库哈希未变化。live journal 为 `accepted_by_
 `confirmed_received`。`sending` 表示结果不确定；`failed_pre_send` 表示 SMTP
 接受前失败；`rejected_by_smtp` 表示 SMTP 明确拒绝收件人。旧 `delivered` journal
 仅作为防重发兼容记录。完整恢复与核销流程见 [../OPERATIONS.md](../OPERATIONS.md)。
+用户明确确认未收到并单独授权重发后，完整生产重跑必须使用
+`scripts/run_production_full_flow.sh --authorized-resend`；该入口仅放行新的
+recipient/date SMTP 提交，不绕过其余生产闸门。
 
 八阶段顺序、数据库副本准备、production release、scheduler 与恢复步骤见 [../OPERATIONS.md](../OPERATIONS.md)。脚本级用途见 [scripts/README.md](scripts/README.md)。
 
@@ -203,6 +213,12 @@ python3 quant-strategy/scripts/execute_pending_intents.py \
 
 重复运行同一意图不会重复成交。研究候选可超过 10 只，但执行目标只取原始排名
 前 10 只；未成交候选不会出现在“实际持仓”中。
+
+报告总览只保留来自认证 NAV 快照的 `nav_chart_all.png`。旧版
+`pnl_chart_all.png` 直接累计单笔交易收益率，不能表示组合资本收益，已停止生成和
+展示。“本次目标变化
+（尚未成交）”仅展示当前 run 新生成的待买入、待加仓和待卖出意图；所有跨 run
+遗留的 pending 仍保留在“待交割指令”表中，但不会冒充本次变化。
 
 这些是运行产物，不应提交到 Git。
 

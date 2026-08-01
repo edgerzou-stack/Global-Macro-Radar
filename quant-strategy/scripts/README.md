@@ -62,7 +62,7 @@ python3 quant-strategy/scripts/production_release.py \
 | 筛选 | `screen_hot_spot.py`, `screen_global_quant.py`, `us_hk_quant.py` | 热点与七策略筛选 |
 | 账本/NAV | `db_utils.py`, `calc_nav.py`, `check_ledger_sanity.py` | legacy 账本、精确会话 NAV 与检查 |
 | 交割 | `execute_pending_intents.py` | test/backtest 副本按市场精确会话原始开盘价执行到期 intent |
-| 报告 | `plot_pnl.py`, `generate_report.py`, `validate_report_html.py`, `send_unified_email.py` | 图表、HTML/Markdown、数据库一致性闸门和 outbox |
+| 报告 | `plot_pnl.py`, `generate_report.py`, `validate_report_html.py`, `send_unified_email.py`, `repair_stock_name_cache.py` | 图表、HTML/Markdown、数据库一致性闸门、outbox 与可验证名称缓存恢复 |
 | 验收 | `shadow_runner.py` | 隔离 shadow 与只读 live probes |
 | 财报审计 | `audit_hkex_financials.py` | 只读审计 HKEX 官方公告的可用序列与源故障 |
 | 迁移 | `production_release.py`, `migrations/` | v6、v7 trade intents、v8 execution evidence、quarantine、copy/restore 演练 |
@@ -84,6 +84,8 @@ python3 quant-strategy/scripts/production_release.py \
 - 报告阶段生成两份绑定产物：完整审计 HTML 保留全部账本历史、行情来源和证据
   SHA，并由数据库校验器逐项复核；收件人 HTML 只展示报告日期、账户/NAV、
   本次交割、产业事件、当前持仓、策略候选、待交割和每策略最近 10 笔交割。
+  账户台账与认证组合 NAV 曲线位于策略章节之前，便于先看总览再看策略；禁止把
+  单笔交易收益率之和标记为组合回测收益。
   运行 ID、UTC 调试时间、内部表版本、provider 状态和证据哈希不得出现在邮件正文。
   两份文件及各自 SHA-256 同时记录在 prepared manifest 中，SMTP 只消费已锁定的
   收件人 HTML。
@@ -107,6 +109,13 @@ python3 quant-strategy/scripts/production_release.py \
   并同时提供原 run ID、artifact dir、HTML SHA-256 和收件人，将 journal
   审计核销为 `confirmed_received`；该操作不连接 SMTP。旧版本 `delivered` journal
   继续作为防重发终态读取，但不再用于新发送。
+- prepared manifest 必须绑定 `effective_date`，邮件主题以 ` | YYYY-MM-DD` 结尾。
+  不同 run ID 对同一收件人和报告日只允许一次非歧义 live 投递；确有独立授权的
+  例外重发只能显式使用 `--allow-duplicate-effective-date-delivery`，该参数不会
+  绕过同一 run ID 的幂等和 `sending` 歧义保护。
+  完整生产重跑应通过顶层
+  `scripts/run_production_full_flow.sh --authorized-resend` 入口，使 override
+  同时进入 run manifest 和 delivery journal 审计证据。
 - scheduler 默认关闭，持久运行需 `--enable-scheduler`。
 - 成功以 durable run manifest 和 delivery journal 为准，不只看进程退出码。
 - `us_hk_quant.py` 对美股优先读取 SEC Company Facts、对港股优先读取 HKEX 官方业绩公告 PDF；Yahoo 仅作为当日非 PIT 备用源。季度型使用最近5期报表（4期用于验证3次连续营收/利润双增长，第5期用于最新同比），半年型使用最近3期报表验证2次连续双增长并计算同比。决策窗口外的历史标准化异常会隔离并保留审计记录；窗口内异常仍然 fail closed。公司缺表、缺字段、缺期、格式不支持或数据过期会被明确过滤。
@@ -143,6 +152,57 @@ PYTHONPATH=quant-strategy/scripts python3 \
 - HKEX PDF 默认保留前10页，同时最多扫描60页寻找正式损益表，仅保留命中页及相邻页，
   避免整份 PDF 文本常驻内存；活动股票 stockId 映射会在进程内复用，公告搜索达到文档预算
   后提前结束。
+- HKEX 结果公告使用独立的版本化文档缓存：成功解析保留30天，确定性解析失败
+  保留7天；URL、公告身份、PDF SHA-256、解析器版本和缓存记录 SHA-256 必须
+  一致。网络/下载失败不缓存，缓存损坏或解析器升级会强制重新获取。
+- 可选报告 LLM 点评使用内容寻址缓存，身份同时绑定输入 payload SHA-256、
+  prompt 版本、provider 和 model，记录本身另有 SHA-256 完整性校验并以原子写入
+  保存30天。输入、prompt、模型变化，记录损坏或 TTL 到期都会重新调用；缓存不可用
+  只影响展示增强，不改变筛选、行情、账本或交割。
+- 报告点评的 provider DTO、prompt、重试/退避、provider 身份和缓存策略集中在
+  `report_review_service.py`；`generate_report.py` 只把返回的结构化点评转成经过
+  HTML escaping 的展示内容。内部策略字段不会因 renderer 增加字段而自动外发。
+- durable run manifest 的 `telemetry` 汇总每个命令/阶段耗时和
+  `hkex_document_cache`、`a_share_close_pair_cache`、`deep_dive_cache`、
+  `report_review_cache` 命中指标；`outcome` 明确区分正常完成与降级完成，
+  `status=completed` 保留为恢复/幂等兼容字段。成功和失败 manifest 都保留可用的
+  pre-run backup 路径与 SHA-256。
+- manifest 的 `stage_inputs` 只记录已知输入产物的路径、大小、SHA-256 和 JSON
+  顶层形状，并为筛选、热点和 prepared manifest 记录版本化语义摘要（策略数、
+  候选数、新闻数和状态），用于解释 A/B 性能与输入漂移；不复制新闻、候选、持仓
+  或账户正文。
+- 缓存遥测同时记录命中次数、`saved_external_calls` 和 parser/policy/prompt 版本。
+  至少积累10个可比 completed manifest 后，runner 才建立 phase p50/p95 基线；
+  样本不足明确为 warming-up，超过有界相对及绝对阈值才生成 performance alert。
+- 报告数据库读取统一经过 `report_repository.py` 的 SQLite `mode=ro`、
+  `query_only=ON` 入口。portfolio、trade history、daily results、账户、NAV/交割状态
+  与执行计数、pending/filled intents、v8 evidence 和 legacy link 在一个读事务中
+  冻结成 snapshot；renderer 只能修改 daily-results 独立副本。SHA-256、eligible
+  session、raw open、SELL_ALL/history 精确关联全部在 repository 暴露快照前 fail closed。
+- Markdown 与 HTML 报告统一消费不可变 `ReportViewModel` 和同一章节声明；完整文档
+  golden 会同时验证热点新闻、运行身份和成交证据，防止邮件编排改动只让一种输出丢段。
+- 股票名称缓存禁止 `symbol -> symbol` 自映射。报告持仓、pending、filled、legacy
+  与 unified 路径必须统一走 `display_stock_name()`；没有可信名称时显示
+  “名称待同步”，不得让代码同时充当名称。可从已完成且哈希绑定的历史收件人报告
+  恢复本地缓存，默认仅预览：
+
+```bash
+PYTHONPATH=quant-strategy/scripts python3 \
+  quant-strategy/scripts/repair_stock_name_cache.py \
+  /absolute/path/to/completed-run/run-manifest.json
+```
+
+  人工核对 dry-run 后才可增加 `--apply`。该工具只更新
+  `quant-strategy/ticker_names.json`，不会写数据库；manifest、delivery journal、
+  run identity、report path 或 HTML SHA-256 任一不一致都会 fail closed。
+- `core/data_gateway.py` 只保留缓存、fallback 与兼容 API 编排；BaoStock/Sina/
+  YFinance 和 Tencent/Sina exact-session transport 位于
+  `core/market_data_adapters.py`，symbol routing、market contract 与 OHLC/close
+  normalization 分别独立。所有 provider 边界异常使用版本化 error envelope，
+  同时保留既有 breaker、timeout、HFQ 和 fail-closed 语义。
+- BaoStock socket adapter 会把服务端在协议 terminator 之前返回的 EOF
+  (`recv() == b""`) 转为可重试的 provider failure。不得移除该 guard；上游 SDK
+  会在 `CLOSE_WAIT` 上永久空读，造成 NAV 阶段无上限挂死。
 - 账本安全检查会对低于 -35% 的真实已实现亏损告警，但不会仅因为超过经验阈值而判定账本损坏；非有限 PnL、数学上不可能的亏损和非正执行价仍会熔断。
 - v8 成交必须在更新账本的同一事务写入 provider、原始报价 payload 与 SHA-256 证据；
   等价 pending intent 跨 run 保留原 eligible session，缺少 raw open 时只延期，不撤销重建。

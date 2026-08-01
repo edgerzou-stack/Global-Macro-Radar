@@ -16,6 +16,9 @@ SECONDS_IN_A_DAY = 86400
 
 MAX_CACHE_ENTRIES = 1000
 CACHE_SCHEMA_VERSION = 2
+DEEP_DIVE_MISS_SCHEMA_VERSION = 1
+DEEP_DIVE_POLICY_VERSION = "verified-independent-primary-v1"
+DEEP_DIVE_MISS_TTL_SECONDS = 24 * 60 * 60
 
 
 def _canonical_json(value):
@@ -71,6 +74,36 @@ def get_cached_score(entry, expected_cache_key):
         return None
     score_data = entry.get("score_data")
     return score_data if isinstance(score_data, dict) else None
+
+
+def make_deep_dive_miss(reason, *, now=None):
+    return {
+        "schema_version": DEEP_DIVE_MISS_SCHEMA_VERSION,
+        "policy_version": DEEP_DIVE_POLICY_VERSION,
+        "attempted_at": float(time.time() if now is None else now),
+        "reason": str(reason),
+    }
+
+
+def is_fresh_deep_dive_miss(entry, *, now=None):
+    if not isinstance(entry, dict):
+        return False
+    miss = entry.get("deep_dive_miss")
+    if not isinstance(miss, dict):
+        return False
+    if miss.get("schema_version") != DEEP_DIVE_MISS_SCHEMA_VERSION:
+        return False
+    if miss.get("policy_version") != DEEP_DIVE_POLICY_VERSION:
+        return False
+    if not miss.get("reason"):
+        return False
+    try:
+        age = float(time.time() if now is None else now) - float(
+            miss["attempted_at"]
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    return 0 <= age < DEEP_DIVE_MISS_TTL_SECONDS
 
 def load_cache():
     if os.path.exists(CACHE_FILE):

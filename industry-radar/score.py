@@ -1,12 +1,15 @@
 import os
 import json
+import logging
 import math
 import re
 from dotenv import load_dotenv
 from llm_router import _call_llm_with_fallback
 from run_date import logical_date_text
+from provider_errors import log_provider_error
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 SCORING_PROMPT_VERSION = "dual-track-v3-industry-events"
 
@@ -442,6 +445,14 @@ def deduplicate_articles(articles, config):
         res = _call_llm_with_fallback(prompt, config, system_prompt="You are a helpful assistant designed to output JSON.", title_context="dedup_batch")
         groups = res.get("groups", [])
     except Exception as e:
+        log_provider_error(
+            logger,
+            e,
+            provider="configured_llm_chain",
+            operation="deduplicate_articles",
+            retryable=False,
+            degraded_allowed=True,
+        )
         print(f"LLM Deduplication error: {e}. Falling back to returning original articles.", flush=True)
         # Fallback: just pick the best from each local group
         final_list = []
@@ -552,6 +563,14 @@ def deduplicate_articles(articles, config):
                 else:
                     base_article['score_data']['justification'] = " | ".join(justs_to_merge)
             except Exception as e:
+                log_provider_error(
+                    logger,
+                    e,
+                    provider="configured_llm_chain",
+                    operation="synthesize_duplicate_event",
+                    retryable=False,
+                    degraded_allowed=True,
+                )
                 print(f"Synthesis failed: {e}")
                 base_article['score_data']['justification'] = " | ".join(justs_to_merge)
                 

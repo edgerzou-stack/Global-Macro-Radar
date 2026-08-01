@@ -142,12 +142,33 @@ def _quote_snapshot_mode():
         if effective_date:
             from core.market import AShareMarket
 
-            market_session = AShareMarket().get_effective_trading_date()
-            if effective_date != market_session:
+            market = AShareMarket()
+            market_session = market.get_effective_trading_date()
+            try:
+                effective_day = datetime.strptime(
+                    effective_date, "%Y-%m-%d"
+                ).date()
+            except ValueError as error:
+                raise QuoteSnapshotModeError(
+                    f"invalid pipeline effective date: {effective_date!r}"
+                ) from error
+            current_closed_day = (
+                effective_day == market.get_current_time().date()
+                and not market.is_trading_date(effective_day)
+                and market_session == market.get_latest_completed_trading_date()
+            )
+            if effective_date != market_session and not current_closed_day:
                 raise QuoteSnapshotModeError(
                     f"{pipeline_mode} effective date {effective_date} does not match "
                     f"the A-share market session {market_session}; use an offline "
                     "point-in-time fixture for historical screening"
+                )
+            if current_closed_day:
+                logger.info(
+                    "Current A-share closed day %s uses the latest completed "
+                    "live snapshot session %s",
+                    effective_date,
+                    market_session,
                 )
         return "live"
     if pipeline_mode == "offline":
@@ -161,9 +182,13 @@ def _quote_snapshot_mode():
     # Compatibility for standalone historical callers.  Pipeline runs always
     # export PIPELINE_MODE and therefore never enter this implicit branch.
     from core.clock import clock
-    import datetime
+    import datetime as datetime_module
 
-    return "historical" if clock.today() < datetime.date.today() else "live"
+    return (
+        "historical"
+        if clock.today() < datetime_module.date.today()
+        else "live"
+    )
 
 
 def _validate_live_quote_snapshot(frame, codes):

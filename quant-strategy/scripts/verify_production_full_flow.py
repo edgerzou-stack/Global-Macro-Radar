@@ -7,6 +7,14 @@ import hashlib
 import json
 from pathlib import Path
 
+from send_unified_email import (
+    EMAIL_DELIVERY_PROFILE,
+    EMAIL_MIME_SCHEMA_VERSION,
+    MAX_INLINE_IMAGE_BYTES,
+    MAX_INLINE_IMAGE_WIDTH,
+    MAX_LIVE_MESSAGE_BYTES,
+)
+
 
 class FullFlowVerificationError(RuntimeError):
     pass
@@ -46,6 +54,108 @@ def _bound_artifact(run_dir: Path, raw_path, label: str) -> Path:
     if not path.is_file():
         raise FullFlowVerificationError(f"{label} is missing: {path}")
     return path
+
+
+def _verify_delivery_authorization(run_manifest, journal):
+    manifest_value = (
+        run_manifest.get("payload", {})
+        .get("delivery_authorization", {})
+        .get("duplicate_effective_date_override", False)
+    )
+    journal_value = journal.get(
+        "duplicate_effective_date_override",
+        False,
+    )
+    if type(manifest_value) is not bool or type(journal_value) is not bool:
+        raise FullFlowVerificationError(
+            "Duplicate effective-date delivery authorization must be boolean"
+        )
+    if manifest_value != journal_value:
+        raise FullFlowVerificationError(
+            "Run manifest and delivery journal disagree on duplicate "
+            "effective-date authorization"
+        )
+    return manifest_value
+
+
+def _verify_delivery_profile(prepared, journal):
+    if prepared.get("mime_schema_version") != EMAIL_MIME_SCHEMA_VERSION:
+        raise FullFlowVerificationError(
+            "Prepared report does not use the current MIME schema"
+        )
+    if journal.get("mime_schema_version") != EMAIL_MIME_SCHEMA_VERSION:
+        raise FullFlowVerificationError(
+            "Delivery journal does not use the current MIME schema"
+        )
+    if prepared.get("delivery_profile") != EMAIL_DELIVERY_PROFILE:
+        raise FullFlowVerificationError(
+            "Prepared report does not use the mailbox-safe delivery profile"
+        )
+    if journal.get("delivery_profile") != EMAIL_DELIVERY_PROFILE:
+        raise FullFlowVerificationError(
+            "Delivery journal does not use the mailbox-safe delivery profile"
+        )
+
+    message_size = journal.get("message_size_bytes")
+    message_limit = journal.get("message_size_limit_bytes")
+    if (
+        type(message_size) is not int
+        or type(message_limit) is not int
+        or message_size <= 0
+        or message_limit != MAX_LIVE_MESSAGE_BYTES
+        or message_size > message_limit
+    ):
+        raise FullFlowVerificationError(
+            "Delivery journal has invalid mailbox-safe message-size evidence"
+        )
+
+    images = journal.get("inline_images")
+    image_count = journal.get("inline_image_count")
+    if not isinstance(images, list) or image_count != len(images):
+        raise FullFlowVerificationError(
+            "Delivery journal inline-image evidence is inconsistent"
+        )
+    delivered_total = 0
+    source_total = 0
+    for image in images:
+        if not isinstance(image, dict):
+            raise FullFlowVerificationError(
+                "Delivery journal contains invalid inline-image evidence"
+            )
+        delivered_bytes = image.get("delivered_bytes")
+        source_bytes = image.get("source_bytes")
+        delivered_width = image.get("delivered_width")
+        delivered_height = image.get("delivered_height")
+        if (
+            type(delivered_bytes) is not int
+            or type(source_bytes) is not int
+            or type(delivered_width) is not int
+            or type(delivered_height) is not int
+            or delivered_bytes <= 0
+            or delivered_bytes > MAX_INLINE_IMAGE_BYTES
+            or source_bytes <= 0
+            or delivered_width <= 0
+            or delivered_width > MAX_INLINE_IMAGE_WIDTH
+            or delivered_height <= 0
+        ):
+            raise FullFlowVerificationError(
+                "Delivery journal inline image exceeds the safe profile"
+            )
+        delivered_total += delivered_bytes
+        source_total += source_bytes
+    if (
+        journal.get("inline_image_delivered_bytes") != delivered_total
+        or journal.get("inline_image_source_bytes") != source_total
+    ):
+        raise FullFlowVerificationError(
+            "Delivery journal inline-image totals are inconsistent"
+        )
+    return {
+        "delivery_profile": EMAIL_DELIVERY_PROFILE,
+        "mime_schema_version": EMAIL_MIME_SCHEMA_VERSION,
+        "message_size_bytes": message_size,
+        "message_size_limit_bytes": message_limit,
+    }
 
 
 def verify_full_flow(
@@ -113,6 +223,11 @@ def verify_full_flow(
         raise FullFlowVerificationError(
             "Prepared recipient HTML SHA does not match delivery journal"
         )
+    delivery_profile = _verify_delivery_profile(prepared, journal)
+    authorized_resend = _verify_delivery_authorization(
+        run_manifest,
+        journal,
+    )
     if not database_path.is_file():
         raise FullFlowVerificationError(
             f"Production database is missing: {database_path}"
@@ -130,6 +245,8 @@ def verify_full_flow(
         "html_sha256": recipient_sha,
         "audit_report_html": str(audit_html),
         "audit_html_sha256": audit_sha,
+        "duplicate_effective_date_override": authorized_resend,
+        **delivery_profile,
         "note": (
             "accepted_by_smtp confirms SMTP acceptance only; "
             "it does not prove inbox receipt"

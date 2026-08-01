@@ -10,6 +10,7 @@ import cloudscraper
 import feedparser
 from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
+from provider_errors import log_provider_error
 
 
 logger = logging.getLogger(__name__)
@@ -289,6 +290,15 @@ def fetch_rss_feeds(
         except Exception as exc:
             health["status"] = "failed"
             health["error"] = str(exc)
+            log_provider_error(
+                logger,
+                exc,
+                provider=feed_url,
+                operation="rss_fetch_parse",
+                retryable=True,
+                degraded_allowed=True,
+                effective_date=now_utc.date().isoformat(),
+            )
             print(f"  ✗ {feed_url}: {exc}", flush=True)
         health["latency_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
         return local_articles, health

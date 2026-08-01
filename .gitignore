@@ -19,6 +19,8 @@ __pycache__/
 coverage.xml
 test-results/
 .pytest_cache/
+.ai-memory/
+.ai-context/
 
 # Runtime artifacts and isolated database workspaces
 artifacts/
