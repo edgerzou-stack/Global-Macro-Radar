@@ -1,11 +1,11 @@
 {
   "artifact_type": "sanitized-public-export",
-  "candidate_fingerprint": "9fb066689143d2ef20d34e99b88188199194005d2d3da9440c9ba1f91f666513",
+  "candidate_fingerprint": "f4eca47507f642ff463a60eff96439aae9eef66eaf9a5159e00da5f2c38329a3",
   "entries": [
     {
       "destination": ".github/workflows/public-boundary.yml",
-      "sha256": "a595e3c56af8aeabdfcfb35a0bc4b21ee29709b8b5669930834c7887f5333b35",
-      "size": 843,
+      "sha256": "f4ed05afb15b9236116b8da5a05e9aedc4810e6cc6e5456db4ed19528b0f373a",
+      "size": 1833,
       "source": ".github/workflows/public-boundary.yml"
     },
     {
@@ -232,13 +232,13 @@
     },
     {
       "destination": "scripts/verify_public_export.py",
-      "sha256": "f5c40179e37e511db258845f876808f246ecd66c507ac318d1d44bdbc6c38965",
-      "size": 5089,
+      "sha256": "a28787542e0b5fa0a7629de905ec8b0f39bad8efa00875e253a93b01dba82f67",
+      "size": 5277,
       "source": "scripts/verify_public_export.py"
     }
   ],
   "policy_version": "public-export-v2-exact",
   "schema_version": 1,
   "source_dirty": false,
-  "source_revision": "15d9002afb2ff2623a7b45cbdc989d466a9a9a71"
+  "source_revision": "d0959d3f0ebdcfa0fe6cb45dad594042b6951dc3"
 }

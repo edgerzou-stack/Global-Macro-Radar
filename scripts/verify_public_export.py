@@ -10,6 +10,10 @@ import json
 import sys
 from pathlib import Path
 
+# Verification must not mutate the exact candidate it audits.  In particular,
+# importing the sibling boundary module must never add an unmanifested cache.
+sys.dont_write_bytecode = True
+
 from check_public_release_boundary import BoundaryPolicyError, audit_root, load_policy
 
 
