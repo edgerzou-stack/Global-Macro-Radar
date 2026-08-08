@@ -1,6 +1,6 @@
 {
   "artifact_type": "sanitized-public-export",
-  "candidate_fingerprint": "f4eca47507f642ff463a60eff96439aae9eef66eaf9a5159e00da5f2c38329a3",
+  "candidate_fingerprint": "b395c872adbcd7e2de55a4aab0933fad24a1a308e6e663aee776f9da100a4ef9",
   "entries": [
     {
       "destination": ".github/workflows/public-boundary.yml",
@@ -172,8 +172,8 @@
     },
     {
       "destination": "industry-radar/requirements.txt",
-      "sha256": "c6333c0d589d350dbb3f99d84f3ec96bab443950625001a6b5a2a5f8384a6faf",
-      "size": 127,
+      "sha256": "e6336d83ee80f4037cd8b22c909f84023d610b7d7ce0bc9a9ce15f94071784db",
+      "size": 144,
       "source": "industry-radar/requirements.txt"
     },
     {
@@ -240,5 +240,5 @@
   "policy_version": "public-export-v2-exact",
   "schema_version": 1,
   "source_dirty": false,
-  "source_revision": "d0959d3f0ebdcfa0fe6cb45dad594042b6951dc3"
+  "source_revision": "8a07b10ea95630a844b8a1fa64e0f7dcbaa45b96"
 }
