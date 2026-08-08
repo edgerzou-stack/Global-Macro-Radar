@@ -8,6 +8,7 @@ import yaml
 
 from ingest import fetch_rss_feeds
 from main import save_json_atomic, validate_rss_health
+from source_registry import enrich_health, load_source_registry
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -27,6 +28,13 @@ def main():
     articles, health = fetch_rss_feeds(
         feeds, hours_back=hours_back, return_health=True
     )
+    registry = (
+        load_source_registry(config)
+        if config.get("source_registry") is not None
+        or config.get("source_registry_file") is not None
+        else {}
+    )
+    health = enrich_health(health, registry)
     reports_dir = os.environ.get(
         "RADAR_REPORTS_DIR", os.path.join(os.path.dirname(__file__), "reports")
     )
@@ -50,6 +58,29 @@ def main():
             ),
             article_count=len(articles),
             critical_source_groups=config.get("rss_critical_source_groups", []),
+            min_primary_available_sources=int(
+                config.get("output", {}).get(
+                    "rss_min_primary_available_sources", 0
+                )
+            ),
+            min_primary_fresh_entry_share=float(
+                config.get("output", {}).get(
+                    "rss_min_primary_fresh_entry_share_warning", 0.0
+                )
+            ),
+            required_primary_domains=config.get(
+                "rss_required_primary_domains", []
+            ),
+            min_primary_available_per_domain=int(
+                config.get("output", {}).get(
+                    "rss_min_primary_available_per_domain", 0
+                )
+            ),
+            min_primary_current_per_domain=int(
+                config.get("output", {}).get(
+                    "rss_min_primary_current_per_domain", 0
+                )
+            ),
         )
     except (RuntimeError, ValueError) as error:
         logging.error("%s", error)

@@ -11,6 +11,7 @@ from pipeline_health import (
 )
 from pipeline_selection import deduplicate_input_articles
 from run_date import logical_today
+from source_registry import enrich_articles, enrich_health, load_source_registry
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,12 @@ def collect_articles(
     fetch_feeds=fetch_rss_feeds,
 ):
     hours_back = config.get("output", {}).get("hours_back", 48)
+    registry = (
+        load_source_registry(config)
+        if config.get("source_registry") is not None
+        or config.get("source_registry_file") is not None
+        else {}
+    )
     fixture = os.environ.get("RADAR_RSS_FIXTURE")
     if fixture:
         print(
@@ -56,6 +63,8 @@ def collect_articles(
             now=reference_time,
             return_health=True,
         )
+    articles = enrich_articles(articles, registry)
+    health = enrich_health(health, registry)
     save_health(health)
     health_summary = validate_rss_health(
         health,
@@ -99,6 +108,31 @@ def collect_articles(
             config.get("output", {}).get(
                 "rss_max_source_fresh_entry_share",
                 0.5,
+            )
+        ),
+        min_primary_available_sources=int(
+            config.get("output", {}).get(
+                "rss_min_primary_available_sources",
+                0,
+            )
+        ),
+        min_primary_fresh_entry_share=float(
+            config.get("output", {}).get(
+                "rss_min_primary_fresh_entry_share_warning",
+                0.0,
+            )
+        ),
+        required_primary_domains=config.get(
+            "rss_required_primary_domains", []
+        ),
+        min_primary_available_per_domain=int(
+            config.get("output", {}).get(
+                "rss_min_primary_available_per_domain", 0
+            )
+        ),
+        min_primary_current_per_domain=int(
+            config.get("output", {}).get(
+                "rss_min_primary_current_per_domain", 0
             )
         ),
     )

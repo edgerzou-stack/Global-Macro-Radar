@@ -181,12 +181,22 @@ def fetch_rss_feeds(
     return_health=False,
     request_timeout=15,
     max_workers=10,
+    request_attempts=2,
+    retry_delay=0.25,
 ):
     """Fetch recent RSS articles and optionally return per-source health state.
 
     Timestamps are normalized to UTC. Entries without a trustworthy timestamp are
     quarantined rather than being presented as newly published.
     """
+    if type(request_attempts) is not int or request_attempts < 1:
+        raise ValueError("request_attempts must be a positive integer")
+    if (
+        isinstance(retry_delay, bool)
+        or not isinstance(retry_delay, (int, float))
+        or retry_delay < 0
+    ):
+        raise ValueError("retry_delay must be a non-negative number")
     now_utc = _as_utc(now or datetime.now(timezone.utc))
     time_limit = now_utc - timedelta(hours=hours_back)
 
@@ -205,6 +215,7 @@ def fetch_rss_feeds(
             "content_type": "",
             "error": "",
             "latency_ms": 0.0,
+            "attempts": 0,
         }
         try:
             headers = {
@@ -215,11 +226,39 @@ def fetch_rss_feeds(
                 )
             }
             scraper = cloudscraper.create_scraper()
-            response = scraper.get(feed_url, headers=headers, timeout=request_timeout)
-            if hasattr(response, "raise_for_status"):
-                response.raise_for_status()
-            elif getattr(response, "status_code", 200) >= 400:
-                raise RuntimeError(f"HTTP {response.status_code}")
+            response = None
+            for attempt in range(1, request_attempts + 1):
+                health["attempts"] = attempt
+                try:
+                    response = scraper.get(
+                        feed_url,
+                        headers=headers,
+                        timeout=request_timeout,
+                    )
+                    status_code = int(getattr(response, "status_code", 200))
+                    if hasattr(response, "raise_for_status"):
+                        response.raise_for_status()
+                    elif status_code >= 400:
+                        raise RuntimeError(f"HTTP {status_code}")
+                    break
+                except Exception as exc:
+                    status_code = int(
+                        getattr(locals().get("response"), "status_code", 0) or 0
+                    )
+                    retryable = not (400 <= status_code < 500 and status_code != 429)
+                    if attempt >= request_attempts or not retryable:
+                        raise
+                    log_provider_error(
+                        logger,
+                        exc,
+                        provider=feed_url,
+                        operation="rss_fetch_retry",
+                        retryable=True,
+                        degraded_allowed=True,
+                        effective_date=now_utc.date().isoformat(),
+                    )
+                    if retry_delay:
+                        time.sleep(float(retry_delay) * attempt)
             health["content_type"] = _validate_content_type(response)
 
             parsed_feed = feedparser.parse(response.content)
@@ -260,6 +299,7 @@ def fetch_rss_feeds(
                         "summary": _clean_html(raw_summary),
                         "content": _clean_html(content),
                         "source": source_name,
+                        "feed_url": feed_url,
                         "published_at": pub_date.isoformat(),
                     }
                 )

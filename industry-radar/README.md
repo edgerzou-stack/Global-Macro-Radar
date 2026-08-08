@@ -21,7 +21,23 @@ Traffic 分进入报告；公司属于科技行业并不等于该篇文章构成
 
 `source_confidence` 用于记录来源可信度，不会自动给内容分加分。`heuristics.yaml` 中未连接到运行路径的 fatigue 参数不应视为有效规则。当前默认回看窗口由配置决定，不能据此保证所有文章都在 24 小时内。
 
+主新闻列表继续使用配置的 Innovation/Traffic 分数阈值。`Research Watch` 是独立的
+证据成熟度通道，不是“差一点到 8 分”的救援桶：它只接纳具备具体产业事实、但尚处
+工程测试、未来里程碑或 discovery-only 阶段的研究线索，并将
+`research_watch_decision`、证据状态、产业里程碑和生产状态写入文章结果供审计。
+融资消息、政策预告和缺少一手支持的常规二手商业部署不能仅凭分数进入该通道。
+
 ## RSS 可靠性
+
+`source_registry.yaml` 是 RSS 元数据的唯一事实源。每个 feed 必须声明 T0-T3
+证据等级、evidence/discovery/research 通道、权威事件类型和交易证据资格；
+`config.yaml`/`config.example.yaml` 的 `rss_feeds` 必须与注册表严格一一对应，
+否则采集在启动时直接失败。
+
+报告会同时生成 `hotspot_evidence_YYYY-MM-DD.json`。该文件绑定 Markdown
+报告的绝对路径和 SHA-256，仅包含满足确定性 T0 一手证据政策的事件。T1
+公司自述和 T2/T3 媒体或社交线索仍可进入报告，但默认仅供研究；没有合格
+事件时会明确发布 `no_change`，量化热点策略不得据此清仓或换仓。
 
 `ingest.py` 并发拉取配置中的全部 feed，并检查：
 
@@ -30,6 +46,7 @@ Traffic 分进入报告；公司属于科技行业并不等于该篇文章构成
 - healthy source ratio、fresh article count
 - 单一来源的新内容占比与入选新闻来源集中度
 - 命名 critical source groups 的 transport availability 与独立内容时效 SLA
+- `ai`、`semiconductor`、`biotech`、`energy`、`space` 等必需行业域是否各自拥有可用的一手源
 - fixture 中声明的健康统计与真实文章数一致
 
 零条新文章的可达 feed 会标为 degraded，但不会被误报为网络不可用。关键源组可以用
@@ -37,13 +54,18 @@ Traffic 分进入报告；公司属于科技行业并不等于该篇文章构成
 内容时效不达标时整轮停止。源数量和成员以本机 `config.yaml` 为准；确认长期陈旧的
 feed 应由官方一手技术源替换，而不是通过降低 freshness 门槛掩盖。
 
+当前一手目录还包含 NIST、SEC 与 FDA 的官方 RSS。一手源并不因为“官方”就自动
+获得高分：注册表的 `authority_for` 必须与评分事件词表一致，且内容仍需通过产业事件
+和具体事实闸门。跨行业确定性里程碑（量产/出货、监管批准、客户认证、商业部署、
+扩产、临床读出、流片和原型等）由统一规则识别，不再依赖 CPO 专用关键词。
+
 ## LLM 路由与缓存
 
-Provider 顺序由配置决定，只有具备凭证且被启用的 provider 才参与。不是固定的 Gemini → OpenAI → DeepSeek 链。缓存键绑定正文、prompt、模型和评分配置版本，使用原子替换；缓存命中不会重新计费，内容或评分合同改变会自动失效。缓存结果和最终报告仍会再次经过确定性的产业边界闸门，旧的错误高分不能绕过报告准入。
+Provider 顺序由配置决定，只有具备凭证且被启用的 provider 才参与。不是固定的 Gemini → OpenAI → DeepSeek 链。缓存键绑定正文、来源证据元数据、prompt、模型和评分配置版本，使用原子替换；缓存命中不会重新计费，内容、来源等级或评分合同改变会自动失效。缓存结果和最终报告仍会再次经过确定性的产业边界闸门，旧的错误高分不能绕过报告准入。
 
 当前项目策略显式设置 `gemini.enabled: false`，并从 provider 顺序中移除 Gemini；即使本机仍存在 `GEMINI_API_KEY`，也不会创建 Gemini 客户端或发送请求。新闻阶段优先使用 DeepSeek，量化模块使用同一禁用策略。
 
-去重分两层：本地字符串/事件分组和 LLM 高分事件合并。Deep Dive 只在阈值触发且文章中能定位并读取独立一手来源时运行；仅有二手报道、模型返回未出现在原文链接中的 URL 或一手正文不可读时一律跳过。成功结果只复用 verified-primary 证据；失败尝试按 policy 版本负缓存24小时，避免同一文章在短时间内重复执行 403/Jina/一手来源探测，policy 变化或 TTL 到期后自动重试。
+去重分两层：评分前先规范化 URL、去除常见追踪参数并执行标题去重，评分后再按事件合并高分文章。RSS 请求会对瞬时连接错误、429 和 5xx 做有界重试，永久 4xx 与内容类型错误继续快速失败。Deep Dive 只在阈值触发且文章中能定位并读取独立一手来源时运行；仅有二手报道、模型返回未出现在原文链接中的 URL 或一手正文不可读时一律跳过。成功结果只复用 verified-primary 证据；失败尝试按 policy 版本负缓存24小时，避免同一文章在短时间内重复执行 403/Jina/一手来源探测，policy 变化或 TTL 到期后自动重试。
 
 ## 运行
 
@@ -84,6 +106,7 @@ synthetic golden set 只用于结构和边界回归，不能证明现实新闻�
 | `pipeline_ingestion.py` | fixture/live RSS 输入选择、健康闸门与预去重 |
 | `pipeline_health.py` | RSS 与 critical source group 健康合同 |
 | `pipeline_selection.py` | 报告准入、分类、排序和 top-N 限制 |
+| `evidence_policy.py` | 确定性的来源证据、成熟度与 Research Watch 决策 |
 | `pipeline_scoring.py` | 增量缓存、预筛、批量评分与结果数 fail-closed |
 | `pipeline_deep_dive.py` | verified-primary 深挖并行编排及负缓存 |
 | `pipeline_rendering.py` | 无 provider 依赖的 Markdown 报告渲染 |

@@ -3,7 +3,8 @@ import json
 import time
 import hashlib
 import tempfile
-from urllib.parse import urlsplit, urlunsplit
+
+from url_identity import canonicalize_article_url
 
 CACHE_FILE = os.path.abspath(
     os.environ.get(
@@ -15,7 +16,7 @@ CACHE_TTL_DAYS = 30
 SECONDS_IN_A_DAY = 86400
 
 MAX_CACHE_ENTRIES = 1000
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3
 DEEP_DIVE_MISS_SCHEMA_VERSION = 1
 DEEP_DIVE_POLICY_VERSION = "verified-independent-primary-v1"
 DEEP_DIVE_MISS_TTL_SECONDS = 24 * 60 * 60
@@ -26,10 +27,7 @@ def _canonical_json(value):
 
 
 def _canonical_url(url):
-    if not url:
-        return ""
-    parts = urlsplit(str(url).strip())
-    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path, parts.query, ""))
+    return canonicalize_article_url(url)
 
 
 def build_cache_key(article, config, prompt_version, provider, model):
@@ -45,6 +43,15 @@ def build_cache_key(article, config, prompt_version, provider, model):
             "title": article.get("title", ""),
             "summary": article.get("summary", ""),
             "content": article.get("content", ""),
+        },
+        "source_evidence": {
+            "source_id": article.get("source_id"),
+            "source_tier": article.get("source_tier"),
+            "source_lane": article.get("source_lane"),
+            "source_domains": sorted(article.get("source_domains") or []),
+            "authority_for": sorted(article.get("authority_for") or []),
+            "trade_eligible": article.get("trade_eligible"),
+            "requires_corroboration": article.get("requires_corroboration"),
         },
         "prompt_version": str(prompt_version),
         "provider": str(provider),

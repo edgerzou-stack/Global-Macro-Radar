@@ -7,25 +7,16 @@ from dotenv import load_dotenv
 from llm_router import _call_llm_with_fallback
 from run_date import logical_date_text
 from provider_errors import log_provider_error
+from event_contract import (
+    EVENT_TYPES,
+    INDUSTRIAL_EVENT_TYPES,
+    NON_INDUSTRIAL_EVENT_TYPES,
+)
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-SCORING_PROMPT_VERSION = "dual-track-v3-industry-events"
-
-INDUSTRIAL_EVENT_TYPES = {
-    "technical_breakthrough",
-    "product_launch",
-    "capacity_capex",
-    "supply_chain",
-    "industrial_policy",
-    "funding_with_use",
-    "commercial_deployment",
-    "mixed_industrial_market",
-    "other_industrial",
-}
-NON_INDUSTRIAL_EVENT_TYPES = {"market_only", "non_industrial"}
-EVENT_TYPES = INDUSTRIAL_EVENT_TYPES | NON_INDUSTRIAL_EVENT_TYPES
+SCORING_PROMPT_VERSION = "dual-track-v5-evidence-maturity-lanes"
 
 _MARKET_ONLY_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
@@ -293,6 +284,10 @@ def score_article(article, config):
     Article Summary: {article['summary']}
     Published At: {article.get('published_at', 'unknown')}
     Source: {article.get('source', 'unknown')}
+    Source Evidence Metadata: tier={article.get('source_tier', 'unknown')},
+    lane={article.get('source_lane', 'unknown')},
+    domains={article.get('source_domains', [])},
+    authority_for={article.get('authority_for', [])}
 
     {rubric}
     
@@ -360,12 +355,27 @@ def score_article(article, config):
         result["llm_provider"] = llm_meta["provider"]
         result["llm_model"] = llm_meta["model"]
         result["llm_degraded"] = bool(llm_meta.get("degraded", False))
-    result["source_confidence"] = (
-        "trusted" if article.get("source") in config.get("trusted_sources", []) else "standard"
-    )
+    result["source_confidence"] = _source_confidence(article, config)
     result["prompt_version"] = SCORING_PROMPT_VERSION
     _apply_composite_scores(result, weights)
     return apply_industry_relevance_gate(article, result)
+
+
+def _source_confidence(article, config):
+    tier = article.get("source_tier")
+    if tier == "T0":
+        return "authoritative"
+    if tier == "T1":
+        return "primary"
+    if tier == "T2":
+        return "secondary"
+    if tier == "T3":
+        return "research_only"
+    return (
+        "trusted"
+        if article.get("source") in config.get("trusted_sources", [])
+        else "standard"
+    )
 
 def deduplicate_articles(articles, config):
     if len(articles) <= 1:
@@ -674,6 +684,10 @@ def score_articles_batch(articles_batch, config):
             "summary": a["summary"][:300],
             "published_at": a.get("published_at", "unknown"),
             "source": a.get("source", "unknown"),
+            "source_tier": a.get("source_tier", "unknown"),
+            "source_lane": a.get("source_lane", "unknown"),
+            "source_domains": a.get("source_domains", []),
+            "authority_for": a.get("authority_for", []),
         })
         
     prompt = f"""
@@ -755,7 +769,6 @@ def score_articles_batch(articles_batch, config):
     if unknown_ids:
         raise ScoreValidationError(f"unknown ids: {unknown_ids}")
 
-    trusted_sources = config.get("trusted_sources", [])
     llm_meta = result.get("_llm", {})
     validated_items = []
     article_by_id = {a["id"]: a for a in articles_batch}
@@ -767,9 +780,7 @@ def score_articles_batch(articles_batch, config):
         _apply_composite_scores(res_item, weights)
         original_a = article_by_id[article_id]
         res_item = apply_industry_relevance_gate(original_a, res_item)
-        res_item["source_confidence"] = (
-            "trusted" if original_a.get("source") in trusted_sources else "standard"
-        )
+        res_item["source_confidence"] = _source_confidence(original_a, config)
         res_item["prompt_version"] = SCORING_PROMPT_VERSION
         if isinstance(llm_meta, dict) and llm_meta.get("provider") and llm_meta.get("model"):
             res_item["llm_provider"] = llm_meta["provider"]

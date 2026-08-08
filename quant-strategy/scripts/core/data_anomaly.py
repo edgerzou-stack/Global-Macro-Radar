@@ -1,2 +1,0 @@
-class DataAnomalyError(Exception):
-    pass

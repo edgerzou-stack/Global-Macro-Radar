@@ -7,3 +7,4 @@ python-dotenv
 openai
 pandas_market_calendars<4.0.0
 cloudscraper>=1.2.71
+Markdown>=3.9,<4

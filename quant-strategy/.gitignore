@@ -1,4 +1,0 @@
-.cache/
-__pycache__/
-*.json
-!config/dividend_ledger_rebuild_20260719.json
