@@ -75,6 +75,11 @@ def validate_rss_health(
     critical_source_groups=None,
     reference_time=None,
     max_fresh_entry_share=None,
+    min_primary_available_sources=0,
+    min_primary_fresh_entry_share=0.0,
+    required_primary_domains=None,
+    min_primary_available_per_domain=0,
+    min_primary_current_per_domain=0,
 ):
     if not health:
         raise RuntimeError(
@@ -86,6 +91,9 @@ def validate_rss_health(
     }
     if max_fresh_entry_share is not None:
         ratio_settings["max_fresh_entry_share"] = max_fresh_entry_share
+    ratio_settings["min_primary_fresh_entry_share"] = (
+        min_primary_fresh_entry_share
+    )
     for name, value in ratio_settings.items():
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f"{name} must be numeric")
@@ -95,6 +103,9 @@ def validate_rss_health(
         "min_fresh_sources": min_fresh_sources,
         "min_total_fresh_entries": min_total_fresh_entries,
         "min_configured_sources": min_configured_sources,
+        "min_primary_available_sources": min_primary_available_sources,
+        "min_primary_available_per_domain": min_primary_available_per_domain,
+        "min_primary_current_per_domain": min_primary_current_per_domain,
     }
     for name, value in minimum_settings.items():
         if type(value) is not int or value < 0:
@@ -125,12 +136,35 @@ def validate_rss_health(
     )
     failure_ratio = len(failed) / len(health)
     healthy_ratio = len(healthy) / len(health)
+    primary = [
+        item for item in health if item.get("source_tier") in {"T0", "T1"}
+    ]
+    primary_available = [
+        item for item in primary if item.get("status") != "failed"
+    ]
+    primary_fresh_entries = sum(
+        int(item.get("fresh_entries") or 0) for item in primary
+    )
+    primary_fresh_entry_share = (
+        primary_fresh_entries / total_fresh_entries
+        if total_fresh_entries
+        else 0.0
+    )
     reasons = []
     critical_group_summaries = []
     reference_time = aware_utc_timestamp(
         reference_time or datetime.now(timezone.utc),
         "reference_time",
     )
+    required_domains = (
+        [] if required_primary_domains is None else required_primary_domains
+    )
+    if (
+        not isinstance(required_domains, list)
+        or any(not isinstance(domain, str) or not domain.strip() for domain in required_domains)
+        or len(required_domains) != len(set(required_domains))
+    ):
+        raise ValueError("required_primary_domains must contain unique domain names")
 
     if len(health) < min_configured_sources:
         reasons.append(
@@ -156,10 +190,74 @@ def validate_rss_health(
             f"fresh entries {total_fresh_entries} below minimum "
             f"{min_total_fresh_entries}"
         )
+    if len(primary_available) < min_primary_available_sources:
+        reasons.append(
+            f"primary available sources {len(primary_available)} below minimum "
+            f"{min_primary_available_sources}"
+        )
     if article_count is not None and article_count != total_fresh_entries:
         reasons.append(
             f"article count {article_count} does not match source total "
             f"{total_fresh_entries}"
+        )
+
+    cadence_hours = {
+        "daily": 72.0,
+        "weekly": 336.0,
+        "monthly": 1080.0,
+        "irregular": None,
+    }
+    primary_domain_coverage = []
+    for domain in required_domains:
+        domain_sources = [
+            item
+            for item in primary
+            if domain in (item.get("source_domains") or [])
+        ]
+        available_sources = [
+            item for item in domain_sources if item.get("status") != "failed"
+        ]
+        current_sources = []
+        for item in available_sources:
+            newest = item.get("newest_published_at")
+            cadence = item.get("expected_cadence", "irregular")
+            maximum_hours = cadence_hours.get(cadence)
+            if maximum_hours is None:
+                if int(item.get("total_entries") or 0) > 0:
+                    current_sources.append(item)
+                continue
+            if not newest:
+                continue
+            newest_at = aware_utc_timestamp(
+                newest,
+                f"primary domain {domain} newest_published_at",
+            )
+            age = reference_time - newest_at
+            if -timedelta(minutes=5) <= age <= timedelta(hours=maximum_hours):
+                current_sources.append(item)
+        if len(available_sources) < min_primary_available_per_domain:
+            reasons.append(
+                f"primary domain {domain} available sources "
+                f"{len(available_sources)} below minimum "
+                f"{min_primary_available_per_domain}"
+            )
+        if len(current_sources) < min_primary_current_per_domain:
+            reasons.append(
+                f"primary domain {domain} current sources "
+                f"{len(current_sources)} below minimum "
+                f"{min_primary_current_per_domain}"
+            )
+        primary_domain_coverage.append(
+            {
+                "domain": domain,
+                "configured_sources": len(domain_sources),
+                "available_sources": len(available_sources),
+                "current_sources": len(current_sources),
+                "fresh_entries": sum(
+                    int(item.get("fresh_entries") or 0)
+                    for item in domain_sources
+                ),
+            }
         )
 
     groups = [] if critical_source_groups is None else critical_source_groups
@@ -322,5 +420,15 @@ def validate_rss_health(
             max_fresh_entry_share is not None
             and leading_source_share > float(max_fresh_entry_share)
         ),
+        "primary_configured_sources": len(primary),
+        "primary_available_sources": len(primary_available),
+        "primary_fresh_entries": primary_fresh_entries,
+        "primary_fresh_entry_share": primary_fresh_entry_share,
+        "primary_coverage_warning": bool(
+            primary
+            and total_fresh_entries
+            and primary_fresh_entry_share < min_primary_fresh_entry_share
+        ),
         "critical_source_groups": critical_group_summaries,
+        "primary_domain_coverage": primary_domain_coverage,
     }

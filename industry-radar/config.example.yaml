@@ -11,11 +11,18 @@ industries:
     keywords: ["Brain-Computer Interface", "BCI", "Neuralink", "AR", "VR", "Spatial Computing", "脑机接口", "空间计算"]
 importance_criteria: |
   请对这篇科技产业新闻进行“双维打分”（硬核创新 vs 流量舆情）：
-  
+
   维度一：硬核创新分 (Innovation Score，0-10分)
   衡量底层技术、长远商业价值和颠覆性。
-  - 8-10分：核心技术的重大跃进。
-  - 【强制审查】：如果文章没有具体事实，仅为公关文，扣分。
+  - 8-10分：核心技术的重大跃进、已验证的重大工程里程碑或具有明确产业规模的落地。
+    【锚点基准线】：
+    - 10.0分：划时代且已被可靠证据确认的科技突破。
+    - 9.0-9.5分：顶尖底层架构、平台或工程系统的重大已实现迭代。
+    - 8.0-8.9分：已发生的实质技术落地、量产、首批交付、关键试验成功、顶刊可复现突破。
+    - 6.0-7.9分：普通产品升级、早期融资、一般商业部署、尚未完成的计划或试验。
+  - 计划、路线图和“拟进行”的工程动作不得按已经完成的里程碑计分。
+  - 融资规模、公司知名度和信源权威性不能替代技术突破或产业落地事实。
+  - 如果文章没有具体事实，仅为公关文，将创新分压至4分以下。
 
   维度二：流量与舆情分 (Traffic & Hype Score，0-10分)
   衡量消费者狂热度、社交媒体热度、以及对产业链的实际影响。
@@ -29,8 +36,6 @@ trusted_sources:
 
 rss_feeds:
   # 顶级创投内参 & 黑客前沿
-  - "https://www.theinformation.com/feed"  # The Information
-  - "https://hnrss.org/frontpage?points=100" # Hacker News Top 100
   - "https://www.technologyreview.com/feed/" # MIT科技评论
   
   # 综合未来前沿科技 (Singularity, 脑机等)
@@ -38,14 +43,16 @@ rss_feeds:
   - "https://huggingface.co/blog/feed.xml" # Hugging Face Blog
   - "https://blog.google/technology/ai/rss/" # Google AI 官方
   - "https://blogs.nvidia.com/feed/" # NVIDIA 官方技术博客
+  - "https://nvidianews.nvidia.com/releases.xml" # NVIDIA 官方新闻稿
   - "https://www.microsoft.com/en-us/research/feed/" # Microsoft Research
   - "https://aws.amazon.com/blogs/machine-learning/feed/" # AWS Machine Learning
+  - "https://www.marktechpost.com/feed/" # MarkTechPost
   
   # 全球顶级科技媒体 & 产业动态
   - "https://techcrunch.com/category/artificial-intelligence/feed/" # TechCrunch AI
   - "https://techcrunch.com/category/startups/feed/" # TechCrunch Startups
   - "https://techcrunch.com/category/venture/feed/" # TechCrunch VC
-  - "https://feeds.feedburner.com/venturebeat/SpiZ" # VentureBeat (深度关注AI与企服)
+  - "https://venturebeat.com/feed" # VentureBeat (深度关注AI与企服)
   - "https://www.wired.com/feed/rss" # Wired 连线杂志
   - "https://www.theverge.com/rss/index.xml" # The Verge (前沿科技与消费电子)
   - "https://www.tomshardware.com/feeds/all" # Tom's Hardware (硬核半导体与硬件)
@@ -54,27 +61,52 @@ rss_feeds:
   - "https://feeds.arstechnica.com/arstechnica/technology-lab" # Ars Technica
   
   # 医药与生物科技
-  - "https://www.fiercebiotech.com/rss/xml" # Fierce Biotech (全球顶级创新药与生物科技)
   - "https://www.statnews.com/feed/" # STAT News (顶级医疗健康前沿)
+  - "https://www.ema.europa.eu/en/news.xml" # EMA 官方新闻与审批
+  - "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/press-releases/rss.xml" # FDA 官方新闻稿
   
   # 新能源、出行与气候科技
   - "https://electrek.co/feed/" # Electrek (电动车与绿能)
-  - "https://cleantechnica.com/feed/" # CleanTechnica (清洁能源与光伏)
+  - "https://www.eia.gov/rss/todayinenergy.xml" # EIA 官方能源数据与分析
+  - "https://www.nist.gov/news-events/news/rss.xml" # NIST 官方科技与制造新闻
+  - "https://www.sec.gov/news/pressreleases.rss" # SEC 官方新闻稿
   
   # 航空航天与深空探索
-  - "https://spacenews.com/feed/" # SpaceNews (全球顶级商业航天)
   - "https://www.space.com/feeds/all" # Space.com (深空探索)
+  - "https://www.jpl.nasa.gov/feeds/news/" # NASA/JPL 官方新闻
   
   # 中国本土顶级科技商业与AI媒体
   - "https://36kr.com/feed" # 36氪
-  - "https://www.huxiu.com/rss/0.xml" # 虎嗅
-  - "https://www.jiqizhixin.com/rss" # 机器之心 (中国最硬核的AI媒体)
   - "https://www.ifanr.com/feed" # 爱范儿 (科技与生活方式)
+  - "https://www.hkexgroup.com/Global/RSS-Feeds/NewsRelease?sc_lang=en" # HKEX 官方新闻稿
+
+source_registry_file: source_registry.yaml
+
+rss_required_primary_domains: [ai, semiconductor, biotech, energy, space]
 
 # Optional source-family gates. A daily run fails closed when a named critical
 # group loses the configured minimum healthy or fresh sources, even if the
 # aggregate RSS ratios still pass.
 rss_critical_source_groups:
+  - name: "primary-evidence"
+    sources:
+      - "https://openai.com/news/rss.xml"
+      - "https://huggingface.co/blog/feed.xml"
+      - "https://blog.google/technology/ai/rss/"
+      - "https://blogs.nvidia.com/feed/"
+      - "https://nvidianews.nvidia.com/releases.xml"
+      - "https://www.microsoft.com/en-us/research/feed/"
+      - "https://aws.amazon.com/blogs/machine-learning/feed/"
+      - "https://www.ema.europa.eu/en/news.xml"
+      - "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/press-releases/rss.xml"
+      - "https://www.eia.gov/rss/todayinenergy.xml"
+      - "https://www.nist.gov/news-events/news/rss.xml"
+      - "https://www.sec.gov/news/pressreleases.rss"
+      - "https://www.jpl.nasa.gov/feeds/news/"
+      - "https://www.hkexgroup.com/Global/RSS-Feeds/NewsRelease?sc_lang=en"
+    min_available_sources: 7
+    min_current_sources: 0
+    content_max_age_hours: 336
   - name: "frontier-technology"
     sources:
       - "https://www.technologyreview.com/feed/"
@@ -86,15 +118,15 @@ rss_critical_source_groups:
     min_current_sources: 2
     content_max_age_hours: 168
 
-# Gemini is intentionally disabled.  Its key may remain present locally, but
-# the router will neither construct a Gemini client nor send Gemini requests.
+# Public-safe default: every external LLM provider is disabled. Enable exactly
+# the reviewed provider in local config.yaml after configuring its credential.
 llm:
   order: ["deepseek", "openai"]
   providers:
     gemini:
       enabled: false
     deepseek:
-      enabled: true
+      enabled: false
       model: "deepseek-v4-flash"
     openai:
       enabled: false
@@ -112,9 +144,19 @@ output:
   rss_min_configured_sources: 10
   rss_max_source_fresh_entry_share: 0.5
   report_source_concentration_warning_ratio: 0.6
+  rss_min_primary_available_sources: 7
+  rss_min_primary_available_per_domain: 1
+  rss_min_primary_current_per_domain: 0
+  rss_min_primary_fresh_entry_share_warning: 0.10
+  max_selected_per_discovery_source: 2
+  report_min_primary_supported_ratio: 0.70
+
+strategic_hardtech:
+  enabled: true
+  max_items_per_topic: 2
 
 delivery:
-  enabled: true
+  enabled: false
   sender_email: "your_sender@example.com" # 填写你的发送邮箱地址
   recipient_email: "your_recipient@example.com"      # 接收报告的邮箱
   subject: "Global Macro Radar Daily Report"

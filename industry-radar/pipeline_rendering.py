@@ -1,8 +1,16 @@
 import json
 import os
 
+from hotspot_evidence import publish_hotspot_evidence
 from pipeline_selection import select_report_articles
 from run_date import logical_today
+
+
+def _evidence_text(article):
+    tier = str(article.get("source_tier") or "unclassified")
+    state = str(article.get("evidence_state") or "discovery_only")
+    trade = "trade-evidence" if article.get("trade_evidence_eligible") else "research-only"
+    return f"{tier} · {state} · {trade}"
 
 
 def _write_article_block(handle, article):
@@ -19,6 +27,14 @@ def _write_article_block(handle, article):
         f"**来源**: {article['source']} | "
         f"**日期**: {article['published_at'][:10]}\n\n"
     )
+    handle.write(f"**证据等级**: {_evidence_text(article)}\n\n")
+    if article.get("strategic_topic") not in {None, "unrelated"}:
+        handle.write(
+            "**产业里程碑**: "
+            f"{article.get('strategic_topic')} / "
+            f"{article.get('industrial_milestone')} / "
+            f"{article.get('production_state')}\n\n"
+        )
     if score.get("translated_summary"):
         handle.write(f"**摘要**: {score['translated_summary']}\n\n")
     handle.write(f"> **点评**: {score['justification']}\n\n")
@@ -83,7 +99,8 @@ def generate_markdown_report(
             "> **选题覆盖**："
             f"双高 {diagnostics['supernova']} · "
             f"硬核 {diagnostics['hardcore']} · "
-            f"流量 {diagnostics['hype']}"
+            f"流量 {diagnostics['hype']} · "
+            f"战略追踪 {diagnostics['strategic_watch']}"
         )
         if diagnostics["near_hardcore"]:
             handle.write(
@@ -107,10 +124,27 @@ def generate_markdown_report(
                 f"{diagnostics['leading_source_share']:.0%}；"
                 "请结合其他独立信源交叉验证。\n\n"
             )
+        evidence_warning_ratio = float(
+            config.get("output", {}).get(
+                "report_min_primary_supported_ratio",
+                0.7,
+            )
+        )
+        if (
+            diagnostics["selected"]
+            and diagnostics["primary_supported_ratio"] < evidence_warning_ratio
+        ):
+            handle.write(
+                "> ⚠️ **一手证据不足**："
+                f"本期高分事件仅 {diagnostics['primary_supported_ratio']:.0%} "
+                "具备 T0/T1 或已核验官方原文；其余仅作为研究线索，"
+                "不得直接驱动交易。\n\n"
+            )
         if not (
             selection.supernova
             or selection.hardcore
             or selection.hype
+            or selection.strategic_watch
         ):
             handle.write(
                 "今天没有任何新闻达到你设置的超高标准 "
@@ -118,7 +152,6 @@ def generate_markdown_report(
                 "_真正的结构性大机会不会每天都有，"
                 "享受这片刻的宁静吧。_\n"
             )
-            return report_path
 
         if selection.deep_dives:
             handle.write(
@@ -177,6 +210,15 @@ def generate_markdown_report(
                 handle.write(f"{deep_dive['report_content']}\n\n")
                 handle.write("  </div>\n</details>\n\n---\n")
 
+        if selection.strategic_watch:
+            handle.write(
+                "## 🧭 战略硬科技追踪 (Research Watch)\n"
+                "_具体技术里程碑已出现但尚未达到主榜阈值；"
+                "默认仅供研究，不直接驱动热点交易。_\n\n"
+            )
+            for article in selection.strategic_watch:
+                _write_article_block(handle, article)
+
         if selection.supernova:
             handle.write(
                 "## 🌟 顶流硬核 (Supernova)\n"
@@ -201,4 +243,15 @@ def generate_markdown_report(
             )
             for article in selection.hype:
                 _write_article_block(handle, article)
+    evidence_articles = (
+        list(selection.strategic_watch)
+        + list(selection.supernova)
+        + list(selection.hardcore)
+        + list(selection.hype)
+    )
+    publish_hotspot_evidence(
+        report_path,
+        evidence_articles,
+        report_date.isoformat(),
+    )
     return report_path

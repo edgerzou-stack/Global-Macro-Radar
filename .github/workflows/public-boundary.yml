@@ -1,0 +1,25 @@
+name: Public release boundary
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  public-boundary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Reject private, unexpected, symlinked or secret-bearing paths
+        run: >-
+          python3 scripts/check_public_release_boundary.py
+          --root .
+          --policy PUBLIC_EXPORT_POLICY.json
+      - name: Verify copy manifest, file hashes and Python syntax
+        run: python3 scripts/verify_public_export.py --root .
+      - name: Install public Industry Radar dependencies
+        run: python3 -m pip install -r industry-radar/requirements.txt
+      - name: Run offline public import and configuration smoke check
+        run: python3 scripts/smoke_public_radar.py --root .

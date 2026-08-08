@@ -137,7 +137,7 @@ def _call_openai_compatible(
                     {"role": "user", "content": prompt},
                 ],
                 response_format={"type": "json_object"},
-                temperature=0.1,
+                temperature=0.0,
             )
             return json.loads(response.choices[0].message.content)
         except Exception as exc:
@@ -171,7 +171,7 @@ def _call_gemini(client, model, prompt, system_prompt, config, title_context):
                 contents=prompt,
                 config=genai.types.GenerateContentConfig(
                     response_mime_type="application/json",
-                    temperature=0.1,
+                    temperature=0.0,
                     system_instruction=system_prompt,
                 ),
             )
