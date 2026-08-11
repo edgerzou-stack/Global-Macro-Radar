@@ -19,6 +19,10 @@ logger = logging.getLogger(__name__)
 SCORED_ARTICLES_FIXTURE_SCHEMA_VERSION = 1
 
 
+def llm_calls_disabled():
+    return os.environ.get("PIPELINE_DISABLE_LLM") == "1"
+
+
 @dataclass(frozen=True)
 class ScoringResult:
     articles: tuple
@@ -36,7 +40,7 @@ def scoring_cache_config(config):
     }
 
 
-def configured_scoring_identities(config):
+def configured_scoring_identities(config, *, require_credentials=True):
     provider_keys = {
         "gemini": "GEMINI_API_KEY",
         "openai": "OPENAI_API_KEY",
@@ -58,7 +62,9 @@ def configured_scoring_identities(config):
     ):
         settings = providers.get(provider, {})
         enabled = settings.get("enabled", True)
-        if enabled and os.getenv(provider_keys.get(provider, "")):
+        if enabled and (
+            not require_credentials or os.getenv(provider_keys.get(provider, ""))
+        ):
             identities.append(
                 (
                     provider,
@@ -72,8 +78,16 @@ def configured_scoring_identities(config):
 
 
 def validate_scoring_configuration(config):
-    identities = configured_scoring_identities(config)
+    identities = configured_scoring_identities(
+        config,
+        require_credentials=not llm_calls_disabled(),
+    )
     if not identities:
+        if llm_calls_disabled():
+            raise ValueError(
+                "CRITICAL ERROR: No enabled LLM provider identity is configured "
+                "for read-only score-cache lookup while LLM calls are disabled."
+            )
         raise ValueError(
             "CRITICAL ERROR: No enabled LLM provider has a configured API key. "
             "Check llm.order, llm.providers.*.enabled, and the corresponding "
@@ -85,7 +99,10 @@ def validate_scoring_configuration(config):
 def find_cached_article(cache_data, article, config):
     from score import SCORING_PROMPT_VERSION
 
-    for provider, model in configured_scoring_identities(config):
+    for provider, model in configured_scoring_identities(
+        config,
+        require_credentials=not llm_calls_disabled(),
+    ):
         cache_key = build_cache_key(
             article,
             scoring_cache_config(config),
@@ -360,7 +377,13 @@ def score_articles_pipeline(articles, config):
         f"Loaded {len(cache_data)} articles from incremental cache.",
         flush=True,
     )
-    print("Scoring articles using Dual-Track LLM...", flush=True)
+    disabled = llm_calls_disabled()
+    print(
+        "Loading cached Dual-Track scores with all LLM calls disabled..."
+        if disabled
+        else "Scoring articles using Dual-Track LLM...",
+        flush=True,
+    )
     for index, article in enumerate(articles):
         article["id"] = index
         score, cache_key = find_cached_article(
@@ -396,6 +419,30 @@ def score_articles_pipeline(articles, config):
         f"Found {len(new_articles)} new articles to process.",
         flush=True,
     )
+    if disabled:
+        for article in new_articles:
+            score = _rejected_score(
+                article,
+                event_type="unscored",
+                prompt_version=SCORING_PROMPT_VERSION,
+                reason="Unscored because PIPELINE_DISABLE_LLM=1",
+                vague=True,
+            )
+            article["score_data"] = score
+            scored_articles.append(article)
+        runtime = config.setdefault("_runtime", {})
+        runtime["llm_disabled"] = True
+        runtime["llm_disabled_unscored_count"] = len(new_articles)
+        print(
+            "LLM calls are disabled; retained cached scores and marked "
+            f"{len(new_articles)} uncached articles as unscored.",
+            flush=True,
+        )
+        return ScoringResult(
+            articles=tuple(scored_articles),
+            cache_data=cache_data,
+            cache_updates=updates,
+        )
     original_new_count = len(new_articles)
     if new_articles:
         print("--- Phase 0: Local String Deduplication ---", flush=True)

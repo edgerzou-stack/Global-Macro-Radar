@@ -43,13 +43,15 @@ Traffic 分进入报告；公司属于科技行业并不等于该篇文章构成
 
 - HTTP/content-type 和 feed 解析结果
 - UTC aware 发布时间与 freshness
-- healthy source ratio、fresh article count
+- transport/parse availability ratio、fresh source count 与 fresh article count
 - 单一来源的新内容占比与入选新闻来源集中度
 - 命名 critical source groups 的 transport availability 与独立内容时效 SLA
 - `ai`、`semiconductor`、`biotech`、`energy`、`space` 等必需行业域是否各自拥有可用的一手源
 - fixture 中声明的健康统计与真实文章数一致
 
-零条新文章的可达 feed 会标为 degraded，但不会被误报为网络不可用。关键源组可以用
+零条新文章的可达 feed 会标为 degraded/quiet，但仍计入 `available_sources`，不会被
+误报为网络不可用；`healthy_sources` 只保留为更严格的内容窗口诊断，不再承担 transport
+闸门。关键源组可以用
 `content_max_age_hours` 为低频高质量媒体设置明确时效 SLA；聚合健康、可访问源数量或
 内容时效不达标时整轮停止。源数量和成员以本机 `config.yaml` 为准；确认长期陈旧的
 feed 应由官方一手技术源替换，而不是通过降低 freshness 门槛掩盖。
@@ -58,12 +60,24 @@ feed 应由官方一手技术源替换，而不是通过降低 freshness 门槛�
 获得高分：注册表的 `authority_for` 必须与评分事件词表一致，且内容仍需通过产业事件
 和具体事实闸门。跨行业确定性里程碑（量产/出货、监管批准、客户认证、商业部署、
 扩产、临床读出、流片和原型等）由统一规则识别，不再依赖 CPO 专用关键词。
+主榜还会硬性满足 `report_min_primary_supported_ratio`：一手证据供给不足时，移除证据
+最弱的二手条目，而不是用高分掩盖证据缺口；被移除数量仍写入 health artifact 并保持
+降级告警。RSS 正文中明确引用的 HTTP(S) 链接会在清洗 HTML 前保留；只有同一批次确实
+抓到 URL、事件类型和发布时间均匹配的一手原文时，才建立精确佐证。未知链接不会被
+自动升级，也不会凭相似关键词猜测。
 
 ## LLM 路由与缓存
 
 Provider 顺序由配置决定，只有具备凭证且被启用的 provider 才参与。不是固定的 Gemini → OpenAI → DeepSeek 链。缓存键绑定正文、来源证据元数据、prompt、模型和评分配置版本，使用原子替换；缓存命中不会重新计费，内容、来源等级或评分合同改变会自动失效。缓存结果和最终报告仍会再次经过确定性的产业边界闸门，旧的错误高分不能绕过报告准入。
 
 当前项目策略显式设置 `gemini.enabled: false`，并从 provider 顺序中移除 Gemini；即使本机仍存在 `GEMINI_API_KEY`，也不会创建 Gemini 客户端或发送请求。新闻阶段优先使用 DeepSeek，量化模块使用同一禁用策略。
+
+隔离验收设置 `PIPELINE_DISABLE_LLM=1` 时，新闻模块进入严格 cache-only 模式：只复用
+身份和内容哈希均匹配的既有评分；未命中缓存的文章记录为 `unscored`，不进入候选，且
+不得合成替代分数。Deep Dive 和 LLM 去重同样跳过。未评分数量写入
+`radar_selection_health.json` 的 `llm_disabled_unscored_count`，并由全流程 manifest
+升级为 `rss_llm_disabled_unscored_warning`，因此这种受控运行可能安全完成但不能宣称
+fully healthy。
 
 去重分两层：评分前先规范化 URL、去除常见追踪参数并执行标题去重，评分后再按事件合并高分文章。RSS 请求会对瞬时连接错误、429 和 5xx 做有界重试，永久 4xx 与内容类型错误继续快速失败。Deep Dive 只在阈值触发且文章中能定位并读取独立一手来源时运行；仅有二手报道、模型返回未出现在原文链接中的 URL 或一手正文不可读时一律跳过。成功结果只复用 verified-primary 证据；失败尝试按 policy 版本负缓存24小时，避免同一文章在短时间内重复执行 403/Jina/一手来源探测，policy 变化或 TTL 到期后自动重试。
 

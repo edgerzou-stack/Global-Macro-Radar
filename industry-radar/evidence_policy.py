@@ -1,14 +1,269 @@
 """Deterministic evidence and industrial-milestone policy."""
 
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
 import re
+from urllib.parse import urlsplit, urlunsplit
 
 
-EVIDENCE_POLICY_VERSION = "industrial-evidence-v3-research-lanes"
+EVIDENCE_POLICY_VERSION = "industrial-evidence-v4-current-trade-gate"
+
+SAME_BATCH_CORROBORATION_METHOD = "same_batch_event_match_v1"
+EXPLICIT_PRIMARY_URL_METHOD = "same_batch_explicit_primary_url_v1"
+REGISTERED_PRIMARY_URL_METHOD = "registered_explicit_primary_url_v1"
+_EVENT_TOKEN = re.compile(r"[a-z0-9][a-z0-9_-]{2,}", re.IGNORECASE)
+_EVENT_STOPWORDS = {
+    "about",
+    "after",
+    "also",
+    "and",
+    "are",
+    "been",
+    "being",
+    "but",
+    "company",
+    "could",
+    "for",
+    "from",
+    "has",
+    "have",
+    "into",
+    "its",
+    "new",
+    "over",
+    "said",
+    "says",
+    "that",
+    "the",
+    "their",
+    "this",
+    "through",
+    "using",
+    "was",
+    "were",
+    "will",
+    "with",
+}
 
 
 PRIMARY_EVIDENCE_STATES = frozenset(
     {"authoritative_record", "primary_claim", "primary_supported"}
 )
+
+
+def _event_tokens(article):
+    score = article.get("score_data") or {}
+    claims = score.get("industrial_claims") or []
+    text = " ".join(
+        [
+            str(article.get("title") or ""),
+            str(article.get("summary") or ""),
+            *(str(claim) for claim in claims if claim),
+        ]
+    ).lower()
+    return {
+        token
+        for token in _EVENT_TOKEN.findall(text)
+        if token not in _EVENT_STOPWORDS and not token.isdigit()
+    }
+
+
+def _published_datetime(article):
+    value = str(article.get("published_at") or "").strip()
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _canonical_evidence_url(value):
+    try:
+        parsed = urlsplit(str(value or "").strip())
+    except ValueError:
+        return ""
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return ""
+    path = parsed.path.rstrip("/") or "/"
+    return urlunsplit(
+        (parsed.scheme.lower(), parsed.netloc.lower(), path, parsed.query, "")
+    )
+
+
+def _compatible_event(primary, event_type):
+    primary_event_type = (primary.get("score_data") or {}).get("event_type")
+    return (
+        primary_event_type == event_type
+        or "other_industrial" in {primary_event_type, event_type}
+    )
+
+
+def _corroboration(primary, method):
+    return {
+        "method": method,
+        "primary_url": str(primary["link"]),
+        "primary_title": str(primary.get("title") or ""),
+        "primary_source_id": str(
+            primary.get("source_id") or primary.get("source") or ""
+        ),
+        "primary_source_tier": str(primary.get("source_tier") or ""),
+    }
+
+
+def _registered_reference_corroboration(reference):
+    return {
+        "method": REGISTERED_PRIMARY_URL_METHOD,
+        "primary_url": str(reference["url"]),
+        "primary_title": "文章明确引用的已登记官方原文",
+        "primary_source_id": str(reference["source_id"]),
+        "primary_source_tier": str(reference["source_tier"]),
+    }
+
+
+def attach_same_batch_primary_corroboration(articles, *, max_days=3):
+    """Attach only high-confidence, unambiguous same-batch primary evidence.
+
+    Numeric scores do not participate.  An explicit citation to an exact
+    same-batch primary URL is preferred.  Otherwise a secondary article must
+    share the same scored event type, publication window, at least three event
+    tokens, and at least one token unique to the candidate primary source's
+    current batch.  Ties fail closed instead of guessing which official item
+    supports the claim.
+    """
+    primaries = [
+        article
+        for article in articles
+        if article.get("source_tier") in {"T0", "T1"}
+        and article.get("link")
+        and (article.get("score_data") or {}).get("event_type")
+        not in {None, "non_industrial"}
+    ]
+    primaries_by_url = defaultdict(list)
+    for primary in primaries:
+        canonical_url = _canonical_evidence_url(primary.get("link"))
+        if canonical_url:
+            primaries_by_url[canonical_url].append(primary)
+    primary_tokens = {id(article): _event_tokens(article) for article in primaries}
+    source_token_frequency = defaultdict(Counter)
+    for primary in primaries:
+        source_id = str(primary.get("source_id") or primary.get("source") or "")
+        source_token_frequency[source_id].update(primary_tokens[id(primary)])
+
+    for article in articles:
+        article.pop("primary_corroboration", None)
+        if article.get("source_tier") in {"T0", "T1"}:
+            continue
+        score = article.get("score_data") or {}
+        event_type = score.get("event_type")
+        if not event_type or score.get("is_relevant") is not True:
+            continue
+        published = _published_datetime(article)
+        if published is None:
+            continue
+
+        explicit_matches = []
+        for reference_url in article.get("reference_urls") or []:
+            for primary in primaries_by_url.get(
+                _canonical_evidence_url(reference_url), ()
+            ):
+                primary_published = _published_datetime(primary)
+                if primary_published is None or not _compatible_event(
+                    primary, event_type
+                ):
+                    continue
+                if (
+                    abs((published - primary_published).total_seconds())
+                    <= max_days * 86400
+                ):
+                    explicit_matches.append(primary)
+        explicit_matches = list({id(item): item for item in explicit_matches}.values())
+        if len(explicit_matches) == 1:
+            article["primary_corroboration"] = _corroboration(
+                explicit_matches[0], EXPLICIT_PRIMARY_URL_METHOD
+            )
+            continue
+        if explicit_matches:
+            continue
+
+        registered_matches = []
+        for reference in article.get("registered_primary_references") or []:
+            authority_for = set(reference.get("authority_for") or [])
+            if event_type not in authority_for and "other_industrial" not in authority_for:
+                continue
+            if reference.get("source_tier") not in {"T0", "T1"}:
+                continue
+            if not reference.get("url") or not reference.get("source_id"):
+                continue
+            registered_matches.append(reference)
+        registered_matches = {
+            _canonical_evidence_url(item["url"]): item
+            for item in registered_matches
+            if _canonical_evidence_url(item["url"])
+        }
+        if len(registered_matches) == 1:
+            article["primary_corroboration"] = (
+                _registered_reference_corroboration(
+                    next(iter(registered_matches.values()))
+                )
+            )
+            continue
+        if registered_matches:
+            continue
+
+        tokens = _event_tokens(article)
+        if len(tokens) < 3:
+            continue
+
+        matches = []
+        for primary in primaries:
+            if not _compatible_event(primary, event_type):
+                continue
+            primary_published = _published_datetime(primary)
+            if primary_published is None:
+                continue
+            if abs((published - primary_published).total_seconds()) > max_days * 86400:
+                continue
+            candidate_tokens = primary_tokens[id(primary)]
+            shared = tokens & candidate_tokens
+            if len(shared) < 3:
+                continue
+            overlap = len(shared) / min(len(tokens), len(candidate_tokens))
+            if overlap < 0.25:
+                continue
+            source_id = str(
+                primary.get("source_id") or primary.get("source") or ""
+            )
+            distinctive = {
+                token
+                for token in shared
+                if source_token_frequency[source_id][token] == 1
+            }
+            if not distinctive:
+                continue
+            matches.append(
+                (
+                    len(distinctive),
+                    overlap,
+                    len(shared),
+                    str(primary.get("link")),
+                    primary,
+                )
+            )
+        matches.sort(reverse=True, key=lambda item: item[:4])
+        if not matches:
+            continue
+        best = matches[0]
+        if len(matches) > 1 and best[:3] == matches[1][:3]:
+            continue
+        primary = best[4]
+        article["primary_corroboration"] = _corroboration(
+            primary, SAME_BATCH_CORROBORATION_METHOD
+        )
+    return articles
 RESEARCH_WATCH_MILESTONES = frozenset(
     {
         "engineering_test",
@@ -40,6 +295,19 @@ DISCOVERY_WATCH_MILESTONES = frozenset(
         "tapeout",
         "poc",
         "testing",
+    }
+)
+
+# Only milestones that prove an already-occurring commercial or regulatory
+# state may cross the report-to-trading boundary.  Earlier engineering stages
+# remain useful in Research Watch, but must never rotate a portfolio.
+TRADE_TRIGGER_MILESTONES = frozenset(
+    {
+        "shipping",
+        "mass_production",
+        "regulatory_approval",
+        "qualification",
+        "commercial_deployment",
     }
 )
 
@@ -133,7 +401,8 @@ def classify_industrial_milestone(text, *, event_type=None):
         ),
         (
             "regulatory_approval",
-            r"regulator approved|regulatory approval|authorized for commercial use|"
+            r"regulator approved|regulatory approval|granted (?:accelerated )?approval|"
+            r"\b(?:fda|ema) approves?\b|authorized for commercial use|"
             r"获批|批准上市|监管批准|获准商业使用",
         ),
         (
@@ -222,6 +491,34 @@ def classify_industrial_milestone(text, *, event_type=None):
     }
 
 
+def trade_evidence_decision(article):
+    """Return the deterministic decision for crossing into the trade lane."""
+    score = article.get("score_data") or {}
+    event_type = score.get("event_type")
+    tier = article.get("source_tier")
+    configured_trade = article.get("trade_eligible", False)
+    authority_for = set(article.get("authority_for") or [])
+    milestone = article.get("industrial_milestone") or "none"
+    production_state = article.get("production_state") or "none"
+
+    if tier != "T0":
+        return {"eligible": False, "reason": "authoritative_source_required"}
+    if configured_trade is not True:
+        return {"eligible": False, "reason": "source_not_trade_enabled"}
+    if authority_for and event_type not in authority_for:
+        return {"eligible": False, "reason": "source_not_authoritative_for_event"}
+    if production_state != "current":
+        return {"eligible": False, "reason": "current_maturity_required"}
+    if milestone not in TRADE_TRIGGER_MILESTONES:
+        return {"eligible": False, "reason": "milestone_is_research_only"}
+    return {
+        "eligible": True,
+        "reason": "current_authoritative_trade_milestone",
+        "milestone": milestone,
+        "production_state": production_state,
+    }
+
+
 def annotate_article_evidence(article):
     score = article.get("score_data") or {}
     industrial_claims = score.get("industrial_claims") or []
@@ -262,23 +559,33 @@ def annotate_article_evidence(article):
         and deep_dive.get("evidence_mode") == "verified_primary"
         and bool(deep_dive.get("primary_url"))
     )
+    corroboration = article.get("primary_corroboration") or {}
+    has_same_batch_primary = (
+        isinstance(corroboration, dict)
+        and corroboration.get("method")
+        in {
+            SAME_BATCH_CORROBORATION_METHOD,
+            EXPLICIT_PRIMARY_URL_METHOD,
+            REGISTERED_PRIMARY_URL_METHOD,
+        }
+        and corroboration.get("primary_source_tier") in {"T0", "T1"}
+        and bool(corroboration.get("primary_url"))
+        and bool(corroboration.get("primary_title"))
+        and bool(corroboration.get("primary_source_id"))
+    )
     if tier == "T0":
         evidence_state = "authoritative_record"
     elif tier == "T1":
         evidence_state = "primary_claim"
-    elif has_verified_primary:
+    elif has_verified_primary or has_same_batch_primary:
         evidence_state = "primary_supported"
     else:
         evidence_state = "discovery_only"
     article["evidence_state"] = evidence_state
 
-    configured_trade = article.get("trade_eligible", False)
-    authority_for = set(article.get("authority_for") or [])
-    article["trade_evidence_eligible"] = bool(
-        tier == "T0"
-        and configured_trade is True
-        and (not authority_for or event_type in authority_for)
-    )
+    decision = trade_evidence_decision(article)
+    article["trade_evidence_decision"] = decision
+    article["trade_evidence_eligible"] = decision["eligible"]
     return article
 
 

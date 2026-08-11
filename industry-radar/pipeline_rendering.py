@@ -1,9 +1,80 @@
 import json
 import os
+import tempfile
 
 from hotspot_evidence import publish_hotspot_evidence
 from pipeline_selection import select_report_articles
 from run_date import logical_today
+
+
+def _has_primary_evidence_warning(diagnostics, threshold):
+    """Warn only when the rendered main list fails the evidence contract.
+
+    Excluding unsupported high-score candidates is a successful enforcement
+    action, not by itself a degraded outcome.  It remains a warning when every
+    otherwise-eligible candidate was excluded and the main list is empty.
+    """
+    selected = int(diagnostics.get("selected", 0) or 0)
+    ratio = float(diagnostics.get("primary_supported_ratio", 0.0) or 0.0)
+    excluded = int(diagnostics.get("evidence_shortfall_excluded", 0) or 0)
+    return bool((selected and ratio < threshold) or (not selected and excluded))
+
+
+def _write_selection_health(output_dir, report_date, diagnostics, config):
+    threshold = float(
+        config.get("output", {}).get(
+            "report_min_primary_supported_ratio",
+            0.7,
+        )
+    )
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError(
+            "report_min_primary_supported_ratio must be between 0 and 1"
+        )
+    payload = {
+        **diagnostics,
+        "primary_evidence_threshold": threshold,
+        "primary_evidence_warning": _has_primary_evidence_warning(
+            diagnostics, threshold
+        ),
+        "llm_disabled": bool(
+            config.get("_runtime", {}).get("llm_disabled", False)
+        ),
+        "llm_disabled_unscored_count": int(
+            config.get("_runtime", {}).get(
+                "llm_disabled_unscored_count", 0
+            )
+            or 0
+        ),
+        "schema_version": 1,
+        "run_id": os.environ.get("PIPELINE_RUN_ID", "standalone"),
+        "effective_date": report_date.isoformat(),
+        "component": "radar-selection-health",
+    }
+    target = os.path.join(output_dir, "radar_selection_health.json")
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=output_dir,
+            prefix=".radar-selection-health.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = handle.name
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, target)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+    return target
 
 
 def _evidence_text(article):
@@ -28,6 +99,14 @@ def _write_article_block(handle, article):
         f"**日期**: {article['published_at'][:10]}\n\n"
     )
     handle.write(f"**证据等级**: {_evidence_text(article)}\n\n")
+    corroboration = article.get("primary_corroboration") or {}
+    if article.get("evidence_state") == "primary_supported" and isinstance(
+        corroboration, dict
+    ):
+        primary_url = str(corroboration.get("primary_url") or "")
+        primary_title = str(corroboration.get("primary_title") or "一手原文")
+        if primary_url:
+            handle.write(f"**一手佐证**: [{primary_title}]({primary_url})\n\n")
     if article.get("strategic_topic") not in {None, "unrelated"}:
         handle.write(
             "**产业里程碑**: "
@@ -90,6 +169,7 @@ def generate_markdown_report(
         + json.dumps(diagnostics, ensure_ascii=False, sort_keys=True),
         flush=True,
     )
+    _write_selection_health(output_dir, report_date, diagnostics, config)
     with open(report_path, "w", encoding="utf-8") as handle:
         handle.write(
             "# 科技产业情报雷达 - Daily Report "
@@ -130,14 +210,16 @@ def generate_markdown_report(
                 0.7,
             )
         )
-        if (
-            diagnostics["selected"]
-            and diagnostics["primary_supported_ratio"] < evidence_warning_ratio
-        ):
+        evidence_shortfall_excluded = int(
+            diagnostics.get("evidence_shortfall_excluded", 0) or 0
+        )
+        if _has_primary_evidence_warning(diagnostics, evidence_warning_ratio):
             handle.write(
                 "> ⚠️ **一手证据不足**："
                 f"本期高分事件仅 {diagnostics['primary_supported_ratio']:.0%} "
-                "具备 T0/T1 或已核验官方原文；其余仅作为研究线索，"
+                "具备 T0/T1 或已核验官方原文；"
+                f"{evidence_shortfall_excluded} 条高分二手线索未进入主榜；"
+                "其余仅作为研究线索，"
                 "不得直接驱动交易。\n\n"
             )
         if not (
@@ -213,8 +295,9 @@ def generate_markdown_report(
         if selection.strategic_watch:
             handle.write(
                 "## 🧭 战略硬科技追踪 (Research Watch)\n"
-                "_具体技术里程碑已出现但尚未达到主榜阈值；"
-                "默认仅供研究，不直接驱动热点交易。_\n\n"
+                "_包括尚未达到主榜阈值的技术里程碑，以及因缺少同事件"
+                "一手佐证而退出主榜的高分二手线索；默认仅供研究，"
+                "不直接驱动热点交易。_\n\n"
             )
             for article in selection.strategic_watch:
                 _write_article_block(handle, article)

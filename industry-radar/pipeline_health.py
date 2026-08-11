@@ -67,7 +67,8 @@ def validate_rss_health(
     health,
     max_failure_ratio=0.5,
     *,
-    min_healthy_ratio=0.0,
+    min_available_ratio=0.0,
+    min_healthy_ratio=None,
     min_fresh_sources=1,
     min_total_fresh_entries=1,
     min_configured_sources=1,
@@ -85,9 +86,19 @@ def validate_rss_health(
         raise RuntimeError(
             "RSS health check failed: no sources were configured"
         )
+    if min_healthy_ratio is not None:
+        if min_available_ratio != 0.0:
+            raise ValueError(
+                "min_healthy_ratio and min_available_ratio cannot both be set"
+            )
+        # Backward-compatible migration: the former gate accidentally mixed
+        # source reachability with publication freshness. Interpret it as the
+        # availability ratio; fresh-source and fresh-entry gates remain
+        # independent.
+        min_available_ratio = min_healthy_ratio
     ratio_settings = {
         "max_failure_ratio": max_failure_ratio,
-        "min_healthy_ratio": min_healthy_ratio,
+        "min_available_ratio": min_available_ratio,
     }
     if max_fresh_entry_share is not None:
         ratio_settings["max_fresh_entry_share"] = max_fresh_entry_share
@@ -112,12 +123,36 @@ def validate_rss_health(
             raise ValueError(f"{name} must be a non-negative integer")
 
     failed = [item for item in health if item.get("status") == "failed"]
+    degraded = [item for item in health if item.get("status") == "degraded"]
     healthy = [item for item in health if item.get("status") == "healthy"]
+    available = [
+        item
+        for item in health
+        if item.get("status") != "failed"
+        and int(
+            item.get("total_entries")
+            if item.get("total_entries") is not None
+            else item.get("fresh_entries")
+            or 0
+        )
+        > 0
+    ]
     fresh = [
         item
         for item in health
         if item.get("status") != "failed"
         and int(item.get("fresh_entries") or 0) > 0
+    ]
+    quiet = [
+        item
+        for item in available
+        if int(item.get("fresh_entries") or 0) == 0
+    ]
+    parse_degraded = [
+        item
+        for item in degraded
+        if bool(item.get("bozo"))
+        or int(item.get("quarantined_entries") or 0) > 0
     ]
     total_fresh_entries = sum(
         int(item.get("fresh_entries") or 0) for item in health
@@ -136,11 +171,15 @@ def validate_rss_health(
     )
     failure_ratio = len(failed) / len(health)
     healthy_ratio = len(healthy) / len(health)
+    available_ratio = len(available) / len(health)
     primary = [
         item for item in health if item.get("source_tier") in {"T0", "T1"}
     ]
     primary_available = [
         item for item in primary if item.get("status") != "failed"
+    ]
+    primary_failed = [
+        item for item in primary if item.get("status") == "failed"
     ]
     primary_fresh_entries = sum(
         int(item.get("fresh_entries") or 0) for item in primary
@@ -176,10 +215,10 @@ def validate_rss_health(
             f"failed sources {len(failed)}/{len(health)} exceed "
             f"{max_failure_ratio:.0%}"
         )
-    if healthy_ratio < min_healthy_ratio:
+    if available_ratio < min_available_ratio:
         reasons.append(
-            f"healthy sources {len(healthy)}/{len(health)} below "
-            f"{min_healthy_ratio:.0%}"
+            f"available sources {len(available)}/{len(health)} below "
+            f"{min_available_ratio:.0%}"
         )
     if len(fresh) < min_fresh_sources:
         reasons.append(
@@ -408,10 +447,15 @@ def validate_rss_health(
     return {
         "configured_sources": len(health),
         "failed_sources": len(failed),
+        "available_sources": len(available),
+        "degraded_sources": len(degraded),
+        "quiet_sources": len(quiet),
+        "parse_degraded_sources": len(parse_degraded),
         "healthy_sources": len(healthy),
         "fresh_sources": len(fresh),
         "total_fresh_entries": total_fresh_entries,
         "failure_ratio": failure_ratio,
+        "available_ratio": available_ratio,
         "healthy_ratio": healthy_ratio,
         "leading_fresh_source": str(leading_source.get("url") or ""),
         "leading_fresh_source_entries": leading_source_entries,
@@ -424,11 +468,16 @@ def validate_rss_health(
         "primary_available_sources": len(primary_available),
         "primary_fresh_entries": primary_fresh_entries,
         "primary_fresh_entry_share": primary_fresh_entry_share,
-        "primary_coverage_warning": bool(
+        "primary_article_mix_warning": bool(
             primary
             and total_fresh_entries
             and primary_fresh_entry_share < min_primary_fresh_entry_share
         ),
+        # Source reachability and publication volume are different dimensions.
+        # Keep this compatibility field aligned with actual source coverage;
+        # high-volume T2 feeds must not make reachable T0/T1 feeds look broken.
+        "primary_source_coverage_warning": bool(primary_failed),
+        "primary_coverage_warning": bool(primary_failed),
         "critical_source_groups": critical_group_summaries,
         "primary_domain_coverage": primary_domain_coverage,
     }

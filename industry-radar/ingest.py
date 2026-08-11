@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 
 import cloudscraper
 import feedparser
@@ -65,6 +66,29 @@ def _clean_html(value, separator=" "):
     return BeautifulSoup(str(value), "html.parser").get_text(
         separator=separator, strip=True
     )
+
+
+def _reference_urls(*html_values, limit=20):
+    """Preserve explicit HTTP(S) citations before stripping feed HTML."""
+    references = []
+    seen = set()
+    for value in html_values:
+        if not value:
+            continue
+        for anchor in BeautifulSoup(str(value), "html.parser").find_all(
+            "a", href=True
+        ):
+            href = str(anchor.get("href") or "").strip()
+            parsed = urlsplit(href)
+            if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+                continue
+            if href in seen:
+                continue
+            seen.add(href)
+            references.append(href)
+            if len(references) >= limit:
+                return references
+    return references
 
 
 def _validate_content_type(response):
@@ -292,6 +316,7 @@ def fetch_rss_feeds(
                 )
                 raw_title = _field(entry, "title", "")
                 raw_summary = _field(entry, "summary", "")
+                reference_urls = _reference_urls(raw_summary, content)
                 local_articles.append(
                     {
                         "title": _clean_html(raw_title, separator="") or "No Title",
@@ -301,6 +326,7 @@ def fetch_rss_feeds(
                         "source": source_name,
                         "feed_url": feed_url,
                         "published_at": pub_date.isoformat(),
+                        "reference_urls": reference_urls,
                     }
                 )
 

@@ -2,6 +2,7 @@
 
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -161,6 +162,42 @@ def _metadata(entry):
     }
 
 
+def _normalized_host(value):
+    try:
+        host = (urlsplit(str(value or "")).hostname or "").lower()
+    except ValueError:
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def _registered_primary_references(article, registry):
+    """Classify explicit links to configured T0/T1 domains without guessing."""
+    primary_by_host = {}
+    for entry in registry.values():
+        if entry["tier"] not in {"T0", "T1"}:
+            continue
+        host = _normalized_host(entry["url"])
+        if host:
+            primary_by_host.setdefault(host, []).append(entry)
+
+    references = []
+    for reference_url in article.get("reference_urls") or []:
+        matches = primary_by_host.get(_normalized_host(reference_url), [])
+        # Ambiguous domain ownership fails closed.
+        if len(matches) != 1:
+            continue
+        entry = matches[0]
+        references.append(
+            {
+                "url": str(reference_url),
+                "source_id": entry["id"],
+                "source_tier": entry["tier"],
+                "authority_for": list(entry["authority_for"]),
+            }
+        )
+    return references
+
+
 def enrich_articles(articles, registry):
     enriched = []
     for article in articles:
@@ -172,6 +209,9 @@ def enrich_articles(articles, registry):
             raise SourceRegistryError(
                 f"article {copied.get('title', '<untitled>')!r} lacks a registered feed_url"
             )
+        registered_references = _registered_primary_references(copied, registry)
+        if registered_references:
+            copied["registered_primary_references"] = registered_references
         enriched.append(copied)
     return enriched
 

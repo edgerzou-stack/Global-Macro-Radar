@@ -42,8 +42,10 @@ rss_feeds:
   - "https://openai.com/news/rss.xml" # OpenAI News
   - "https://huggingface.co/blog/feed.xml" # Hugging Face Blog
   - "https://blog.google/technology/ai/rss/" # Google AI 官方
+  - "https://deepmind.google/blog/rss.xml" # Google DeepMind 官方
   - "https://blogs.nvidia.com/feed/" # NVIDIA 官方技术博客
   - "https://nvidianews.nvidia.com/releases.xml" # NVIDIA 官方新闻稿
+  - "https://newsroom.intel.com/feed" # Intel 官方新闻中心
   - "https://www.microsoft.com/en-us/research/feed/" # Microsoft Research
   - "https://aws.amazon.com/blogs/machine-learning/feed/" # AWS Machine Learning
   - "https://www.marktechpost.com/feed/" # MarkTechPost
@@ -76,7 +78,6 @@ rss_feeds:
   - "https://www.jpl.nasa.gov/feeds/news/" # NASA/JPL 官方新闻
   
   # 中国本土顶级科技商业与AI媒体
-  - "https://36kr.com/feed" # 36氪
   - "https://www.ifanr.com/feed" # 爱范儿 (科技与生活方式)
   - "https://www.hkexgroup.com/Global/RSS-Feeds/NewsRelease?sc_lang=en" # HKEX 官方新闻稿
 
@@ -93,8 +94,10 @@ rss_critical_source_groups:
       - "https://openai.com/news/rss.xml"
       - "https://huggingface.co/blog/feed.xml"
       - "https://blog.google/technology/ai/rss/"
+      - "https://deepmind.google/blog/rss.xml"
       - "https://blogs.nvidia.com/feed/"
       - "https://nvidianews.nvidia.com/releases.xml"
+      - "https://newsroom.intel.com/feed"
       - "https://www.microsoft.com/en-us/research/feed/"
       - "https://aws.amazon.com/blogs/machine-learning/feed/"
       - "https://www.ema.europa.eu/en/news.xml"
@@ -138,7 +141,7 @@ output:
   hours_back: 48 # 过去48小时
   model: "deepseek-v4-flash" # 使用 DeepSeek 进行核心推理
   rss_max_failure_ratio: 0.25
-  rss_min_healthy_ratio: 0.5
+  rss_min_available_ratio: 0.5 # 可用性与窗口内新鲜内容分开检查
   rss_min_fresh_sources: 5
   rss_min_total_fresh_entries: 10
   rss_min_configured_sources: 10
@@ -147,9 +150,12 @@ output:
   rss_min_primary_available_sources: 7
   rss_min_primary_available_per_domain: 1
   rss_min_primary_current_per_domain: 0
-  rss_min_primary_fresh_entry_share_warning: 0.10
+  rss_min_primary_fresh_entry_share_warning: 0.10 # 仅诊断原始文章构成，不代表一手源不可用
   max_selected_per_discovery_source: 2
+  max_items_per_section: 10
+  primary_evidence_score_tolerance: 0.75
   report_min_primary_supported_ratio: 0.70
+  enforce_report_primary_supported_ratio: true # 主榜不足70%一手支持时宁可缩短，不以二手稿凑数
 
 strategic_hardtech:
   enabled: true
