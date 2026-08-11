@@ -44,8 +44,11 @@ def main():
         validate_rss_health(
             health,
             float(config.get("output", {}).get("rss_max_failure_ratio", 0.5)),
-            min_healthy_ratio=float(
-                config.get("output", {}).get("rss_min_healthy_ratio", 0.0)
+            min_available_ratio=float(
+                config.get("output", {}).get(
+                    "rss_min_available_ratio",
+                    config.get("output", {}).get("rss_min_healthy_ratio", 0.0),
+                )
             ),
             min_fresh_sources=int(
                 config.get("output", {}).get("rss_min_fresh_sources", 1)

@@ -74,10 +74,10 @@ def collect_articles(
                 0.5,
             )
         ),
-        min_healthy_ratio=float(
+        min_available_ratio=float(
             config.get("output", {}).get(
-                "rss_min_healthy_ratio",
-                0.0,
+                "rss_min_available_ratio",
+                config.get("output", {}).get("rss_min_healthy_ratio", 0.0),
             )
         ),
         min_fresh_sources=int(

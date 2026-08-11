@@ -36,6 +36,19 @@ def _unique_articles(articles):
     return unique
 
 
+def _source_evidence_text(article):
+    """Preserve first-party body text needed to bind an issuer to an event."""
+    parts = []
+    seen = set()
+    for field in ("summary", "content"):
+        value = " ".join(str(article.get(field) or "").split())
+        normalized = value.casefold()
+        if value and normalized not in seen:
+            seen.add(normalized)
+            parts.append(value)
+    return "\n".join(parts)[:20000]
+
+
 def _event(article):
     score = article.get("score_data") or {}
     link = str(article.get("link") or "")
@@ -43,12 +56,16 @@ def _event(article):
         "event_id": hashlib.sha256(link.encode("utf-8")).hexdigest(),
         "title": str(article.get("title") or ""),
         "summary": str(article.get("summary") or article.get("content") or ""),
+        "evidence_text": _source_evidence_text(article),
         "link": link,
         "source": str(article.get("source") or ""),
         "source_id": str(article.get("source_id") or ""),
         "source_tier": str(article.get("source_tier") or ""),
         "evidence_state": str(article.get("evidence_state") or ""),
         "trade_evidence_eligible": True,
+        "trade_evidence_reason": str(
+            (article.get("trade_evidence_decision") or {}).get("reason") or ""
+        ),
         "event_type": str(score.get("event_type") or ""),
         "innovation_score": float(score.get("innovation_score") or 0),
         "traffic_score": float(score.get("traffic_score") or 0),
