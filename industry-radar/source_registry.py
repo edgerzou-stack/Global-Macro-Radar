@@ -108,6 +108,23 @@ def load_source_registry(config):
             raise SourceRegistryError(
                 f"source {source_id!r} requires_corroboration must be boolean"
             )
+        publisher_identity = raw.get("publisher_identity")
+        issuer_identity = raw.get("issuer_identity")
+        if trade_eligible == "conditional":
+            for field, value in (
+                ("publisher_identity", publisher_identity),
+                ("issuer_identity", issuer_identity),
+            ):
+                if not isinstance(value, str) or not value.strip():
+                    raise SourceRegistryError(
+                        f"source {source_id!r} conditional {field} must be a "
+                        "non-empty audited identity"
+                    )
+            _string_list(
+                raw.get("identity_aliases"),
+                "identity_aliases",
+                source_id,
+            )
         cadence = raw.get("expected_cadence")
         if cadence not in EXPECTED_CADENCES:
             raise SourceRegistryError(
@@ -121,6 +138,18 @@ def load_source_registry(config):
             source_id,
             allow_empty=True,
         )
+        if "identity_aliases" in raw:
+            entry["identity_aliases"] = _string_list(
+                raw["identity_aliases"],
+                "identity_aliases",
+                source_id,
+            )
+        if "audited_platform_aliases" in raw:
+            entry["audited_platform_aliases"] = _string_list(
+                raw["audited_platform_aliases"],
+                "audited_platform_aliases",
+                source_id,
+            )
         unknown_authority = set(entry["authority_for"]) - AUTHORITY_TYPES
         if unknown_authority:
             raise SourceRegistryError(
@@ -150,7 +179,7 @@ def load_source_registry(config):
 
 
 def _metadata(entry):
-    return {
+    metadata = {
         "source_id": entry["id"],
         "source_tier": entry["tier"],
         "source_lane": entry["lane"],
@@ -160,6 +189,15 @@ def _metadata(entry):
         "requires_corroboration": entry["requires_corroboration"],
         "expected_cadence": entry["expected_cadence"],
     }
+    for field in ("publisher_identity", "issuer_identity"):
+        value = entry.get(field)
+        if isinstance(value, str) and value.strip():
+            metadata[field] = value.strip()
+    for field in ("identity_aliases", "audited_platform_aliases"):
+        value = entry.get(field)
+        if isinstance(value, list):
+            metadata[field] = list(value)
+    return metadata
 
 
 def _normalized_host(value):

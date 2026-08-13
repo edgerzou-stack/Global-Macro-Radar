@@ -326,15 +326,19 @@ def generate_markdown_report(
             )
             for article in selection.hype:
                 _write_article_block(handle, article)
-    evidence_articles = (
-        list(selection.strategic_watch)
-        + list(selection.supernova)
-        + list(selection.hardcore)
-        + list(selection.hype)
-    )
     publish_hotspot_evidence(
         report_path,
-        evidence_articles,
+        selection.evidence_selection,
         report_date.isoformat(),
+        eligible_input_articles=selection.evidence_input,
+        report_selected_count=sum(
+            len(section)
+            for section in (
+                selection.supernova,
+                selection.hardcore,
+                selection.hype,
+                selection.strategic_watch,
+            )
+        ),
     )
     return report_path

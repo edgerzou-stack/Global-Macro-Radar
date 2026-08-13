@@ -19,6 +19,8 @@ class ReportSelection:
     hype: tuple
     strategic_watch: tuple
     deep_dives: tuple
+    evidence_input: tuple
+    evidence_selection: tuple
     diagnostics: dict
 
 
@@ -78,6 +80,45 @@ def _stable_rank_key(article, score_key, *, supported_first=False):
         canonicalize_article_url(article.get("link") or ""),
         " ".join(str(article.get("title") or "").casefold().split()),
     )
+
+
+def _evidence_preference_key(article):
+    """Prefer the strongest auditable representative of one reported event."""
+    tier_rank = {"T0": 0, "T1": 1, "T2": 2, "T3": 3}
+    score = article.get("score_data") or {}
+    return (
+        -int(article.get("trade_evidence_eligible") is True),
+        tier_rank.get(str(article.get("source_tier") or ""), 9),
+        -max(
+            normalize_score(score.get("innovation_score", 0)),
+            normalize_score(score.get("traffic_score", 0)),
+        ),
+        canonicalize_article_url(article.get("link") or ""),
+    )
+
+
+def _deduplicate_evidence_articles(articles):
+    """Deduplicate the evidence lane without letting commentary erase proof.
+
+    Report presentation may prefer the most readable/highest-scoring article.
+    The machine-readable trade boundary must instead prefer a trade-eligible
+    authoritative record for the same normalized event title.
+    """
+    groups = {}
+    order = []
+    for article in articles:
+        link = canonicalize_article_url(article.get("link") or "")
+        title = " ".join(str(article.get("title") or "").casefold().split())
+        event_type = str((article.get("score_data") or {}).get("event_type") or "")
+        identity = f"title:{event_type}:{title}" if title else f"url:{link}"
+        if identity not in groups:
+            groups[identity] = []
+            order.append(identity)
+        groups[identity].append(article)
+    return [
+        min(groups[identity], key=_evidence_preference_key)
+        for identity in order
+    ]
 
 
 def _bounded_evidence_aware(
@@ -178,16 +219,25 @@ def select_report_articles(
     )
     date_text = report_date.isoformat()
     cutoff = (report_date - timedelta(days=lookback_days)).isoformat()
-    attach_same_batch_primary_corroboration(scored_articles)
     selected = []
     strategic_candidates = []
+    evidence_candidates = []
+    evidence_input_rejections = Counter()
+    report_score_threshold_excluded = 0
+    relevant_articles = []
+    corroboration_articles = []
     for article in scored_articles:
         published = article.get("published_at", "")[:10]
         if published and (published < cutoff or published > date_text):
+            evidence_input_rejections["outside_effective_window"] += 1
             continue
+        corroboration_articles.append(article)
         score = relevance_gate(article, article.get("score_data", {}))
         article["score_data"] = score
         if not score.get("is_relevant"):
+            evidence_input_rejections[
+                str(score.get("industry_policy_rejection") or "not_relevant")
+            ] += 1
             continue
         score = dict(score)
         innovation = normalize_score(score.get("innovation_score", 0))
@@ -195,14 +245,44 @@ def select_report_articles(
         score["innovation_score"] = innovation
         score["traffic_score"] = traffic
         article["score_data"] = score
+        relevant_articles.append(article)
+
+    # Corroboration is resolved only inside the effective window. A low-scored
+    # official record may still support research provenance, while the T1 trade
+    # gate separately requires its T0 corroborator to pass relevance policy.
+    attach_same_batch_primary_corroboration(corroboration_articles)
+    for article in relevant_articles:
+        score = article["score_data"]
+        innovation = score["innovation_score"]
+        traffic = score["traffic_score"]
         annotate_article_evidence(article)
+        # The machine-readable evidence boundary evaluates every relevant,
+        # in-window event. Numeric scores remain a report presentation rule and
+        # can no longer prevent a valid official event from reaching policy.
+        evidence_candidates.append(article)
         if innovation >= minimum or traffic >= minimum:
             selected.append(article)
-        elif strategic_enabled:
-            watch_decision = research_watch_decision(article)
-            article["research_watch_decision"] = watch_decision
-            if watch_decision["eligible"]:
-                strategic_candidates.append(article)
+        else:
+            report_score_threshold_excluded += 1
+            if strategic_enabled:
+                watch_decision = research_watch_decision(article)
+                article["research_watch_decision"] = watch_decision
+                if watch_decision["eligible"]:
+                    strategic_candidates.append(article)
+    evidence_input = tuple(evidence_candidates)
+    evidence_selection = tuple(_deduplicate_evidence_articles(evidence_candidates))
+    evidence_trade_count = sum(
+        article.get("trade_evidence_eligible") is True
+        for article in evidence_selection
+    )
+    evidence_rejection_reasons = Counter(
+        str(
+            (article.get("trade_evidence_decision") or {}).get("reason")
+            or "missing_trade_evidence_decision"
+        )
+        for article in evidence_selection
+        if article.get("trade_evidence_eligible") is not True
+    )
     if selected and deduplicate:
         selected = deduplicator(selected, config)
 
@@ -408,9 +488,25 @@ def select_report_articles(
         hype=tuple(hype),
         strategic_watch=tuple(strategic_watch),
         deep_dives=tuple(deep_dives),
+        evidence_input=evidence_input,
+        evidence_selection=evidence_selection,
         diagnostics={
             "selected": selected_count,
             "eligible_selected": len(selected),
+            "scored_input_count": len(scored_articles),
+            "evidence_input_count": len(evidence_input),
+            "evidence_selected": len(evidence_selection),
+            "trade_evidence_eligible": evidence_trade_count,
+            "trade_evidence_rejected": (
+                len(evidence_selection) - evidence_trade_count
+            ),
+            "trade_evidence_rejection_reasons": dict(
+                sorted(evidence_rejection_reasons.items())
+            ),
+            "evidence_input_rejection_reasons": dict(
+                sorted(evidence_input_rejections.items())
+            ),
+            "report_score_threshold_excluded": report_score_threshold_excluded,
             "supernova": len(supernova),
             "hardcore": len(hardcore),
             "hype": len(hype),
