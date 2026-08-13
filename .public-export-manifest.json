@@ -1,6 +1,6 @@
 {
   "artifact_type": "sanitized-public-export",
-  "candidate_fingerprint": "efc323373cdc615a41241c2a1991adf14ddcc61942f82e6a46580ddda57488b9",
+  "candidate_fingerprint": "c3e12c12353e7a394c464808ffc76e088fcfa449d550eed4209dac0d54309d37",
   "entries": [
     {
       "destination": ".github/workflows/public-boundary.yml",
@@ -88,14 +88,14 @@
     },
     {
       "destination": "industry-radar/evidence_policy.py",
-      "sha256": "5484cee3e81d3ecfee35405e5f19c62bd6a266a9ed8552771269d4ad9c29fe3f",
-      "size": 21915,
+      "sha256": "6e68a1193df4d34b3adf6874f914a8e3cbf17d3cc1ecc291c511d6238cdca0d6",
+      "size": 45097,
       "source": "industry-radar/evidence_policy.py"
     },
     {
       "destination": "industry-radar/hotspot_evidence.py",
-      "sha256": "41e56a54bf8eab403fef88c8d06e2190d1a2ef448361f26fe8e52f038ea58b2a",
-      "size": 4434,
+      "sha256": "713c6c90ffaf06d12a5f8816fb5c9683c0b3d9c3a096748650ce6db1d32b97fe",
+      "size": 10043,
       "source": "industry-radar/hotspot_evidence.py"
     },
     {
@@ -148,20 +148,20 @@
     },
     {
       "destination": "industry-radar/pipeline_rendering.py",
-      "sha256": "598cf4510e95368f762d14e1e25321e71d47ec4edffd1f9a13914192483e4015",
-      "size": 12923,
+      "sha256": "1705338e08ab3ca459da70041fd9458396e0a9b4d468e0de683161a25e259b6e",
+      "size": 13080,
       "source": "industry-radar/pipeline_rendering.py"
     },
     {
       "destination": "industry-radar/pipeline_scoring.py",
-      "sha256": "88299fa5194cd7f4e47399c4a664d524eab56554f09b35e74de478224f714ecc",
-      "size": 18803,
+      "sha256": "4a9411173c67b3e3ec66ba93c6fbf2a8bae27030c498254be4de885034c03a13",
+      "size": 19616,
       "source": "industry-radar/pipeline_scoring.py"
     },
     {
       "destination": "industry-radar/pipeline_selection.py",
-      "sha256": "4c39fd9efc951ef0d85d7c65f248cf9e5244a920841b6af51888ec447e066d78",
-      "size": 15787,
+      "sha256": "cf643247f4f518acd50170b85b6c1f237f63504209c92734ae226fbc2073c382",
+      "size": 19952,
       "source": "industry-radar/pipeline_selection.py"
     },
     {
@@ -190,14 +190,14 @@
     },
     {
       "destination": "industry-radar/source_registry.py",
-      "sha256": "a31f96e72a8b99f61689bced427654b00c904841f74fd8290be21234f52a1a02",
-      "size": 8890,
+      "sha256": "4765cfde6b9cc678c94ef413c2964849259d4bf1daa37198324ae1b503050e68",
+      "size": 10470,
       "source": "industry-radar/source_registry.py"
     },
     {
       "destination": "industry-radar/source_registry.yaml",
-      "sha256": "061367bf48978635657fb7a795a1f2dae0550b909cdde0af4f3eb20a832b9feb",
-      "size": 8526,
+      "sha256": "be4a18abb7a1e5b8d68b107415c8014d6baca6fd3066ad008a1a5d476aef408c",
+      "size": 9536,
       "source": "industry-radar/source_registry.yaml"
     },
     {
@@ -239,6 +239,6 @@
   ],
   "policy_version": "public-export-v2-exact",
   "schema_version": 1,
-  "source_dirty": true,
-  "source_revision": "8a07b10ea95630a844b8a1fa64e0f7dcbaa45b96"
+  "source_dirty": false,
+  "source_revision": "958dd99d685d1745f00a07b797cacff82fcb2dfb"
 }

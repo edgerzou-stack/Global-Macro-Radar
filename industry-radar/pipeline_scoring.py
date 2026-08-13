@@ -300,6 +300,17 @@ def load_scored_articles_fixture(path, rss_articles, config):
 
 
 def _local_deduplicate(articles):
+    def evidence_priority(article):
+        """Choose evidence, never fetch order, as a duplicate representative."""
+        tier_rank = {"T0": 0, "T1": 1, "T2": 2, "T3": 3}
+        trade_eligible = article.get("trade_eligible")
+        return (
+            tier_rank.get(str(article.get("source_tier") or ""), 9),
+            0 if article.get("source_lane") == "evidence" else 1,
+            0 if trade_eligible is True else 1 if trade_eligible == "conditional" else 2,
+            str(article.get("link") or ""),
+        )
+
     groups = []
     for article in articles:
         text = article.get(
@@ -329,7 +340,11 @@ def _local_deduplicate(articles):
                 break
         else:
             groups.append([article])
-    return [group[0] for group in groups]
+    # Similar secondary coverage must not erase the official record before the
+    # scoring/evidence pipeline gets a chance to evaluate it.  The ordering is
+    # deterministic so concurrent RSS completion order cannot change the
+    # selected representative.
+    return [min(group, key=evidence_priority) for group in groups]
 
 
 def _rejected_score(
