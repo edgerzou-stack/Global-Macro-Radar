@@ -5,9 +5,16 @@ import threading
 import time
 
 from provider_errors import log_provider_error
+from llm_cost_policy import active_run, resolve_policy
 
 
-llm_semaphore = threading.Semaphore(10)
+try:
+    _max_concurrent = int(os.environ.get("LLM_MAX_CONCURRENT", "3"))
+except ValueError as error:
+    raise ValueError("LLM_MAX_CONCURRENT must be an integer") from error
+if _max_concurrent <= 0:
+    raise ValueError("LLM_MAX_CONCURRENT must be positive")
+llm_semaphore = threading.Semaphore(_max_concurrent)
 logger = logging.getLogger(__name__)
 
 
@@ -209,26 +216,44 @@ def _call_llm_with_fallback(
     Providers are no longer hard-disabled. A provider participates only when it
     is enabled (explicitly or by the presence of its API key) and has a key.
     """
+    policy = resolve_policy(config or {})
+    if not policy.api_enabled:
+        raise RuntimeError(f"LLM APIs are disabled in {policy.mode} mode")
+    controller = active_run(config or {})
     is_heavy = "vc analyst" in system_prompt.lower()
-    clients = {
-        "gemini": get_gemini_client(config),
-        "openai": get_openai_client(config),
-        "deepseek": get_deepseek_client(config),
-    }
     order = (config or {}).get("llm", {}).get(
         "order", ["gemini", "openai", "deepseek"]
     )
-    enabled_order = [provider for provider in order if clients.get(provider)]
+    if policy.mode == "deepseek":
+        order = ["deepseek"]
+    factories = {
+        "gemini": get_gemini_client,
+        "openai": get_openai_client,
+        "deepseek": get_deepseek_client,
+    }
+    clients = {}
+    enabled_order = []
+    for provider in order:
+        factory = factories.get(provider)
+        if factory is None:
+            continue
+        client = factory(config)
+        if client is not None:
+            clients[provider] = client
+            enabled_order.append(provider)
     if not enabled_order:
         raise RuntimeError(
             f"All LLM APIs are disabled or unconfigured for '{title_context}'"
         )
 
     last_error = None
+    preauthorized = controller.consume_router_preauthorization()
     for index, provider in enumerate(enabled_order):
         client = clients[provider]
         model = _model_for(config, provider, is_heavy)
         try:
+            if not (index == 0 and preauthorized):
+                controller.authorize_api_call(provider, title_context or "llm_call")
             with llm_semaphore:
                 if provider == "gemini":
                     result = _call_gemini(

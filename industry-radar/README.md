@@ -68,18 +68,55 @@ feed 应由官方一手技术源替换，而不是通过降低 freshness 门槛�
 
 ## LLM 路由与缓存
 
-Provider 顺序由配置决定，只有具备凭证且被启用的 provider 才参与。不是固定的 Gemini → OpenAI → DeepSeek 链。缓存键绑定正文、来源证据元数据、prompt、模型和评分配置版本，使用原子替换；缓存命中不会重新计费，内容、来源等级或评分合同改变会自动失效。缓存结果和最终报告仍会再次经过确定性的产业边界闸门，旧的错误高分不能绕过报告准入。
+默认模式为 `offline`，不会读取 API key。四种显式模式为：
+
+- `offline`：冻结 fixture 或严格 cache-only，普通回归费用为零；
+- `interactive`：确定性过滤和缓存后，仅把新增疑难文章写入
+  `llm-review-request.json`，供 Gemini/Codex 等文件夹工具审阅，项目不发 API 请求；
+- `unattended`：只对缓存未命中的少量疑难文章使用已启用 provider，并受文章数、
+  API 调用数和每日人民币预算三重限制；
+- `deepseek`：兼容原 DeepSeek 工作流，但只构造 DeepSeek 客户端且仍受相同预算。
+
+Provider 顺序由配置决定，只有具备凭证且被启用的 provider 才参与。评分缓存使用
+provider 无关的语义身份，绑定规范化 URL、正文、发布时间、来源证据、稳定 prompt、
+评分配置及确定性规则哈希；provider/model 只作为审计 provenance。相同身份永久复用，
+不再因 30 天 TTL、容量裁剪或更换 provider 重复计费；正文、prompt、来源或规则变化只
+使对应文章失效。缓存结果和最终报告仍会再次经过确定性的产业边界闸门。
 
 当前项目策略显式设置 `gemini.enabled: false`，并从 provider 顺序中移除 Gemini；即使本机仍存在 `GEMINI_API_KEY`，也不会创建 Gemini 客户端或发送请求。新闻阶段优先使用 DeepSeek，量化模块使用同一禁用策略。
 
-隔离验收设置 `PIPELINE_DISABLE_LLM=1` 时，新闻模块进入严格 cache-only 模式：只复用
+隔离验收设置 `PIPELINE_DISABLE_LLM=1` 时等同强制 `offline`：只复用
 身份和内容哈希均匹配的既有评分；未命中缓存的文章记录为 `unscored`，不进入候选，且
 不得合成替代分数。Deep Dive 和 LLM 去重同样跳过。未评分数量写入
 `radar_selection_health.json` 的 `llm_disabled_unscored_count`，并由全流程 manifest
 升级为 `rss_llm_disabled_unscored_warning`，因此这种受控运行可能安全完成但不能宣称
 fully healthy。
 
-去重分两层：评分前先规范化 URL、去除常见追踪参数并执行标题去重，评分后再按事件合并高分文章。RSS 请求会对瞬时连接错误、429 和 5xx 做有界重试，永久 4xx 与内容类型错误继续快速失败。Deep Dive 只在阈值触发且文章中能定位并读取独立一手来源时运行；仅有二手报道、模型返回未出现在原文链接中的 URL 或一手正文不可读时一律跳过。成功结果只复用 verified-primary 证据；失败尝试按 policy 版本负缓存24小时，避免同一文章在短时间内重复执行 403/Jina/一手来源探测，policy 变化或 TTL 到期后自动重试。
+市场行情、摘要/合集、广告和没有独立产业事实的明确负例先由确定性规则排除；其余新增
+或正文变化的疑难文章直接进入一次详细评分，不再先付费做 LLM pre-filter。报告去重只
+使用确定性 URL/正文相似度，不再隐式调用 LLM 合成。Deep Dive 默认关闭，只有显式设置
+`RADAR_ENABLE_DEEP_DIVE=1` 且本轮存在新 AI 评分文章时才运行，并继续受统一预算约束。
+
+每轮写出 `radar_llm_usage.json`，并把同一份摘要嵌入 selection health 和 run snapshot。
+字段包括 `cache_hit_count`、`cache_miss_count`、`deterministic_count`、
+`ai_review_count`、`api_call_count`、`estimated_cost_cny`、
+`budget_blocked_count` 和 `manual_review_count`。每日预算按北京时间写入带锁账本，
+并发请求不能超支。
+
+交互式审阅分两步，外部 AI 不能直接修改缓存、报告或数据库：
+
+```bash
+RADAR_LLM_MODE=interactive RADAR_CONFIG=/absolute/config.yaml python3 main.py
+python3 import_manual_review.py \
+  --request /run/llm-review-request.json \
+  --response /review/response.json \
+  --output /run/radar_scored_articles.json
+```
+
+导入器严格校验 request hash、文章集合、响应 schema 和 reviewer 身份；输出复用既有
+`RADAR_SCORED_ARTICLES_FIXTURE` 离线渲染契约。付费 `llm_eval` 只能通过
+`run_llm_eval.py` 显式运行，必须同时给出确认 token、最大文章数、最大 API 调用数和
+每日人民币预算；普通 pytest、CI 和 release checks 都不运行它。
 
 ## 运行
 

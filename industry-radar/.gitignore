@@ -18,4 +18,5 @@ parse_pmset.py
 resend_report.py
 config.yaml
 article_cache.json
+article_cache.json.lock
 *.db

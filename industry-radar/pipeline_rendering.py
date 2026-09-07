@@ -46,6 +46,10 @@ def _write_selection_health(output_dir, report_date, diagnostics, config):
             )
             or 0
         ),
+        "llm_cost": dict(config.get("_runtime", {}).get("llm_cost", {})),
+        "llm_review_bundle_path": config.get("_runtime", {}).get(
+            "llm_review_bundle_path"
+        ),
         "schema_version": 1,
         "run_id": os.environ.get("PIPELINE_RUN_ID", "standalone"),
         "effective_date": report_date.isoformat(),
@@ -127,10 +131,8 @@ def generate_markdown_report(
     *,
     deduplicate=True,
 ):
-    from score import (
-        apply_industry_relevance_gate,
-        deduplicate_articles,
-    )
+    from score import apply_industry_relevance_gate
+    from pipeline_scoring import deterministic_deduplicate_articles
 
     output_dir = output_dir or os.environ.get(
         "RADAR_REPORTS_DIR",
@@ -148,7 +150,7 @@ def generate_markdown_report(
             f"Deduplicating {len(items)} high-scoring articles...",
             flush=True,
         )
-        result = deduplicate_articles(items, selection_config)
+        result = deterministic_deduplicate_articles(items, selection_config)
         print(
             f"After deduplication: {len(result)} articles remaining.",
             flush=True,

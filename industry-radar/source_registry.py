@@ -11,7 +11,7 @@ from event_contract import INDUSTRIAL_EVENT_TYPES
 
 SOURCE_TIERS = {"T0", "T1", "T2", "T3"}
 SOURCE_LANES = {"evidence", "discovery", "research"}
-SOURCE_ADAPTERS = {"rss"}
+SOURCE_ADAPTERS = {"rss", "official_newsroom", "official_space_newsroom"}
 TRADE_ELIGIBILITY = {True, False, "conditional"}
 AUTHORITY_TYPES = INDUSTRIAL_EVENT_TYPES
 EXPECTED_CADENCES = {"daily", "weekly", "monthly", "irregular"}
@@ -35,7 +35,7 @@ def _string_list(value, field, source_id, *, allow_empty=False):
 
 
 def load_source_registry(config):
-    """Return registry entries keyed by URL and enforce RSS/metadata alignment."""
+    """Return entries keyed by URL and enforce adapter/metadata alignment."""
     raw_entries = config.get("source_registry")
     registry_file = config.get("source_registry_file")
     if raw_entries is not None and registry_file is not None:
@@ -58,6 +58,8 @@ def load_source_registry(config):
             payload.get("source_registry") if isinstance(payload, dict) else payload
         )
     feeds = config.get("rss_feeds", [])
+    official_newsrooms = config.get("official_newsrooms", [])
+    official_space_newsrooms = config.get("official_space_newsrooms", [])
     if raw_entries is None:
         if feeds:
             raise SourceRegistryError(
@@ -131,6 +133,14 @@ def load_source_registry(config):
                 f"source {source_id!r} has invalid expected_cadence"
             )
         entry = dict(raw)
+        if "official_hosts" in raw:
+            hosts = _string_list(raw["official_hosts"], "official_hosts", source_id)
+            if any(not re.fullmatch(r"[a-z0-9]+(?:[.-][a-z0-9]+)*\.[a-z]{2,}", host)
+                   for host in hosts):
+                raise SourceRegistryError(f"source {source_id!r} has invalid official_hosts")
+            if (urlsplit(url).hostname or "").lower().removeprefix("www.") not in hosts:
+                raise SourceRegistryError(f"source {source_id!r} feed host is not audited")
+            entry["official_hosts"] = hosts
         entry["domains"] = _string_list(raw.get("domains"), "domains", source_id)
         entry["authority_for"] = _string_list(
             raw.get("authority_for", []),
@@ -175,6 +185,54 @@ def load_source_registry(config):
             "source registry alignment failed: "
             f"unregistered={missing}, registry_only={extra}"
         )
+    registered_newsrooms = [
+        url
+        for url, entry in registry.items()
+        if entry["adapter"] == "official_newsroom"
+    ]
+    if not isinstance(official_newsrooms, list) or any(
+        not isinstance(url, str) or not url.strip()
+        for url in official_newsrooms
+    ):
+        raise SourceRegistryError("official_newsrooms must be a list of URLs")
+    if len(official_newsrooms) != len(set(official_newsrooms)):
+        raise SourceRegistryError(
+            "source registry alignment failed: duplicate official_newsrooms"
+        )
+    if set(official_newsrooms) != set(registered_newsrooms):
+        missing = sorted(set(official_newsrooms) - set(registered_newsrooms))
+        extra = sorted(set(registered_newsrooms) - set(official_newsrooms))
+        raise SourceRegistryError(
+            "official newsroom registry alignment failed: "
+            f"unregistered={missing}, registry_only={extra}"
+        )
+    registered_space_newsrooms = [
+        url
+        for url, entry in registry.items()
+        if entry["adapter"] == "official_space_newsroom"
+    ]
+    if not isinstance(official_space_newsrooms, list) or any(
+        not isinstance(url, str) or not url.strip()
+        for url in official_space_newsrooms
+    ):
+        raise SourceRegistryError(
+            "official_space_newsrooms must be a list of URLs"
+        )
+    if len(official_space_newsrooms) != len(set(official_space_newsrooms)):
+        raise SourceRegistryError(
+            "source registry alignment failed: duplicate official_space_newsrooms"
+        )
+    if set(official_space_newsrooms) != set(registered_space_newsrooms):
+        missing = sorted(
+            set(official_space_newsrooms) - set(registered_space_newsrooms)
+        )
+        extra = sorted(
+            set(registered_space_newsrooms) - set(official_space_newsrooms)
+        )
+        raise SourceRegistryError(
+            "official space newsroom registry alignment failed: "
+            f"unregistered={missing}, registry_only={extra}"
+        )
     return registry
 
 
@@ -193,7 +251,7 @@ def _metadata(entry):
         value = entry.get(field)
         if isinstance(value, str) and value.strip():
             metadata[field] = value.strip()
-    for field in ("identity_aliases", "audited_platform_aliases"):
+    for field in ("identity_aliases", "audited_platform_aliases", "official_hosts"):
         value = entry.get(field)
         if isinstance(value, list):
             metadata[field] = list(value)
@@ -240,6 +298,9 @@ def enrich_articles(articles, registry):
     enriched = []
     for article in articles:
         copied = dict(article)
+        # Host authorization comes only from the checked-in registry, never
+        # publisher/feed/fixture fields (including obsolete captured metadata).
+        copied.pop("official_hosts", None)
         url = copied.get("feed_url")
         if url in registry:
             copied.update(_metadata(registry[url]))

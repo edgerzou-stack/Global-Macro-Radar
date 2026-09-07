@@ -28,6 +28,18 @@ def rss_reference_time_utc():
     return datetime.now(timezone.utc)
 
 
+def validate_rss_capture_time(articles, health, reference_time):
+    """Live capture and replay share ingestion's five-minute clock tolerance."""
+    from ingest import MAX_FUTURE_SKEW
+
+    for rows, field in ((articles, "published_at"), (health, "newest_published_at")):
+        for row in rows:
+            if field == "newest_published_at" and row.get(field) is None:
+                continue
+            if aware_utc_timestamp(row.get(field), field) > reference_time + MAX_FUTURE_SKEW:
+                raise ValueError(f"RSS fixture contains post-capture content: {row.get('title', row.get('url'))}")
+
+
 def validate_rss_fixture_effective_date(articles, health, effective_date):
     if not isinstance(effective_date, date):
         raise TypeError("effective_date must be a date")

@@ -31,6 +31,12 @@ from pipeline_scoring import (
     store_article_score,
     validate_scoring_configuration,
 )
+from llm_cost_policy import (
+    resolve_policy,
+    start_run,
+    write_interactive_rss_fixture,
+    write_telemetry,
+)
 from pipeline_selection import is_verified_deep_dive
 from ingest import fetch_rss_feeds, load_rss_fixture
 from run_date import logical_date_text
@@ -144,6 +150,9 @@ def write_run_snapshot(
         ),
         "radar_selection_health.json": selection_path,
     }
+    llm_cost_path = os.path.join(reports_dir, "radar_llm_usage.json")
+    if os.path.isfile(llm_cost_path):
+        artifact_paths["radar_llm_usage.json"] = llm_cost_path
     snapshot = {
         "schema_version": 1,
         "component": "radar-run-snapshot",
@@ -200,9 +209,15 @@ def load_config(config_path=None):
 
 def main():
     print("Starting Dual-Track Industry Intelligence Gatherer...", flush=True)
-    load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env'))
     config = load_config()
+    policy = resolve_policy(config)
+    # Offline regression and interactive folder-AI modes must not even load
+    # project API credentials. API modes retain the reviewed DeepSeek/OpenAI
+    # provider workflow and load secrets only after the mode contract is known.
+    if policy.api_enabled:
+        load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env'))
     reports_dir = os.environ.get("RADAR_REPORTS_DIR", "reports")
+    controller = start_run(config)
     
     print("Fetching articles from RSS feeds...", flush=True)
     ingestion = collect_articles(
@@ -235,6 +250,21 @@ def main():
         )
 
     scored_fixture = os.environ.get("RADAR_SCORED_ARTICLES_FIXTURE")
+    if policy.mode == "interactive" and not scored_fixture:
+        rss_fixture_path = os.environ.get("RADAR_LLM_RSS_FIXTURE") or os.path.join(
+            reports_dir,
+            "llm-review-rss-fixture.json",
+        )
+        sealed = write_interactive_rss_fixture(
+            rss_fixture_path,
+            articles,
+            ingestion.health,
+            reference_time=ingestion.reference_time,
+            run_id=os.environ.get("PIPELINE_RUN_ID"),
+        )
+        config.setdefault("_runtime", {})[
+            "interactive_rss_fixture_path"
+        ] = sealed["path"]
     if scored_fixture:
         print(
             f"Loading deterministic scored-articles fixture: {scored_fixture}",
@@ -242,6 +272,26 @@ def main():
         )
         scored_articles = load_scored_articles_fixture(
             scored_fixture, articles, config
+        )
+        for environment_name, metric_name in (
+            ("RADAR_REUSED_MANUAL_REVIEW_COUNT", "reused_manual_review_count"),
+            ("RADAR_NEW_MANUAL_REVIEW_COUNT", "new_manual_review_count"),
+        ):
+            raw_count = os.environ.get(environment_name, "0")
+            try:
+                count = int(raw_count)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"{environment_name} must be an integer") from error
+            if count < 0 or str(count) != str(raw_count).strip():
+                raise ValueError(f"{environment_name} must be non-negative")
+            if count:
+                controller.increment(metric_name, count)
+                if metric_name == "new_manual_review_count":
+                    controller.increment("manual_review_count", count)
+        write_telemetry(
+            os.path.join(reports_dir, "radar_llm_usage.json"),
+            config,
+            controller,
         )
         report_path = generate_markdown_report(
             scored_articles, config, deduplicate=False
@@ -261,23 +311,58 @@ def main():
     cache_data = scoring.cache_data
     cache_updates = scoring.cache_updates
     
-    if llm_calls_disabled():
+    runtime_cost = config.get("_runtime", {}).get("llm_cost", {})
+    new_reviewed = int(runtime_cost.get("ai_review_count", 0) or 0)
+    deep_dive_enabled = os.environ.get("RADAR_ENABLE_DEEP_DIVE") == "1"
+    if llm_calls_disabled(config):
         print(
-            "PIPELINE_DISABLE_LLM=1: skipping LLM deep-dive enrichment.",
+            "LLM API mode disabled: skipping Deep Dive enrichment.",
             flush=True,
         )
-    else:
+    elif deep_dive_enabled and new_reviewed:
         scored_articles = enrich_deep_dives(
             scored_articles,
             cache_data,
             config,
             cache_updates=cache_updates,
         )
+    else:
+        print(
+            "Skipping implicit Deep Dive: enable RADAR_ENABLE_DEEP_DIVE=1 "
+            "and provide newly AI-reviewed articles to run it.",
+            flush=True,
+        )
+
+    write_telemetry(
+        os.path.join(reports_dir, "radar_llm_usage.json"),
+        config,
+        controller,
+    )
+
+    if policy.mode == "interactive":
+        # The replay phase intentionally rewrites radar_llm_usage.json in
+        # offline mode.  Preserve the prepare counters so the final telemetry
+        # can distinguish verified historical reuse from genuinely new manual
+        # review instead of reporting both as zero.
+        write_telemetry(
+            os.path.join(reports_dir, "radar_llm_usage_prepare.json"),
+            config,
+            controller,
+        )
+        request_path = config.get("_runtime", {}).get("llm_review_bundle_path")
+        print(
+            "Interactive review package prepared; production report generation "
+            f"is paused until the audited response is imported: {request_path}",
+            flush=True,
+        )
+        return request_path
 
     report_path = generate_markdown_report(
         scored_articles,
         config,
-        deduplicate=not llm_calls_disabled(),
+        # Ingestion and scoring already perform deterministic content/URL
+        # deduplication. Report rendering must never trigger an implicit LLM.
+        deduplicate=False,
     )
     write_run_snapshot(
         reports_dir,

@@ -1,11 +1,11 @@
+import hashlib
+import inspect
 import os
 import json
 import logging
 import math
 import re
-from dotenv import load_dotenv
 from llm_router import _call_llm_with_fallback
-from run_date import logical_date_text
 from provider_errors import log_provider_error
 from event_contract import (
     EVENT_TYPES,
@@ -13,10 +13,10 @@ from event_contract import (
     NON_INDUSTRIAL_EVENT_TYPES,
 )
 
-load_dotenv()
 logger = logging.getLogger(__name__)
 
-SCORING_PROMPT_VERSION = "dual-track-v5-evidence-maturity-lanes"
+SCORING_PROMPT_VERSION = "dual-track-v6-stable-content-prompt"
+SCORING_RULE_VERSION = "deterministic-industry-boundary-v2"
 
 _MARKET_ONLY_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
@@ -116,13 +116,46 @@ def apply_industry_relevance_gate(article, score_data):
         rejection = local_route
 
     if rejection:
-        gated["is_relevant"] = False
-        for field in ("tech_score", "commercial_score", "hype_score", "macro_score"):
-            if isinstance(gated.get(field), (int, float)):
-                gated[field] = min(gated[field], 40)
-        for field in ("innovation_score", "traffic_score"):
-            if isinstance(gated.get(field), (int, float)):
-                gated[field] = min(float(gated[field]), 4.0)
+        # Old deterministic cache entries predate the strict score fixture
+        # contract and may contain only the rejection metadata.  A rejected
+        # row is safe to migrate only to one canonical zero-score shape: never
+        # coerce arbitrary numeric values or preserve a composite score that
+        # disagrees with its missing sub-scores.
+        gated.update(
+            {
+                "is_relevant": False,
+                "is_vague_or_roundup": (
+                    gated["is_vague_or_roundup"]
+                    if type(gated.get("is_vague_or_roundup")) is bool
+                    else True
+                ),
+                "event_type": (
+                    gated["event_type"]
+                    if gated.get("event_type") in NON_INDUSTRIAL_EVENT_TYPES
+                    else "non_industrial"
+                ),
+                "industrial_claims": [],
+                "market_only_claims": [
+                    claim.strip()
+                    for claim in gated.get("market_only_claims", [])
+                    if isinstance(claim, str) and claim.strip()
+                ]
+                if isinstance(gated.get("market_only_claims"), list)
+                else [],
+                "barrier_to_entry": "none",
+                "market_size": "none",
+                "immediacy": "none",
+                "reasoning_chain": "Deterministic boundary rejection",
+                "tech_score": 0,
+                "commercial_score": 0,
+                "hype_score": 0,
+                "macro_score": 0,
+                "innovation_score": 0.0,
+                "traffic_score": 0.0,
+                "translated_title": str(article.get("title") or ""),
+                "translated_summary": "",
+            }
+        )
         gated["industry_policy_rejection"] = rejection
         gated["justification"] = (
             "REJECTED: no independently useful industrial event remains after "
@@ -131,15 +164,9 @@ def apply_industry_relevance_gate(article, score_data):
     return gated
 
 
-def _current_date_text():
-    return logical_date_text()
-
-
-def _strict_rubric(config, current_date):
+def _strict_rubric(config):
     language = config.get("output", {}).get("language", "Chinese")
     return f"""
-    Current Date: {current_date}
-
     CRITICAL REJECTION RULES: is_relevant MUST be false for roundups/digests,
     shopping deals or advertisements, re-hashed old news, pure stock-price moves,
     pure theoretical research without a near-term industry application, and vague
@@ -270,8 +297,7 @@ def _apply_composite_scores(result, weights):
 
 def score_article(article, config):
     weights = _validate_weights(config)
-    current_date = _current_date_text()
-    rubric = _strict_rubric(config, current_date)
+    rubric = _strict_rubric(config)
     prompt = f"""
     You are an expert industry analyst and VC. Evaluate this tech news article based on the dual-track criteria.
     
@@ -307,7 +333,9 @@ def score_article(article, config):
        **CRITICAL REJECTION RULES: You MUST set is_relevant to False if the article is:**
        - A news roundup, summary, or digest (e.g., "Top 10 news", "Morning brief", "Weekly digest", "8点1氪", "氪星晚报", "晚报").
        - A shopping deal, discount, or advertisement (e.g., "Prime Day deals", "Black Friday", "Save $50 on...", "优惠精选", "购物指南").
-       - Re-hashed old news or an old event being re-reported as new (e.g., "炒冷饭" - a breakthrough or event that actually happened months or years prior to the Current Date). If you recognize the event as historical relative to the Current Date, YOU MUST REJECT IT by setting is_relevant to False.
+       - Re-hashed old news or an old event whose own dated facts show that it is
+         being presented as new. Publication-window freshness is enforced by the
+         deterministic pipeline and must not be guessed from today's wall clock.
        - Vague, generic, or purely macro-level commentary lacking specific technical details, quantitative data, or concrete innovations (e.g., "market is growing", "competition intensifies", or "many companies are releasing models" without specifying unique technical specs).
        - Pure stock-price, trading-volume, market-cap, index, analyst-rating, or
          fund-flow news without a separate concrete industrial claim.
@@ -388,7 +416,7 @@ def deduplicate_articles(articles, config):
     # Pre-deduplicate using local string matching to save LLM tokens
     local_dedup_groups = [] # list of lists of articles
     for a in sorted_articles:
-        long_text = a.get('content', a.get('summary', ''))
+        long_text = a.get('content') or a.get('summary', '')
         if long_text: long_text = long_text[:800]
         text_to_match = (a.get('title', '') + " " + long_text).lower()
         
@@ -396,7 +424,7 @@ def deduplicate_articles(articles, config):
         for group in local_dedup_groups:
             # Compare against the first article in the group
             rep = group[0]
-            rep_text = rep.get('content', rep.get('summary', ''))
+            rep_text = rep.get('content') or rep.get('summary', '')
             if rep_text: rep_text = rep_text[:800]
             rep_match = (rep.get('title', '') + " " + rep_text).lower()
             
@@ -423,7 +451,7 @@ def deduplicate_articles(articles, config):
     payload = []
     for i, group in enumerate(local_dedup_groups):
         a = group[0] # Use the representative for LLM scoring
-        long_text = a.get('content', a.get('summary', ''))
+        long_text = a.get('content') or a.get('summary', '')
         if long_text:
             long_text = long_text[:250]
         
@@ -606,7 +634,6 @@ def deduplicate_articles(articles, config):
     return final_articles
 
 def pre_filter_articles_batch(articles_batch, config):
-    current_date = _current_date_text()
     payload = []
     for a in articles_batch:
         payload.append({
@@ -621,8 +648,6 @@ def pre_filter_articles_batch(articles_batch, config):
     You will receive a list of articles. For each article, determine if it is relevant to Hardcore Tech, Investment, or cutting-edge innovation.
     
     Target Industries: {', '.join([ind['name'] for ind in config.get('industries', [])])}
-    Current Date: {current_date}
-    
     CRITICAL REJECTION RULES: Return is_relevant=false if the article is:
     1. A news roundup/digest (e.g. "Morning brief", "晚报").
     2. A shopping deal, discount, ad (e.g. "Black Friday", "Save $50", "促销").
@@ -674,8 +699,7 @@ def pre_filter_articles_batch(articles_batch, config):
 
 def score_articles_batch(articles_batch, config):
     weights = _validate_weights(config)
-    current_date = _current_date_text()
-    rubric = _strict_rubric(config, current_date)
+    rubric = _strict_rubric(config)
     payload = []
     for a in articles_batch:
         payload.append({
@@ -790,3 +814,14 @@ def score_articles_batch(articles_batch, config):
     result["results"] = validated_items
                 
     return result
+
+
+# Compute this once from the original prompt-building functions.  Keeping the
+# digest immutable for the lifetime of the process makes cache identity robust
+# to test doubles and runtime wrappers, while still invalidating persisted
+# scores whenever the real rubric or batch prompt implementation changes.
+SCORING_PROMPT_SHA256 = hashlib.sha256(
+    "\n".join(
+        (inspect.getsource(_strict_rubric), inspect.getsource(score_articles_batch))
+    ).encode("utf-8")
+).hexdigest()

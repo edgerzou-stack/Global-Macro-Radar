@@ -1,10 +1,17 @@
+import hashlib
 import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
+from pathlib import Path
 
 from ingest import fetch_rss_feeds, load_rss_fixture
+from official_newsrooms import fetch_official_newsrooms
+from official_article_capture import capture_official_bodies
+from official_space_newsrooms import fetch_official_space_newsrooms
 from pipeline_health import (
+    aware_utc_timestamp,
+    validate_rss_capture_time,
     rss_reference_time_utc,
     validate_rss_fixture_effective_date,
     validate_rss_health,
@@ -29,6 +36,9 @@ def collect_articles(
     save_health,
     load_fixture=load_rss_fixture,
     fetch_feeds=fetch_rss_feeds,
+    fetch_newsrooms=fetch_official_newsrooms,
+    fetch_space_newsrooms=fetch_official_space_newsrooms,
+    capture_bodies=capture_official_bodies,
 ):
     hours_back = config.get("output", {}).get("hours_back", 48)
     registry = (
@@ -43,18 +53,38 @@ def collect_articles(
             f"Loading deterministic RSS fixture: {fixture}",
             flush=True,
         )
+        replay_sha = os.environ.get("RADAR_CAPTURE_REPLAY_SHA256")
+        if replay_sha and (
+            hashlib.sha256(Path(fixture).read_bytes()).hexdigest() != replay_sha
+        ):
+            raise ValueError("Capture clock RSS fixture hash mismatch")
         articles, health = load_fixture(fixture)
         effective_date = logical_today()
-        validate_rss_fixture_effective_date(
-            articles,
-            health,
-            effective_date,
-        )
         reference_time = datetime.combine(
             effective_date + timedelta(days=1),
             time.min,
             tzinfo=timezone.utc,
         ) - timedelta(microseconds=1)
+        if replay_sha:
+            raw = Path(fixture).read_bytes()
+            if os.environ.get("PIPELINE_MODE") != "production":
+                raise ValueError("Capture clock replay requires production mode")
+            if hashlib.sha256(raw).hexdigest() != replay_sha:
+                raise ValueError("Capture clock RSS fixture hash mismatch")
+            clock = json.loads(raw).get("capture_clock", {})
+            if (
+                not isinstance(clock, dict)
+                or set(clock) != {"run_id", "reference_time"}
+                or not clock.get("run_id")
+                or clock["run_id"] != os.environ.get("PIPELINE_RUN_ID")
+            ):
+                raise ValueError("Capture clock run identity mismatch")
+            reference_time = aware_utc_timestamp(
+                clock.get("reference_time"), "capture_clock.reference_time"
+            )
+            validate_rss_capture_time(articles, health, reference_time)
+        else:
+            validate_rss_fixture_effective_date(articles, health, effective_date)
     else:
         reference_time = rss_reference_time_utc()
         articles, health = fetch_feeds(
@@ -63,6 +93,33 @@ def collect_articles(
             now=reference_time,
             return_health=True,
         )
+        newsroom_entries = [
+            entry
+            for entry in registry.values()
+            if entry.get("adapter") == "official_newsroom"
+        ]
+        if newsroom_entries:
+            newsroom_articles, newsroom_health = fetch_newsrooms(
+                newsroom_entries,
+                hours_back=hours_back,
+                now=reference_time,
+            )
+            articles.extend(newsroom_articles)
+            health.extend(newsroom_health)
+        space_newsroom_entries = [
+            entry
+            for entry in registry.values()
+            if entry.get("adapter") == "official_space_newsroom"
+        ]
+        if space_newsroom_entries:
+            space_articles, space_health = fetch_space_newsrooms(
+                space_newsroom_entries,
+                hours_back=hours_back,
+                now=reference_time,
+            )
+            articles.extend(space_articles)
+            health.extend(space_health)
+        articles = capture_bodies(articles, registry, now=reference_time)
     articles = enrich_articles(articles, registry)
     health = enrich_health(health, registry)
     save_health(health)

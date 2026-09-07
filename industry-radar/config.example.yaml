@@ -45,7 +45,7 @@ rss_feeds:
   - "https://deepmind.google/blog/rss.xml" # Google DeepMind 官方
   - "https://blogs.nvidia.com/feed/" # NVIDIA 官方技术博客
   - "https://nvidianews.nvidia.com/releases.xml" # NVIDIA 官方新闻稿
-  - "https://newsroom.intel.com/feed" # Intel 官方新闻中心
+  - "https://www.intc.com/news-events/press-releases/rss" # Intel 官方投资者关系新闻
   - "https://www.microsoft.com/en-us/research/feed/" # Microsoft Research
   - "https://aws.amazon.com/blogs/machine-learning/feed/" # AWS Machine Learning
   - "https://www.marktechpost.com/feed/" # MarkTechPost
@@ -80,6 +80,19 @@ rss_feeds:
   # 中国本土顶级科技商业与AI媒体
   - "https://www.ifanr.com/feed" # 爱范儿 (科技与生活方式)
   - "https://www.hkexgroup.com/Global/RSS-Feeds/NewsRelease?sc_lang=en" # HKEX 官方新闻稿
+  - "https://www.alizila.com/feed/" # Alibaba 官方企业新闻
+
+# Issuer-owned newsroom sitemaps are parsed by strict, source-specific adapters.
+official_newsrooms:
+  - "https://news.modernatx.com/sitemap.xml"
+  - "https://www.merck.com/media/news/"
+  - "https://www.smics.com/en/site/news"
+
+# SpaceX's official site is a client-rendered app. Its audited content API is
+# parsed by a separate fail-closed adapter; NASA/JPL remains authoritative only
+# for NASA/JPL events and cannot authenticate a SpaceX issuer claim.
+official_space_newsrooms:
+  - "https://content.spacex.com/api/spacex-website/updates"
 
 source_registry_file: source_registry.yaml
 
@@ -97,7 +110,7 @@ rss_critical_source_groups:
       - "https://deepmind.google/blog/rss.xml"
       - "https://blogs.nvidia.com/feed/"
       - "https://nvidianews.nvidia.com/releases.xml"
-      - "https://newsroom.intel.com/feed"
+      - "https://www.intc.com/news-events/press-releases/rss"
       - "https://www.microsoft.com/en-us/research/feed/"
       - "https://aws.amazon.com/blogs/machine-learning/feed/"
       - "https://www.ema.europa.eu/en/news.xml"
@@ -124,7 +137,17 @@ rss_critical_source_groups:
 # Public-safe default: every external LLM provider is disabled. Enable exactly
 # the reviewed provider in local config.yaml after configuring its credential.
 llm:
+  # offline is the public/default zero-API mode. Use interactive to emit a
+  # folder-AI review bundle, unattended for the configured provider chain, or
+  # deepseek to pin all paid calls to DeepSeek.
+  mode: "offline"
   order: ["deepseek", "openai"]
+  policy:
+    daily_budget_cny: 2.0
+    max_articles_per_run: 20
+    max_api_calls_per_run: 8
+    estimated_cny_per_call: 0.10
+    allow_llm_eval: false
   providers:
     gemini:
       enabled: false
