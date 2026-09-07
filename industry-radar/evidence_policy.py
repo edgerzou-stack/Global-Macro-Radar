@@ -8,7 +8,7 @@ import re
 from urllib.parse import urlsplit, urlunsplit
 
 
-EVIDENCE_POLICY_VERSION = "industrial-evidence-v7-official-t1-event-cluster"
+EVIDENCE_POLICY_VERSION = "industrial-evidence-v10-spacex-event-bound"
 
 SAME_BATCH_CORROBORATION_METHOD = "same_batch_event_match_v1"
 EXPLICIT_PRIMARY_URL_METHOD = "same_batch_explicit_primary_url_v1"
@@ -16,7 +16,72 @@ REGISTERED_PRIMARY_URL_METHOD = "registered_explicit_primary_url_v1"
 INDEPENDENT_T1_MUTUAL_CORROBORATION_METHOD = (
     "same_batch_official_t1_event_cluster_v2"
 )
+REGULATOR_ISSUER_CORROBORATION_METHOD = (
+    "same_batch_regulator_issuer_event_cluster_v1"
+)
 OFFICIAL_T1_EVENT_CLUSTER_VERSION = "official-t1-event-cluster-v1"
+REGULATOR_ISSUER_EVENT_CLUSTER_VERSION = "regulator-issuer-event-cluster-v1"
+REGULATORY_SOURCE_IDS = frozenset({"fda_press_releases", "ema_news"})
+SPACEX_SOURCE_ID = "spacex_updates"
+SPACEX_UPDATES_API_URL = (
+    "https://content.spacex.com/api/spacex-website/updates"
+)
+SPACEX_CANONICAL_HOST = "www.spacex.com"
+SPACEX_CANONICAL_PATH = re.compile(
+    r"/updates/[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?/"
+)
+SPACEX_DOCUMENT_ID = re.compile(r"[a-z0-9]{8,64}")
+SPACEX_UNSCORED_PLACEHOLDER_CONTRACT = "unscored-placeholder-v1"
+SPACEX_ALLOWED_DEFERRED_REASON_BY_RESOLUTION = {
+    "unscored": frozenset(
+        {"api_disabled_or_budget", "batch_budget_exhausted"}
+    ),
+    "manual": frozenset({"interactive_manual_pending"}),
+}
+SPACEX_EVENT_ENTITY = re.compile(
+    r"\b(?:space\s*x|spacex|starship|super\s+heavy|starlink|"
+    r"falcon\s+(?:9|heavy)|(?:crew|cargo)\s+dragon|dragon\s+spacecraft|"
+    r"raptor\s+engine)\b",
+    re.IGNORECASE,
+)
+SPACEX_VEHICLE_PATTERNS = {
+    "starship": re.compile(r"\bstarship\b", re.IGNORECASE),
+    "super-heavy": re.compile(r"\bsuper\s+heavy\b", re.IGNORECASE),
+    "starlink": re.compile(r"\bstarlink\b", re.IGNORECASE),
+    "falcon-9": re.compile(r"\bfalcon\s*9\b", re.IGNORECASE),
+    "falcon-heavy": re.compile(r"\bfalcon\s+heavy\b", re.IGNORECASE),
+    "crew-dragon": re.compile(r"\bcrew\s+dragon\b", re.IGNORECASE),
+    "cargo-dragon": re.compile(r"\bcargo\s+dragon\b", re.IGNORECASE),
+    "dragon-spacecraft": re.compile(
+        r"\bdragon\s+(?:spacecraft|capsule)\b", re.IGNORECASE
+    ),
+    "raptor": re.compile(r"\braptor(?:\s+engine)?\b", re.IGNORECASE),
+}
+SPACEX_EVENT_ACTION_PATTERNS = {
+    "flight-test": re.compile(r"\b(?:flight\s+test|test\s+flight)\b", re.I),
+    "static-fire": re.compile(r"\bstatic\s+fire\b", re.I),
+    "launch": re.compile(r"\b(?:launch(?:ed|es|ing)?|lift[- ]?off)\b", re.I),
+    "deployment": re.compile(r"\bdeploy(?:ed|ment|ing)?\b", re.I),
+    "recovery": re.compile(
+        r"\b(?:recover(?:ed|y|ing)?|booster\s+catch|landed|landing)\b",
+        re.I,
+    ),
+    "splashdown": re.compile(r"\bsplashdown\b", re.I),
+    "anomaly": re.compile(r"\b(?:anomaly|explod(?:e|ed|es|ing)|failure)\b", re.I),
+}
+SPACEX_MISSION_ID = re.compile(
+    r"\b(?:crew|crs|ax|ussf|transporter|bandwagon|starlink)[-\s]?[0-9]+"
+    r"(?:[-\s][0-9]+)?\b|\bflight\s+(?:test\s+)?(?:number\s+|no\.?\s*)?[0-9]+\b",
+    re.IGNORECASE,
+)
+REGULATORY_ENTITY_ROLE_PATTERN = re.compile(
+    r"\b(?:applicant|application holder|sponsor|marketing authori[sz]ation holder|"
+    r"rights holder|licensed to|manufactured by|marketed by|developed by|"
+    r"submitted by|owned by|granted.{0,80}approval.{0,80}to)\b|"
+    r"(?:申请人|申办方|上市许可持有人|权利人|"
+    r"生产企业|由.{0,40}(?:研发|生产|持有))",
+    re.IGNORECASE,
+)
 _EVENT_TOKEN = re.compile(r"[a-z0-9][a-z0-9_-]{2,}", re.IGNORECASE)
 _EVENT_STOPWORDS = {
     "about",
@@ -149,6 +214,9 @@ def _registered_first_party_host_matches(article):
     feed_host = feed_host.removeprefix("www.")
     if not article_host or not feed_host:
         return False
+    audited_hosts = article.get("official_hosts")
+    if isinstance(audited_hosts, list) and audited_hosts:
+        return feed_host in audited_hosts and article_host in audited_hosts
     return (
         article_host == feed_host
         or article_host.endswith(f".{feed_host}")
@@ -398,6 +466,66 @@ def _independent_mutual_t1_pair(article, other):
     }
 
 
+def _regulator_issuer_pair(article, regulator):
+    """Prove that a regulator and issuer independently describe one approval."""
+    if article.get("source_tier") != "T1" or regulator.get("source_tier") != "T0":
+        return False
+    if str(regulator.get("source_id") or "") not in REGULATORY_SOURCE_IDS:
+        return False
+    aliases = _normalized_aliases(article)
+    if not aliases or not _registered_first_party_host_matches(article):
+        return False
+    if not (
+        article.get("source_lane") == "evidence"
+        and article.get("trade_eligible") == "conditional"
+        and article.get("requires_corroboration") is True
+        and regulator.get("source_lane") == "evidence"
+        and regulator.get("trade_eligible") is True
+    ):
+        return False
+    event_type = str((article.get("score_data") or {}).get("event_type") or "")
+    regulator_event_type = str(
+        (regulator.get("score_data") or {}).get("event_type") or ""
+    )
+    if not event_type or event_type != regulator_event_type:
+        return False
+    if not (
+        event_type in set(article.get("authority_for") or [])
+        and event_type in set(regulator.get("authority_for") or [])
+    ):
+        return False
+    if _trade_maturity(article) != "regulatory_approval" or _trade_maturity(
+        regulator
+    ) != "regulatory_approval":
+        return False
+    if not (
+        (article.get("score_data") or {}).get("is_relevant") is True
+        and (regulator.get("score_data") or {}).get("is_relevant") is True
+    ):
+        return False
+    issuer_text = _article_evidence_text(article)
+    regulator_text = _article_evidence_text(regulator)
+    if not (
+        any(_contains_alias(issuer_text, alias) for alias in aliases)
+        and any(_contains_alias(regulator_text, alias) for alias in aliases)
+        and REGULATORY_ENTITY_ROLE_PATTERN.search(regulator_text)
+    ):
+        return False
+    product_name = _shared_unambiguous_product_name(article, regulator)
+    if not product_name:
+        return False
+    return {
+        "event_cluster_version": REGULATOR_ISSUER_EVENT_CLUSTER_VERSION,
+        "event_product_name": product_name,
+        "event_type": event_type,
+        "milestone": "regulatory_approval",
+        "exact_reference_direction_count": int(
+            _references_exact_article(article, regulator)
+        )
+        + int(_references_exact_article(regulator, article)),
+    }
+
+
 def _valid_primary_corroboration(
     article,
     *,
@@ -419,6 +547,7 @@ def _valid_primary_corroboration(
         EXPLICIT_PRIMARY_URL_METHOD,
         REGISTERED_PRIMARY_URL_METHOD,
         INDEPENDENT_T1_MUTUAL_CORROBORATION_METHOD,
+        REGULATOR_ISSUER_CORROBORATION_METHOD,
     }
     if require_same_batch:
         allowed_methods.remove(REGISTERED_PRIMARY_URL_METHOD)
@@ -467,6 +596,179 @@ def _compatible_event(primary, event_type):
     return (
         primary_event_type == event_type
         or "other_industrial" in {primary_event_type, event_type}
+    )
+
+
+def _strict_spacex_primary(article):
+    """Accept only a record emitted by the audited SpaceX update adapter."""
+    if (
+        str(article.get("source_id") or "") != SPACEX_SOURCE_ID
+        or article.get("source_tier") != "T1"
+        or article.get("source_lane") != "evidence"
+        or _normalized_identity(article, "publisher_identity") != "spacex"
+        or _normalized_identity(article, "issuer_identity") != "spacex"
+        or article.get("canonical_verification") != "official_api_update_id"
+        or not SPACEX_DOCUMENT_ID.fullmatch(
+            str(article.get("official_document_id") or "")
+        )
+        or _canonical_evidence_url(article.get("feed_url"))
+        != SPACEX_UPDATES_API_URL
+    ):
+        return False
+    try:
+        parsed = urlsplit(str(article.get("link") or "").strip())
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname == SPACEX_CANONICAL_HOST
+        and parsed.username is None
+        and parsed.password is None
+        and port is None
+        and not parsed.query
+        and not parsed.fragment
+        and bool(SPACEX_CANONICAL_PATH.fullmatch(parsed.path))
+    )
+
+
+def _spacex_event_text(article):
+    return _article_evidence_text(article)
+
+
+def _spacex_event_claim(article):
+    return bool(SPACEX_EVENT_ENTITY.search(_spacex_event_text(article)))
+
+
+def _spacex_event_anchors(article):
+    text = _spacex_event_text(article)
+    vehicles = {
+        name for name, pattern in SPACEX_VEHICLE_PATTERNS.items()
+        if pattern.search(text)
+    }
+    actions = {
+        name for name, pattern in SPACEX_EVENT_ACTION_PATTERNS.items()
+        if pattern.search(text)
+    }
+    missions = {
+        re.sub(r"[\s-]+", "-", match.group(0).casefold())
+        for match in SPACEX_MISSION_ID.finditer(text)
+    }
+    return vehicles, missions, actions
+
+
+def _spacex_allowed_unscored_placeholder(article):
+    """Recognize only the scoring pipeline's exact deferred-score contract."""
+    score = article.get("score_data")
+    resolution = str(article.get("_score_resolution") or "")
+    allowed_reasons = SPACEX_ALLOWED_DEFERRED_REASON_BY_RESOLUTION.get(
+        resolution
+    )
+    zero_fields = (
+        "innovation_score",
+        "traffic_score",
+        "tech_score",
+        "commercial_score",
+        "hype_score",
+        "macro_score",
+    )
+    return (
+        isinstance(score, dict)
+        and allowed_reasons is not None
+        and score.get("_unscored_placeholder_contract")
+        == SPACEX_UNSCORED_PLACEHOLDER_CONTRACT
+        and score.get("_unscored_reason_code") in allowed_reasons
+        and score.get("is_relevant") is False
+        and score.get("is_vague_or_roundup") is True
+        and score.get("event_type") == "unscored"
+        and score.get("industrial_claims") == []
+        and score.get("market_only_claims") == []
+        and all(score.get(field) == 0 for field in zero_fields)
+        and bool(str(score.get("prompt_version") or "").strip())
+        and bool(str(score.get("reasoning_chain") or "").strip())
+        and score.get("reasoning_chain") == score.get("justification")
+        and article.get("_score_cache_hit") is False
+    )
+
+
+def _spacex_event_context_matches(article, primary, *, max_days):
+    """Validate provenance, issuer, event type and publication window."""
+    if not _strict_spacex_primary(primary) or not _spacex_event_claim(article):
+        return False
+    primary_score = primary.get("score_data")
+    deferred_placeholder = _spacex_allowed_unscored_placeholder(primary)
+    if not (
+        isinstance(primary_score, dict)
+        and (
+            primary_score.get("is_relevant") is True
+            or deferred_placeholder
+        )
+    ):
+        return False
+    published = _published_datetime(article)
+    primary_published = _published_datetime(primary)
+    event_type = str((article.get("score_data") or {}).get("event_type") or "")
+    primary_event_type = (
+        ""
+        if deferred_placeholder
+        else str((primary.get("score_data") or {}).get("event_type") or "")
+    )
+    if (
+        published is None
+        or primary_published is None
+        or abs((published - primary_published).total_seconds()) > max_days * 86400
+        or not event_type
+        or (primary_event_type and not _compatible_event(primary, event_type))
+        or (
+            not primary_event_type
+            and event_type not in set(primary.get("authority_for") or [])
+        )
+    ):
+        return False
+    return True
+
+
+def _spacex_primary_verified_relevant(primary, article_event_type):
+    """Use audited source authority when the official item was not AI-scored."""
+    score = primary.get("score_data")
+    if _spacex_allowed_unscored_placeholder(primary):
+        return (
+            _strict_spacex_primary(primary)
+            and str(article_event_type or "")
+            in set(primary.get("authority_for") or [])
+        )
+    if isinstance(score, dict) and "is_relevant" in score:
+        return score.get("is_relevant") is True
+    if isinstance(score, dict) and score.get("event_type"):
+        return False
+    return False
+
+
+def _same_spacex_event(article, primary, *, max_days):
+    """Infer one SpaceX event only from an exact shared mission identifier.
+
+    Vehicle and action overlap alone is not unique: SpaceX can launch multiple
+    Falcon 9 payloads within the same three-day window. Non-explicit matching
+    therefore requires the same recognized mission/flight identifier plus the
+    same action. Exact URL citations select the provenance method but must pass
+    these same event anchors; a background/related link grants no exception.
+    """
+    if not _spacex_event_context_matches(
+        article, primary, max_days=max_days
+    ):
+        return False
+    vehicles, missions, actions = _spacex_event_anchors(article)
+    primary_vehicles, primary_missions, primary_actions = (
+        _spacex_event_anchors(primary)
+    )
+    return (
+        bool(missions & primary_missions)
+        and bool(actions & primary_actions)
+        and (
+            not vehicles
+            or not primary_vehicles
+            or bool(vehicles & primary_vehicles)
+        )
     )
 
 
@@ -519,7 +821,7 @@ def _event_cluster_payload(article, primary, cluster):
         (_cluster_evidence_sha256(article), _cluster_evidence_sha256(primary))
     )
     identity = {
-        "version": OFFICIAL_T1_EVENT_CLUSTER_VERSION,
+        "version": cluster["event_cluster_version"],
         "event_type": cluster["event_type"],
         "milestone": cluster["milestone"],
         "event_product_name": str(cluster["event_product_name"]).casefold(),
@@ -558,6 +860,21 @@ def _mutual_t1_corroboration(article, primary, cluster):
     return payload
 
 
+def _regulator_issuer_corroboration(article, regulator, cluster):
+    payload = _corroboration(
+        regulator,
+        REGULATOR_ISSUER_CORROBORATION_METHOD,
+    )
+    payload.update(_event_cluster_payload(article, regulator, cluster))
+    payload.update(
+        {
+            "issuer_identity": str(article["issuer_identity"]),
+            "publisher_identity": str(article["publisher_identity"]),
+        }
+    )
+    return payload
+
+
 def _registered_reference_corroboration(reference):
     return {
         "method": REGISTERED_PRIMARY_URL_METHOD,
@@ -583,8 +900,11 @@ def attach_same_batch_primary_corroboration(articles, *, max_days=3):
         for article in articles
         if article.get("source_tier") in {"T0", "T1"}
         and article.get("link")
-        and (article.get("score_data") or {}).get("event_type")
-        not in {None, "non_industrial"}
+        and (
+            (article.get("score_data") or {}).get("event_type")
+            not in {None, "non_industrial"}
+            or _strict_spacex_primary(article)
+        )
     ]
     primaries_by_url = defaultdict(list)
     for primary in primaries:
@@ -600,6 +920,8 @@ def attach_same_batch_primary_corroboration(articles, *, max_days=3):
     for article in articles:
         article.pop("primary_corroboration", None)
         article.pop("_primary_corroboration_verified_relevant", None)
+        article.pop("event_cluster", None)
+    for article in articles:
         article_tier = article.get("source_tier")
         if article_tier == "T0":
             continue
@@ -621,6 +943,33 @@ def attach_same_batch_primary_corroboration(articles, *, max_days=3):
             # Prefer an exact same-batch T0 record whenever one is present.
             # The T1-peer path is a narrowly bounded fallback, never an
             # alternative that can displace regulator-grade evidence.
+            regulator_matches = []
+            for primary in primaries:
+                primary_published = _published_datetime(primary)
+                cluster = _regulator_issuer_pair(article, primary)
+                if (
+                    primary_published is None
+                    or abs((published - primary_published).total_seconds())
+                    > max_days * 86400
+                    or not cluster
+                ):
+                    continue
+                regulator_matches.append((primary, cluster))
+            if len(regulator_matches) == 1:
+                primary, cluster = regulator_matches[0]
+                corroboration = _regulator_issuer_corroboration(
+                    article, primary, cluster
+                )
+                article["primary_corroboration"] = corroboration
+                article["_primary_corroboration_verified_relevant"] = True
+                primary["event_cluster"] = {
+                    key: value
+                    for key, value in corroboration.items()
+                    if key.startswith("event_") or key in {"milestone"}
+                }
+                continue
+            if regulator_matches:
+                continue
             exact_t0_matches = []
             for reference_url in article.get("reference_urls") or []:
                 for primary in primaries_by_url.get(
@@ -683,7 +1032,45 @@ def attach_same_batch_primary_corroboration(articles, *, max_days=3):
                 )
                 article["_primary_corroboration_verified_relevant"] = True
                 continue
-
+        # Commercial-space discovery reports are especially prone to broad
+        # entity overlap (many unrelated stories say only "SpaceX").  They
+        # therefore use a closed event-level path: one real, same-batch
+        # ``spacex_updates`` record must match vehicle/mission, event action,
+        # event type and time. Registry hints, NASA/FAA records and generic
+        # token overlap cannot authenticate the issuer's separate event.
+        if article_tier not in {"T0", "T1"} and _spacex_event_claim(article):
+            exact_matches = [
+                primary
+                for primary in primaries
+                if id(primary) != id(article)
+                and _same_spacex_event(
+                    article, primary, max_days=max_days
+                )
+                and _references_exact_article(article, primary)
+            ]
+            if len(exact_matches) == 1:
+                primary = exact_matches[0]
+                method = EXPLICIT_PRIMARY_URL_METHOD
+            else:
+                if exact_matches:
+                    continue
+                inferred_matches = [
+                    primary
+                    for primary in primaries
+                    if id(primary) != id(article)
+                    and _same_spacex_event(
+                        article, primary, max_days=max_days
+                    )
+                ]
+                if len(inferred_matches) != 1:
+                    continue
+                primary = inferred_matches[0]
+                method = SAME_BATCH_CORROBORATION_METHOD
+            article["primary_corroboration"] = _corroboration(primary, method)
+            article["_primary_corroboration_verified_relevant"] = (
+                _spacex_primary_verified_relevant(primary, event_type)
+            )
+            continue
         explicit_matches = []
         for reference_url in article.get("reference_urls") or []:
             for primary in primaries_by_url.get(
@@ -740,6 +1127,13 @@ def attach_same_batch_primary_corroboration(articles, *, max_days=3):
             article["_primary_corroboration_verified_relevant"] = False
             continue
         if registered_matches:
+            continue
+
+        if article_tier == "T1":
+            # Conditional first-party T1 claims have a closed authorization
+            # set. Registry URL hints remain visible for audit above, but a T1
+            # claim must never fall through to fuzzy token overlap intended
+            # for discovery media.
             continue
 
         tokens = _event_tokens(article)
@@ -976,7 +1370,11 @@ def classify_industrial_milestone(
         ),
         (
             "clinical_readout",
-            r"phase [123] (?:trial )?(?:met|results)|pivotal trial|"
+            r"phase [123] (?:trial )?(?:met|results)|"
+            r"phase [123]\b[^.!?;。！？；\n]{0,180}\b(?:trial|study)\b"
+            r"[^.!?;。！？；\n]{0,140}\b(?:met|achieved|reached)\b"
+            r"[^.!?;。！？；\n]{0,100}\b(?:endpoint|endpoints|results?)\b|"
+            r"pivotal trial|"
             r"临床.{0,8}(?:达到终点|结果|数据)",
         ),
         (
@@ -1109,23 +1507,23 @@ def trade_evidence_decision(article):
             or not _registered_first_party_host_matches(article)
         ):
             return {"eligible": False, "reason": "t1_primary_binding_required"}
-        if not _valid_primary_corroboration(
-            article,
-            allowed_tiers=frozenset({"T0", "T1"}),
-            require_same_batch=True,
-            require_relevant_primary=True,
-            require_independent_t1=True,
-        ):
-            return {
-                "eligible": False,
-                "reason": "t1_independent_corroboration_required",
-            }
     if authority_for and event_type not in authority_for:
         return {"eligible": False, "reason": "source_not_authoritative_for_event"}
     if production_state != "current":
         return {"eligible": False, "reason": "current_maturity_required"}
     if milestone not in TRADE_TRIGGER_MILESTONES:
         return {"eligible": False, "reason": "milestone_is_research_only"}
+    if conditional_t1 and not _valid_primary_corroboration(
+        article,
+        allowed_tiers=frozenset({"T0", "T1"}),
+        require_same_batch=True,
+        require_relevant_primary=True,
+        require_independent_t1=True,
+    ):
+        return {
+            "eligible": False,
+            "reason": "t1_independent_corroboration_required",
+        }
     return {
         "eligible": True,
         "reason": (

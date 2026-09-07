@@ -40,6 +40,7 @@ def _unique_articles(articles):
 def _canonical_article_projection(article):
     score = article.get("score_data") or {}
     corroboration = article.get("primary_corroboration") or {}
+    event_cluster = article.get("event_cluster") or corroboration
     return {
         "link": str(article.get("link") or ""),
         "title": " ".join(str(article.get("title") or "").split()),
@@ -58,12 +59,12 @@ def _canonical_article_projection(article):
         ),
         "corroboration_method": str(corroboration.get("method") or ""),
         "corroboration_url": str(corroboration.get("primary_url") or ""),
-        "event_cluster_id": str(corroboration.get("event_cluster_id") or ""),
+        "event_cluster_id": str(event_cluster.get("event_cluster_id") or ""),
         "event_cluster_version": str(
-            corroboration.get("event_cluster_version") or ""
+            event_cluster.get("event_cluster_version") or ""
         ),
         "event_product_name": str(
-            corroboration.get("event_product_name") or ""
+            event_cluster.get("event_product_name") or ""
         ),
     }
 
@@ -138,10 +139,13 @@ def _event(article):
     corroboration = article.get("primary_corroboration") or {}
     if not isinstance(corroboration, dict):
         corroboration = {}
+    event_cluster = article.get("event_cluster") or corroboration
+    if not isinstance(event_cluster, dict):
+        event_cluster = {}
     link = str(article.get("link") or "")
     return {
         "event_id": hashlib.sha256(link.encode("utf-8")).hexdigest(),
-        "event_cluster_id": str(corroboration.get("event_cluster_id") or ""),
+        "event_cluster_id": str(event_cluster.get("event_cluster_id") or ""),
         "title": str(article.get("title") or ""),
         "summary": str(article.get("summary") or article.get("content") or ""),
         "evidence_text": _source_evidence_text(article),

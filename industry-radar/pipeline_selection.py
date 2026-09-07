@@ -12,6 +12,9 @@ from evidence_policy import (
 from url_identity import canonicalize_article_url
 
 
+REPORT_SCORE_HARD_FLOOR = 8.0
+
+
 @dataclass(frozen=True)
 class ReportSelection:
     supernova: tuple
@@ -34,6 +37,32 @@ def normalize_score(value):
     except (InvalidOperation, TypeError, ValueError):
         score = Decimal("0.00")
     return float(max(Decimal("0.00"), min(Decimal("10.00"), score)))
+
+
+def report_score_threshold(config):
+    """Return the effective presentation threshold, which cannot fall below 8."""
+    configured = config.get("output", {}).get(
+        "min_score_to_keep",
+        REPORT_SCORE_HARD_FLOOR,
+    )
+    if isinstance(configured, bool):
+        raise ValueError("min_score_to_keep must be numeric")
+    try:
+        configured = float(configured)
+    except (TypeError, ValueError) as error:
+        raise ValueError("min_score_to_keep must be numeric") from error
+    if not math.isfinite(configured) or configured < 0:
+        raise ValueError("min_score_to_keep must be a finite non-negative number")
+    return max(REPORT_SCORE_HARD_FLOOR, configured)
+
+
+def report_score(article):
+    """Return the sole score used to admit an article to any report lane."""
+    score = article.get("score_data") or {}
+    return max(
+        normalize_score(score.get("innovation_score", 0)),
+        normalize_score(score.get("traffic_score", 0)),
+    )
 
 
 def is_verified_deep_dive(deep_dive):
@@ -210,7 +239,7 @@ def select_report_articles(
     relevance_gate,
     deduplicator,
 ):
-    minimum = config.get("output", {}).get("min_score_to_keep", 6)
+    minimum = report_score_threshold(config)
     strategic_config = config.get("strategic_hardtech", {})
     strategic_enabled = strategic_config.get("enabled") is True
     lookback_days = config.get("output", {}).get(
@@ -220,8 +249,8 @@ def select_report_articles(
     date_text = report_date.isoformat()
     cutoff = (report_date - timedelta(days=lookback_days)).isoformat()
     selected = []
-    strategic_candidates = []
     evidence_candidates = []
+    report_exclusion_reasons = {}
     evidence_input_rejections = Counter()
     report_score_threshold_excluded = 0
     relevant_articles = []
@@ -267,8 +296,6 @@ def select_report_articles(
             if strategic_enabled:
                 watch_decision = research_watch_decision(article)
                 article["research_watch_decision"] = watch_decision
-                if watch_decision["eligible"]:
-                    strategic_candidates.append(article)
     evidence_input = tuple(evidence_candidates)
     evidence_selection = tuple(_deduplicate_evidence_articles(evidence_candidates))
     evidence_trade_count = sum(
@@ -284,7 +311,14 @@ def select_report_articles(
         if article.get("trade_evidence_eligible") is not True
     )
     if selected and deduplicate:
+        before_deduplication = list(selected)
         selected = deduplicator(selected, config)
+        retained_ids = {id(item) for item in selected}
+        for item in before_deduplication:
+            if id(item) not in retained_ids:
+                report_exclusion_reasons[id(item)] = (
+                    "deduplicated_from_report_selection"
+                )
 
     max_discovery_per_source = config.get("output", {}).get(
         "max_selected_per_discovery_source"
@@ -305,6 +339,9 @@ def select_report_articles(
                     article.get("source_id") or article.get("source") or "unknown"
                 )
                 if discovery_counts[source_id] >= max_discovery_per_source:
+                    report_exclusion_reasons[id(article)] = (
+                        "excluded_by_discovery_source_cap"
+                    )
                     continue
                 discovery_counts[source_id] += 1
             bounded.append(article)
@@ -401,30 +438,14 @@ def select_report_articles(
             ),
         ),
     )
-    strategic_candidates.sort(
-        key=lambda item: _stable_rank_key(
-            item,
-            lambda candidate: candidate["score_data"].get(
-                "innovation_score", 0
-            ),
-        ),
-    )
+    # Research Watch remains a report lane, so it may only contain articles
+    # that passed the same hard score gate as every main section.  Low-scored
+    # official records remain in ``evidence_input`` and can still corroborate
+    # or qualify evidence independently of report presentation.
     strategic_watch = list(ratio_research[:max_items_per_section])
-    strategic_watch_ids = {id(item) for item in strategic_watch}
-    per_topic = Counter()
     max_per_topic = strategic_config.get("max_items_per_topic", 2)
     if type(max_per_topic) is not int or max_per_topic <= 0:
         raise ValueError("max_items_per_topic must be a positive integer")
-    for article in strategic_candidates:
-        if id(article) in strategic_watch_ids:
-            continue
-        topic = str(article.get("strategic_topic") or "unknown")
-        if per_topic[topic] >= max_per_topic:
-            continue
-        per_topic[topic] += 1
-        strategic_watch.append(article)
-        strategic_watch_ids.add(id(article))
-    strategic_watch = strategic_watch[:max_items_per_section]
     rendered = supernova + hardcore + hype
     source_counts = Counter(
         str(item.get("source") or "unknown") for item in rendered
@@ -452,6 +473,10 @@ def select_report_articles(
     )
     rendered_ids = {id(item) for item in rendered}
     research_watch_ids = {id(item) for item in strategic_watch}
+    report_rendered_ids = rendered_ids | research_watch_ids
+    report_items = rendered + strategic_watch
+    if any(report_score(item) < minimum for item in report_items):
+        raise AssertionError("report lane contains an article below the score threshold")
     selection_decisions = [
         {
             "title": str(item.get("title") or ""),
@@ -460,7 +485,8 @@ def select_report_articles(
             "evidence_state": str(item.get("evidence_state") or "discovery_only"),
             "innovation_score": item.get("score_data", {}).get("innovation_score", 0),
             "traffic_score": item.get("score_data", {}).get("traffic_score", 0),
-            "rendered": id(item) in rendered_ids or id(item) in research_watch_ids,
+            "report_score": report_score(item),
+            "rendered": id(item) in report_rendered_ids,
             "report_lane": (
                 "main"
                 if id(item) in rendered_ids
@@ -475,13 +501,25 @@ def select_report_articles(
                 if id(item) in research_watch_ids
                 and evidence_exclusion_reasons.get(id(item))
                 == "excluded_by_primary_evidence_ratio"
-                else evidence_exclusion_reasons.get(
-                    id(item), "eligible_but_section_capacity_exceeded"
-                )
+                else "report_score_below_threshold"
+                if report_score(item) < minimum
+                else report_exclusion_reasons.get(id(item))
+                or evidence_exclusion_reasons.get(id(item))
+                or "eligible_but_section_capacity_exceeded"
             ),
         }
-        for item in selected
+        for item in evidence_input
     ]
+    report_rendered_count = selected_count + len(strategic_watch)
+    if len(selection_decisions) != len(evidence_input):
+        raise AssertionError("selection decisions do not cover evidence input")
+    if sum(item["rendered"] for item in selection_decisions) != report_rendered_count:
+        raise AssertionError("selection decision render count does not match report")
+    if any(
+        item["rendered"] and item["report_score"] < minimum
+        for item in selection_decisions
+    ):
+        raise AssertionError("sub-threshold selection decision marked as rendered")
     return ReportSelection(
         supernova=tuple(supernova),
         hardcore=tuple(hardcore),
@@ -507,6 +545,15 @@ def select_report_articles(
                 sorted(evidence_input_rejections.items())
             ),
             "report_score_threshold_excluded": report_score_threshold_excluded,
+            "report_score_eligible_count": sum(
+                report_score(item) >= minimum for item in evidence_input
+            ),
+            "report_score_threshold": minimum,
+            "selection_decision_count": len(selection_decisions),
+            "report_rendered_count": report_rendered_count,
+            "main_report_selected_count": selected_count,
+            "research_watch_selected_count": len(strategic_watch),
+            "report_selected_count": report_rendered_count,
             "supernova": len(supernova),
             "hardcore": len(hardcore),
             "hype": len(hype),

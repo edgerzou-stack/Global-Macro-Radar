@@ -105,6 +105,7 @@ def enrich_deep_dives(
         article
         for article in scored_articles
         if article.get("score_data", {}).get("is_relevant")
+        and article.get("_score_cache_hit") is not True
         and article.get("score_data", {}).get("innovation_score", 0)
         + article.get("score_data", {}).get("traffic_score", 0)
         >= 18

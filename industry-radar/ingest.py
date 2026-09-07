@@ -3,6 +3,7 @@ import concurrent.futures
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
@@ -19,6 +20,28 @@ logger = logging.getLogger(__name__)
 ALLOWED_FEED_CONTENT_TYPES = ("rss", "atom", "xml")
 MAX_FUTURE_SKEW = timedelta(minutes=5)
 RSS_FIXTURE_SCHEMA_VERSION = 1
+JPL_AUDITED_RSS_URL = "https://www.jpl.nasa.gov/feeds/news/"
+_JPL_CONTENT_ENCODED_CDATA_TOKEN = b"<content:encoded<![CDATA["
+_JPL_CONTENT_ENCODED_CDATA_REPLACEMENT = b"<content:encoded><![CDATA["
+_JPL_CONTENT_ENCODED_CLOSE_TOKEN = b" ]]>/><media:content"
+_JPL_CONTENT_ENCODED_CLOSE_REPLACEMENT = (
+    b" ]]></content:encoded><media:content"
+)
+_REPAIR_XML_10_ILLEGAL_CHARACTERS = "xml_10_illegal_character_removal"
+_REPAIR_JPL_CONTENT_ENCODED_CDATA = "jpl_content_encoded_cdata_missing_gt"
+_REPAIR_JPL_CONTENT_ENCODED_CLOSE = "jpl_content_encoded_cdata_missing_close_tag"
+_XML_ENCODING_PATTERN = re.compile(
+    br"<\?xml[^>]+encoding=[\"']\s*([^\"']+)\s*[\"']",
+    flags=re.IGNORECASE,
+)
+_PROMOTION_PATH_PATTERN = re.compile(
+    r"(?:^|[-_/])(?:promo-codes?|coupon-codes?|coupons?)(?:[-_/]|$)",
+    flags=re.IGNORECASE,
+)
+_PROMOTION_TITLE_PATTERN = re.compile(
+    r"\b(?:promo codes?|coupon codes?|coupons?)\b",
+    flags=re.IGNORECASE,
+)
 
 
 def _field(obj, name, default=None):
@@ -68,6 +91,16 @@ def _clean_html(value, separator=" "):
     )
 
 
+def _is_obvious_consumer_promotion(title, link):
+    """Reject dedicated coupon pages without semantically classifying news."""
+
+    path = urlsplit(str(link or "")).path
+    return bool(
+        _PROMOTION_PATH_PATTERN.search(path)
+        and _PROMOTION_TITLE_PATTERN.search(str(title or ""))
+    )
+
+
 def _reference_urls(*html_values, limit=20):
     """Preserve explicit HTTP(S) citations before stripping feed HTML."""
     references = []
@@ -97,6 +130,128 @@ def _validate_content_type(response):
     if content_type and not any(token in content_type for token in ALLOWED_FEED_CONTENT_TYPES):
         raise ValueError(f"Unexpected feed content type: {content_type}")
     return content_type
+
+
+def _is_valid_xml_10_character(value):
+    codepoint = ord(value)
+    return (
+        codepoint in {0x09, 0x0A, 0x0D}
+        or 0x20 <= codepoint <= 0xD7FF
+        or 0xE000 <= codepoint <= 0xFFFD
+        or 0x10000 <= codepoint <= 0x10FFFF
+    )
+
+
+def _remove_safe_xml_10_illegal_characters(content):
+    """Remove only forbidden XML 1.0 code points from UTF-8 feed content.
+
+    Structural markup, entities, malformed byte sequences, and non-UTF-8
+    documents are deliberately left untouched so a real parser error remains
+    visible instead of being guessed into a different document.
+    """
+    if isinstance(content, str):
+        text = content
+        as_bytes = False
+    elif isinstance(content, (bytes, bytearray)):
+        raw = bytes(content)
+        declaration = _XML_ENCODING_PATTERN.search(raw[:256])
+        declared_encoding = (
+            declaration.group(1).decode("ascii", errors="ignore").strip().lower()
+            if declaration
+            else "utf-8"
+        )
+        if declared_encoding not in {"utf-8", "utf8"}:
+            return content, 0
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            return content, 0
+        as_bytes = True
+    else:
+        return content, 0
+
+    cleaned = "".join(value for value in text if _is_valid_xml_10_character(value))
+    removed = len(text) - len(cleaned)
+    if removed == 0:
+        return content, 0
+    return (cleaned.encode("utf-8") if as_bytes else cleaned), removed
+
+
+def _replace_audited_jpl_content_encoded_token(content, feed_url):
+    if feed_url != JPL_AUDITED_RSS_URL:
+        return content, {}
+    if isinstance(content, str):
+        open_token = _JPL_CONTENT_ENCODED_CDATA_TOKEN.decode("ascii")
+        open_replacement = _JPL_CONTENT_ENCODED_CDATA_REPLACEMENT.decode("ascii")
+        close_token = _JPL_CONTENT_ENCODED_CLOSE_TOKEN.decode("ascii")
+        close_replacement = _JPL_CONTENT_ENCODED_CLOSE_REPLACEMENT.decode("ascii")
+    elif isinstance(content, (bytes, bytearray)):
+        content = bytes(content)
+        open_token = _JPL_CONTENT_ENCODED_CDATA_TOKEN
+        open_replacement = _JPL_CONTENT_ENCODED_CDATA_REPLACEMENT
+        close_token = _JPL_CONTENT_ENCODED_CLOSE_TOKEN
+        close_replacement = _JPL_CONTENT_ENCODED_CLOSE_REPLACEMENT
+    else:
+        return content, {}
+    open_count = content.count(open_token)
+    close_count = content.count(close_token)
+    if open_count <= 0 or open_count != close_count:
+        return content, {}
+    return (
+        content.replace(open_token, open_replacement).replace(
+            close_token,
+            close_replacement,
+        ),
+        {
+            _REPAIR_JPL_CONTENT_ENCODED_CDATA: open_count,
+            _REPAIR_JPL_CONTENT_ENCODED_CLOSE: close_count,
+        },
+    )
+
+
+def _parse_feed_with_safe_xml_repair(content, *, feed_url):
+    """Retry bozo feeds only through deterministic, audited repair rules."""
+    original = feedparser.parse(content)
+    original_bozo = bool(_field(original, "bozo", False))
+    original_exception = str(_field(original, "bozo_exception", "") or "")
+    audit = {
+        "bozo": original_bozo,
+        "bozo_exception": original_exception,
+        "xml_repair_attempted": False,
+        "xml_repair_applied": False,
+        "xml_repair_removed_characters": 0,
+        "repair_types": [],
+        "repair_counts": {},
+        "post_repair_bozo": None,
+        "post_repair_bozo_exception": "",
+    }
+    if not original_bozo:
+        return original, audit
+
+    repaired_content, removed = _remove_safe_xml_10_illegal_characters(content)
+    audit["xml_repair_removed_characters"] = removed
+    if removed:
+        audit["repair_counts"][_REPAIR_XML_10_ILLEGAL_CHARACTERS] = removed
+    repaired_content, jpl_repair_counts = _replace_audited_jpl_content_encoded_token(
+        repaired_content,
+        feed_url,
+    )
+    audit["repair_counts"].update(jpl_repair_counts)
+    audit["repair_types"] = list(audit["repair_counts"])
+    if not audit["repair_types"]:
+        return original, audit
+
+    audit["xml_repair_attempted"] = True
+    repaired = feedparser.parse(repaired_content)
+    repaired_bozo = bool(_field(repaired, "bozo", False))
+    audit["post_repair_bozo"] = repaired_bozo
+    audit["post_repair_bozo_exception"] = str(
+        _field(repaired, "bozo_exception", "") or ""
+    )
+    if repaired_bozo:
+        return original, audit
+    audit["xml_repair_applied"] = True
+    return repaired, audit
 
 
 def _fixture_timestamp(value, field_name):
@@ -163,7 +318,12 @@ def load_rss_fixture(path):
         seen_urls.add(url)
         if item.get("status") not in {"healthy", "degraded", "failed"}:
             raise ValueError(f"RSS fixture health {index} has invalid status")
-        for field in ("fresh_entries", "total_entries", "quarantined_entries"):
+        for field in (
+            "fresh_entries",
+            "total_entries",
+            "quarantined_entries",
+            "policy_filtered_entries",
+        ):
             value = item.get(field, 0)
             if type(value) is not int or value < 0:
                 raise ValueError(f"RSS fixture health {index} has invalid {field}")
@@ -234,8 +394,17 @@ def fetch_rss_feeds(
             "fresh_entries": 0,
             "total_entries": 0,
             "quarantined_entries": 0,
+            "policy_filtered_entries": 0,
             "newest_published_at": None,
             "bozo": False,
+            "bozo_exception": "",
+            "xml_repair_attempted": False,
+            "xml_repair_applied": False,
+            "xml_repair_removed_characters": 0,
+            "repair_types": [],
+            "repair_counts": {},
+            "post_repair_bozo": None,
+            "post_repair_bozo_exception": "",
             "content_type": "",
             "error": "",
             "latency_ms": 0.0,
@@ -285,10 +454,13 @@ def fetch_rss_feeds(
                         time.sleep(float(retry_delay) * attempt)
             health["content_type"] = _validate_content_type(response)
 
-            parsed_feed = feedparser.parse(response.content)
+            parsed_feed, parse_audit = _parse_feed_with_safe_xml_repair(
+                response.content,
+                feed_url=feed_url,
+            )
             entries = list(_field(parsed_feed, "entries", []) or [])
             health["total_entries"] = len(entries)
-            health["bozo"] = bool(_field(parsed_feed, "bozo", False))
+            health.update(parse_audit)
             source_name = _source_title(parsed_feed, feed_url)
             newest = None
 
@@ -317,10 +489,15 @@ def fetch_rss_feeds(
                 raw_title = _field(entry, "title", "")
                 raw_summary = _field(entry, "summary", "")
                 reference_urls = _reference_urls(raw_summary, content)
+                clean_title = _clean_html(raw_title, separator="") or "No Title"
+                link = _field(entry, "link", "") or ""
+                if _is_obvious_consumer_promotion(clean_title, link):
+                    health["policy_filtered_entries"] += 1
+                    continue
                 local_articles.append(
                     {
-                        "title": _clean_html(raw_title, separator="") or "No Title",
-                        "link": _field(entry, "link", "") or "",
+                        "title": clean_title,
+                        "link": link,
                         "summary": _clean_html(raw_summary),
                         "content": _clean_html(content),
                         "source": source_name,
@@ -335,9 +512,19 @@ def fetch_rss_feeds(
             health["newest_published_at"] = newest.isoformat() if newest else None
             degraded_reasons = []
             if health["bozo"]:
-                degraded_reasons.append(
-                    f"bozo feed: {_field(parsed_feed, 'bozo_exception', 'parse error')}"
-                )
+                if health["xml_repair_applied"]:
+                    repair_summary = ", ".join(
+                        f"{repair_type}={count}"
+                        for repair_type, count in health["repair_counts"].items()
+                    )
+                    degraded_reasons.append(
+                        f"bozo feed safely repaired via {repair_summary}: "
+                        f"{health['bozo_exception'] or 'parse error'}"
+                    )
+                else:
+                    degraded_reasons.append(
+                        f"bozo feed: {health['bozo_exception'] or 'parse error'}"
+                    )
             if health["quarantined_entries"]:
                 degraded_reasons.append(
                     f"{health['quarantined_entries']} entries quarantined"

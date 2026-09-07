@@ -3,6 +3,7 @@ import json
 import time
 import hashlib
 import tempfile
+import fcntl
 
 from url_identity import canonicalize_article_url
 
@@ -15,8 +16,12 @@ CACHE_FILE = os.path.abspath(
 CACHE_TTL_DAYS = 30
 SECONDS_IN_A_DAY = 86400
 
-MAX_CACHE_ENTRIES = 1000
+# Roughly one month of the current 300-article/day candidate volume.  The
+# previous 1,000-entry cap retained only about three runs and defeated the
+# content-hash cache on otherwise unchanged articles.
+MAX_CACHE_ENTRIES = int(os.environ.get("RADAR_MAX_CACHE_ENTRIES", "10000"))
 CACHE_SCHEMA_VERSION = 3
+SEMANTIC_CACHE_SCHEMA_VERSION = 1
 DEEP_DIVE_MISS_SCHEMA_VERSION = 1
 DEEP_DIVE_POLICY_VERSION = "verified-independent-primary-v1"
 DEEP_DIVE_MISS_TTL_SECONDS = 24 * 60 * 60
@@ -56,6 +61,41 @@ def build_cache_key(article, config, prompt_version, provider, model):
         "prompt_version": str(prompt_version),
         "provider": str(provider),
         "model": str(model),
+        "config": config,
+    }
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def build_semantic_cache_key(article, config, prompt_version, rules_sha256):
+    """Return the provider-independent identity of an actual scoring request.
+
+    Provider and model remain cache-entry provenance. They are deliberately not
+    part of this key: an already validated score for the exact same article,
+    source evidence, prompt contract, and deterministic rules must not incur a
+    second API charge merely because the operator changes the provider order.
+    """
+
+    payload = {
+        "semantic_schema_version": SEMANTIC_CACHE_SCHEMA_VERSION,
+        "url": _canonical_url(article.get("link") or article.get("url")),
+        "content": {
+            "title": article.get("title", ""),
+            "summary": article.get("summary", ""),
+            "content": article.get("content", ""),
+            "published_at": article.get("published_at", ""),
+        },
+        "source_evidence": {
+            "source": article.get("source"),
+            "source_id": article.get("source_id"),
+            "source_tier": article.get("source_tier"),
+            "source_lane": article.get("source_lane"),
+            "source_domains": sorted(article.get("source_domains") or []),
+            "authority_for": sorted(article.get("authority_for") or []),
+            "trade_eligible": article.get("trade_eligible"),
+            "requires_corroboration": article.get("requires_corroboration"),
+        },
+        "prompt_version": str(prompt_version),
+        "rules_sha256": str(rules_sha256),
         "config": config,
     }
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
@@ -112,35 +152,28 @@ def is_fresh_deep_dive_miss(entry, *, now=None):
         return False
     return 0 <= age < DEEP_DIVE_MISS_TTL_SECONDS
 
+def _prune_cache(cache_data, *, now=None):
+    # Validated scores are content-addressed facts. Evicting them by age or an
+    # arbitrary capacity cap would violate the no-rescore contract and create
+    # avoidable API charges. Time-bounded deep-dive failures are evaluated by
+    # ``is_fresh_deep_dive_miss`` and do not require deleting the score entry.
+    return 0, 0
+
+
 def load_cache():
     if os.path.exists(CACHE_FILE):
         try:
             with open(CACHE_FILE, 'r', encoding='utf-8') as f:
                 cache_data = json.load(f)
                 
-            current_time = time.time()
-            keys_to_delete = []
-            for key, value in cache_data.items():
-                if isinstance(value, dict) and "timestamp" in value:
-                    if current_time - value["timestamp"] > CACHE_TTL_DAYS * SECONDS_IN_A_DAY:
-                        keys_to_delete.append(key)
-                        
-            if keys_to_delete:
-                for key in keys_to_delete:
-                    del cache_data[key]
-                print(f"Pruned {len(keys_to_delete)} expired cache entries.", flush=True)
-                
-            # Limit to MAX_CACHE_ENTRIES
-            if len(cache_data) > MAX_CACHE_ENTRIES:
-                sorted_entries = sorted(
-                    cache_data.items(), 
-                    key=lambda item: item[1].get("timestamp", 0) if isinstance(item[1], dict) else 0,
-                    reverse=True
+            expired, overflow = _prune_cache(cache_data)
+            if expired:
+                print(f"Pruned {expired} expired cache entries.", flush=True)
+            if overflow:
+                print(
+                    f"Pruned {overflow} cache entries to maintain max size.",
+                    flush=True,
                 )
-                keys_to_delete = [item[0] for item in sorted_entries[MAX_CACHE_ENTRIES:]]
-                for key in keys_to_delete:
-                    del cache_data[key]
-                print(f"Pruned {len(keys_to_delete)} cache entries to maintain max size.", flush=True)
                 
             return cache_data
         except Exception as e:
@@ -154,6 +187,12 @@ def save_cache(cache_data):
     for key, value in cache_data.items():
         if isinstance(value, dict) and "timestamp" not in value:
             value["timestamp"] = current_time
+    expired, overflow = _prune_cache(cache_data, now=current_time)
+    if expired or overflow:
+        print(
+            f"Pruned cache before save: expired={expired}, overflow={overflow}.",
+            flush=True,
+        )
             
     temp_path = None
     try:
@@ -182,3 +221,79 @@ def save_cache(cache_data):
                 os.unlink(temp_path)
             except OSError:
                 pass
+
+
+def merge_verified_cache_entries(entries):
+    """Atomically merge importer-verified scores into the content cache.
+
+    Manual-review imports run after the interactive capture has paused.  A
+    locked read/modify/write prevents a concurrent legitimate cache writer from
+    being lost.  An exact semantic identity is immutable: conflicting scores
+    fail closed rather than using whichever import happened last.
+    """
+
+    if not isinstance(entries, dict) or any(
+        not isinstance(key, str)
+        or not key
+        or not isinstance(value, dict)
+        or value.get("cache_key") != key
+        for key, value in entries.items()
+    ):
+        raise ValueError("verified cache entries are malformed")
+    target_path = os.path.abspath(CACHE_FILE)
+    target_dir = os.path.dirname(target_path)
+    os.makedirs(target_dir, exist_ok=True)
+    lock_path = target_path + ".lock"
+    with open(lock_path, "a+", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            if os.path.exists(target_path):
+                try:
+                    with open(target_path, "r", encoding="utf-8") as handle:
+                        cache_data = json.load(handle)
+                except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                    raise RuntimeError(
+                        f"Cannot read score cache for verified merge: {error}"
+                    ) from error
+                if not isinstance(cache_data, dict):
+                    raise RuntimeError("Score cache root must be a JSON object")
+            else:
+                cache_data = {}
+
+            for key, entry in entries.items():
+                existing = cache_data.get(key)
+                if isinstance(existing, dict) and existing.get(
+                    "score_data"
+                ) != entry.get("score_data"):
+                    raise RuntimeError(
+                        "Conflicting validated scores for semantic cache key " + key
+                    )
+                cache_data[key] = entry
+
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=target_dir,
+                    prefix=f".{os.path.basename(target_path)}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as handle:
+                    temporary = handle.name
+                    json.dump(
+                        cache_data,
+                        handle,
+                        ensure_ascii=False,
+                        indent=2,
+                        allow_nan=False,
+                    )
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, target_path)
+                temporary = None
+            finally:
+                if temporary and os.path.exists(temporary):
+                    os.unlink(temporary)
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)

@@ -41,8 +41,20 @@ def run_smoke(root):
 
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     registry = source_registry.load_source_registry(config)
-    if len(registry) != len(config.get("rss_feeds", [])):
+    rss_registry = [
+        entry for entry in registry.values() if entry.get("adapter") == "rss"
+    ]
+    newsroom_registry = [
+        entry
+        for entry in registry.values()
+        if entry.get("adapter") == "official_newsroom"
+    ]
+    if len(rss_registry) != len(config.get("rss_feeds", [])):
         raise RuntimeError("source registry and RSS configuration are not aligned")
+    if len(newsroom_registry) != len(config.get("official_newsrooms", [])):
+        raise RuntimeError(
+            "source registry and official newsroom configuration are not aligned"
+        )
     providers = config.get("llm", {}).get("providers", {})
     enabled_providers = sorted(
         name for name, provider in providers.items() if provider.get("enabled") is True
@@ -68,7 +80,8 @@ def run_smoke(root):
         raise RuntimeError("Research Watch decision contract is unavailable")
     return {
         "status": "ok",
-        "rss_sources": len(registry),
+        "rss_sources": len(rss_registry),
+        "official_newsroom_sources": len(newsroom_registry),
         "event_types": len(event_contract.INDUSTRIAL_EVENT_TYPES),
         "external_providers_enabled": enabled_providers,
         "delivery_enabled": False,
