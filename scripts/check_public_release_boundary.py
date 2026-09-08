@@ -252,6 +252,13 @@ def scan_secrets(root, paths) -> list[dict]:
         if b"\0" in data:
             findings.append({"path": relative, "reason": "binary_file"})
             continue
+        if relative == "config/manual_review_cache_revocations.json":
+            try:
+                public_policy = json.loads(data)
+            except (ValueError, UnicodeDecodeError):
+                public_policy = None
+            if public_policy != {"schema_version": 1, "incidents": []}:
+                findings.append({"path": relative, "reason": "private_manual_review_policy"})
         for name, pattern in SECRET_PATTERNS:
             if pattern.search(data):
                 findings.append(
