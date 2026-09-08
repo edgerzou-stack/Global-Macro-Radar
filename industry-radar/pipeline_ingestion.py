@@ -87,11 +87,20 @@ def collect_articles(
             validate_rss_fixture_effective_date(articles, health, effective_date)
     else:
         reference_time = rss_reference_time_utc()
+        fetch_options = {}
+        if (config.get("rss_source_cooldown_enabled") is True
+                and os.environ.get("PIPELINE_MODE") == "production"):
+            # Mutable collection scheduling state is never consulted on replay
+            # or by a shadow run. It contains no article bodies or scores.
+            fetch_options["source_state_path"] = str(
+                Path(__file__).resolve().parent / ".cache" / "rss-source-state.json"
+            )
         articles, health = fetch_feeds(
             config.get("rss_feeds", []),
             hours_back=hours_back,
             now=reference_time,
             return_health=True,
+            **fetch_options,
         )
         newsroom_entries = [
             entry

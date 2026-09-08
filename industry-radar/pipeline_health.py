@@ -1,5 +1,81 @@
 import os
 from datetime import date, datetime, time, timedelta, timezone
+from urllib.parse import urlsplit
+
+
+def _publisher_host_key(item):
+    host = (urlsplit(str(item.get("url") or "")).hostname or "").lower().rstrip(".")
+    # Without a public-suffix dependency, collapse to the last two labels.
+    # This deliberately undercounts e.g. co.uk publishers, never treats sibling
+    # feeds/subdomains as independent. Registry identity resolves ambiguity.
+    return "host:" + ".".join(host.split(".")[-2:])
+
+
+def _discovery_domain_coverage(health, reference_time, cadence_hours):
+    """Diagnostic only: alternatives never erase endpoint failure or gates."""
+    discovery = [row for row in health if row.get("source_lane") == "discovery"]
+    # Join owner identities across hosts AND sibling feeds with incomplete
+    # metadata. A missing publisher identity must not fabricate independence.
+    parents = {}
+
+    def root(key):
+        parents.setdefault(key, key)
+        if parents[key] != key:
+            parents[key] = root(parents[key])
+        return parents[key]
+
+    for row in discovery:
+        host_key = _publisher_host_key(row)
+        identity = str(row.get("publisher_identity") or "").strip().casefold()
+        if identity:
+            parents[root(host_key)] = root("publisher:" + identity)
+
+    def publisher_key(row):
+        return root(_publisher_host_key(row))
+
+    domains = sorted({domain for row in discovery for domain in row.get("source_domains", [])})
+    summaries = []
+    for domain in domains:
+        sources = [row for row in discovery if domain in row.get("source_domains", [])]
+        failed = [row for row in sources if row.get("status") == "failed"]
+        reachable = [row for row in sources if row.get("status") != "failed"]
+        fresh = [row for row in reachable if int(row.get("fresh_entries") or 0) > 0]
+        current = []
+        for row in reachable:
+            newest = row.get("newest_published_at")
+            maximum_hours = cadence_hours.get(row.get("expected_cadence", "irregular"))
+            if maximum_hours is None:
+                # An irregular publication has no freshness SLA; do not claim
+                # currency solely because an old feed remains reachable.
+                if row in fresh:
+                    current.append(row)
+            elif newest:
+                age = reference_time - aware_utc_timestamp(newest, "discovery newest_published_at")
+                if -timedelta(minutes=5) <= age <= timedelta(hours=maximum_hours):
+                    current.append(row)
+        failed_publishers = {publisher_key(row) for row in failed}
+        fresh_publishers = {publisher_key(row) for row in fresh}
+        alternatives = fresh_publishers - failed_publishers
+        summaries.append({
+            "domain": domain,
+            "configured_sources": len(sources),
+            "failed_sources": len(failed),
+            "reachable_sources": len(reachable),
+            "current_sources": len(current),
+            "fresh_sources": len(fresh),
+            "fresh_entries": sum(int(row.get("fresh_entries") or 0) for row in fresh),
+            "reachable_publishers": len({publisher_key(row) for row in reachable}),
+            "current_publishers": len({publisher_key(row) for row in current}),
+            "fresh_publishers": len(fresh_publishers),
+            "fresh_independent_alternative_publishers": len(alternatives) if failed else 0,
+            "failed_source_urls": sorted(str(row.get("url") or "") for row in failed),
+            "failure_coverage_status": (
+                "no_failed_sources" if not failed else
+                "covered_by_fresh_independent_alternative" if alternatives else
+                "uncovered_no_fresh_independent_alternative"
+            ),
+        })
+    return summaries
 
 
 def aware_utc_timestamp(value, field_name):
@@ -258,6 +334,9 @@ def validate_rss_health(
         "monthly": 1080.0,
         "irregular": None,
     }
+    discovery_domain_coverage = _discovery_domain_coverage(
+        health, reference_time, cadence_hours
+    )
     primary_domain_coverage = []
     for domain in required_domains:
         domain_sources = [
@@ -492,4 +571,9 @@ def validate_rss_health(
         "primary_coverage_warning": bool(primary_failed),
         "critical_source_groups": critical_group_summaries,
         "primary_domain_coverage": primary_domain_coverage,
+        "discovery_domain_coverage": discovery_domain_coverage,
+        "discovery_uncovered_failure_domains": [
+            row["domain"] for row in discovery_domain_coverage
+            if row["failure_coverage_status"] == "uncovered_no_fresh_independent_alternative"
+        ],
     }

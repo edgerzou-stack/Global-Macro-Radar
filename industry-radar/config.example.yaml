@@ -57,10 +57,12 @@ rss_feeds:
   - "https://venturebeat.com/feed" # VentureBeat (深度关注AI与企服)
   - "https://www.wired.com/feed/rss" # Wired 连线杂志
   - "https://www.theverge.com/rss/index.xml" # The Verge (前沿科技与消费电子)
-  - "https://www.tomshardware.com/feeds/all" # Tom's Hardware (硬核半导体与硬件)
+  - "https://www.tomshardware.com/feeds.xml" # Verified canonical redirect target
   - "https://feed.infoq.com/" # InfoQ (硬核软件开发与架构)
   - "https://siliconangle.com/feed/" # SiliconANGLE (硬核企业级科技/云/芯片)
   - "https://feeds.arstechnica.com/arstechnica/technology-lab" # Ars Technica
+  - "https://feeds.arstechnica.com/arstechnica/gadgets" # Independent hardware discovery
+  - "https://feeds.arstechnica.com/arstechnica/science" # Independent science/space discovery
   
   # 医药与生物科技
   - "https://www.statnews.com/feed/" # STAT News (顶级医疗健康前沿)
@@ -74,7 +76,7 @@ rss_feeds:
   - "https://www.sec.gov/news/pressreleases.rss" # SEC 官方新闻稿
   
   # 航空航天与深空探索
-  - "https://www.space.com/feeds/all" # Space.com (深空探索)
+  - "https://www.space.com/feeds.xml" # Verified canonical redirect target
   - "https://www.jpl.nasa.gov/feeds/news/" # NASA/JPL 官方新闻
   
   # 中国本土顶级科技商业与AI媒体
@@ -95,6 +97,7 @@ official_space_newsrooms:
   - "https://content.spacex.com/api/spacex-website/updates"
 
 source_registry_file: source_registry.yaml
+rss_source_cooldown_enabled: true
 
 rss_required_primary_domains: [ai, semiconductor, biotech, energy, space]
 

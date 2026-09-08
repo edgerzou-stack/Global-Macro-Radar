@@ -1,6 +1,6 @@
 {
   "artifact_type": "sanitized-public-export",
-  "candidate_fingerprint": "d558b41e39f7ef57167d04e3d81261e673d1e61d253e484f1c9f56fb8d7a79c9",
+  "candidate_fingerprint": "ea2341b355085da10b624f5ed156e69ceaa07f8e7114544ba024f22f85f214de",
   "entries": [
     {
       "destination": ".github/workflows/public-boundary.yml",
@@ -22,8 +22,8 @@
     },
     {
       "destination": "PUBLIC_EXPORT_POLICY.json",
-      "sha256": "2e00e9fd02befabb09b54537d77948405239cd34b3df0bb2c075cd802e495442",
-      "size": 4796,
+      "sha256": "fa7d86418e644b7514f0fc1f7d813f689e06bea81f8f9cd3885cf4f8ec5e8863",
+      "size": 5028,
       "source": "public/public_export_policy.json"
     },
     {
@@ -37,6 +37,12 @@
       "sha256": "690866d0493dfe20be9e9e1f0334c2329df5fef0c63d35fec5785be0235dcd2e",
       "size": 617,
       "source": "public/SECURITY.md"
+    },
+    {
+      "destination": "config/manual_review_cache_revocations.json",
+      "sha256": "633ef0a3a7ccd5ac80bf063d0031d7665f4e78d8354c65e8fcce110360062139",
+      "size": 45,
+      "source": "public/manual_review_cache_revocations.json"
     },
     {
       "destination": "industry-radar/.env.example",
@@ -58,8 +64,8 @@
     },
     {
       "destination": "industry-radar/cache_manager.py",
-      "sha256": "2b8d39ee874fdcfb51052166a869b3540bfe17d8c29ddf8426955e08e9aac76c",
-      "size": 11097,
+      "sha256": "171da814615945d7e9945ca5fa96524a9ce1f41b0ed4c3f72b4ea6c57634d3bc",
+      "size": 13565,
       "source": "industry-radar/cache_manager.py"
     },
     {
@@ -70,8 +76,8 @@
     },
     {
       "destination": "industry-radar/config.example.yaml",
-      "sha256": "7f6e271ae3988c8696c85527a1aa3846120e34227ccdd067dd6c636a2ca8f25c",
-      "size": 9378,
+      "sha256": "feb9e5d444a82a5d53e6007f4fcf6b121d648a87cfe029be684f8ebfeae933f0",
+      "size": 9598,
       "source": "industry-radar/config.example.yaml"
     },
     {
@@ -106,8 +112,8 @@
     },
     {
       "destination": "industry-radar/ingest.py",
-      "sha256": "35aab5b8e02e705b78bd35d70307a027fef5c4ed93084588d633ccca5a8ff11d",
-      "size": 22366,
+      "sha256": "4d517c4784e3395c873860345582c60678b69c8292f30fff9e01ab5494cc7857",
+      "size": 26201,
       "source": "industry-radar/ingest.py"
     },
     {
@@ -166,14 +172,14 @@
     },
     {
       "destination": "industry-radar/pipeline_health.py",
-      "sha256": "fc8126c92ddd9a2e0c9057f964516004c1bf1a6a31058898a45d72c79689c5f7",
-      "size": 18791,
+      "sha256": "055b8f851cf5969544d3a56f9ae61cf02eff9be8ae64a2c887275cdd5e9dff71",
+      "size": 22914,
       "source": "industry-radar/pipeline_health.py"
     },
     {
       "destination": "industry-radar/pipeline_ingestion.py",
-      "sha256": "13b32d300c6845cdc72946ed2f6235f7cbba7d9a1b55b69260880cdeb585ef7e",
-      "size": 7138,
+      "sha256": "a93ca6eeaaefee39d5c7423c0701d0e9b9fcff530da3b76a73b3a62d540d00d1",
+      "size": 7633,
       "source": "industry-radar/pipeline_ingestion.py"
     },
     {
@@ -207,6 +213,12 @@
       "source": "industry-radar/requirements.txt"
     },
     {
+      "destination": "industry-radar/rss_source_state.py",
+      "sha256": "fa981b53add6c67cc3f14fa9e83e84301b8498533869ed895b0452193e0e9855",
+      "size": 4072,
+      "source": "industry-radar/rss_source_state.py"
+    },
+    {
       "destination": "industry-radar/run_date.py",
       "sha256": "e80bf98127a4d9770911c7fc9985002395f622465274143502f7925af9ae5fe1",
       "size": 642,
@@ -238,8 +250,8 @@
     },
     {
       "destination": "industry-radar/source_registry.yaml",
-      "sha256": "440e885e6449ee0a6af7bd7c7f9cc3f6aebdf3cca0ac43a61e7d23ce0a0ab137",
-      "size": 11778,
+      "sha256": "627695b82d97ab05acce11091e71554f50bb7550c2045cb3b1ea03a7d7933e33",
+      "size": 12469,
       "source": "industry-radar/source_registry.yaml"
     },
     {
@@ -262,14 +274,14 @@
     },
     {
       "destination": "scripts/check_public_release_boundary.py",
-      "sha256": "34e3327efc860c5e36b686f65e6b9c39c4552fd7c96d74b1598e7e397e15f8a9",
-      "size": 12479,
+      "sha256": "ee0eb4f10b4cdec3c323bc5d484f8d65b3f374072600231a54273ab907128a3c",
+      "size": 12871,
       "source": "scripts/check_public_release_boundary.py"
     },
     {
       "destination": "scripts/smoke_public_radar.py",
-      "sha256": "07a188b01f8cd5fe129cb181fea787c9cc6e1526c30c3c4c76724a378cdedf57",
-      "size": 4039,
+      "sha256": "a8df69499413b54b8eb76029d99fdf5526fa981c062c0ad60cea5c11b5a0433a",
+      "size": 4282,
       "source": "scripts/smoke_public_radar.py"
     },
     {
@@ -282,5 +294,5 @@
   "policy_version": "public-export-v2-exact",
   "schema_version": 1,
   "source_dirty": false,
-  "source_revision": "9afa8f018b57b5c85aeb7d6f9ecd806a8d27937d"
+  "source_revision": "e53e46fc541ace7b25227ca90d6c9add2204d28d"
 }

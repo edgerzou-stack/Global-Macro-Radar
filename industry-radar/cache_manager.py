@@ -4,6 +4,7 @@ import time
 import hashlib
 import tempfile
 import fcntl
+from functools import lru_cache
 
 from url_identity import canonicalize_article_url
 
@@ -25,6 +26,51 @@ SEMANTIC_CACHE_SCHEMA_VERSION = 1
 DEEP_DIVE_MISS_SCHEMA_VERSION = 1
 DEEP_DIVE_POLICY_VERSION = "verified-independent-primary-v1"
 DEEP_DIVE_MISS_TTL_SECONDS = 24 * 60 * 60
+MANUAL_REVIEW_REVOCATIONS_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "config", "manual_review_cache_revocations.json",
+)
+
+
+@lru_cache(maxsize=8)
+def _load_manual_review_revocations(path):
+    # This is deployment policy, not mutable runtime cache. A missing policy
+    # must not silently restore scores whose review evidence was invalidated.
+    try:
+        with open(path, encoding="utf-8") as handle:
+            policy = json.load(handle)
+        if policy.get("schema_version") != 1 or not isinstance(policy.get("incidents"), list):
+            raise ValueError("invalid schema")
+        revoked = set()
+        for incident in policy["incidents"]:
+            run_id = incident["source_run_id"]
+            if not isinstance(run_id, str) or not run_id or not incident["reason"]:
+                raise ValueError("invalid incident provenance")
+            for entry in incident["entries"]:
+                key = entry["semantic_input_sha256"]
+                fingerprint = entry["score_data_sha256"]
+                if any(not isinstance(v, str) or len(v) != 64 or
+                       any(c not in "0123456789abcdef" for c in v)
+                       for v in (key, fingerprint)):
+                    raise ValueError("invalid score identity")
+                revoked.add((run_id, key, fingerprint))
+        return frozenset(revoked)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+        raise RuntimeError("Manual review cache revocation policy unavailable or invalid") from error
+
+
+def is_revoked_manual_score(entry):
+    """Reject only the exact score and run provenance covered by an incident."""
+    if not isinstance(entry, dict) or "manual_review_provenance" not in entry:
+        return False
+    revoked = _load_manual_review_revocations(MANUAL_REVIEW_REVOCATIONS_FILE)
+    provenance = entry.get("manual_review_provenance") or {}
+    fingerprint = hashlib.sha256(_canonical_json(entry.get("score_data")).encode("utf-8")).hexdigest()
+    return (
+        provenance.get("source_run_id"),
+        entry.get("semantic_cache_key") or entry.get("cache_key"),
+        fingerprint,
+    ) in revoked
 
 
 def _canonical_json(value):
@@ -118,6 +164,8 @@ def get_cached_score(entry, expected_cache_key):
     if entry.get("schema_version") != CACHE_SCHEMA_VERSION:
         return None
     if entry.get("cache_key") != expected_cache_key:
+        return None
+    if is_revoked_manual_score(entry):
         return None
     score_data = entry.get("score_data")
     return score_data if isinstance(score_data, dict) else None
@@ -261,10 +309,12 @@ def merge_verified_cache_entries(entries):
                 cache_data = {}
 
             for key, entry in entries.items():
+                if is_revoked_manual_score(entry):
+                    raise RuntimeError("Cannot import revoked manual review score " + key)
                 existing = cache_data.get(key)
                 if isinstance(existing, dict) and existing.get(
                     "score_data"
-                ) != entry.get("score_data"):
+                ) != entry.get("score_data") and not is_revoked_manual_score(existing):
                     raise RuntimeError(
                         "Conflicting validated scores for semantic cache key " + key
                     )

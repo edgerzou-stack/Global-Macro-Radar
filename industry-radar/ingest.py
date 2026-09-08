@@ -10,9 +10,11 @@ from urllib.parse import urlsplit
 
 import cloudscraper
 import feedparser
+import requests
 from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
 from provider_errors import log_provider_error
+from rss_source_state import active_cooldown, locked_source_state, record_results
 
 
 logger = logging.getLogger(__name__)
@@ -20,6 +22,7 @@ logger = logging.getLogger(__name__)
 ALLOWED_FEED_CONTENT_TYPES = ("rss", "atom", "xml")
 MAX_FUTURE_SKEW = timedelta(minutes=5)
 RSS_FIXTURE_SCHEMA_VERSION = 1
+RSS_TIMEOUT_RETRY_CAP_SECONDS = 30
 JPL_AUDITED_RSS_URL = "https://www.jpl.nasa.gov/feeds/news/"
 _JPL_CONTENT_ENCODED_CDATA_TOKEN = b"<content:encoded<![CDATA["
 _JPL_CONTENT_ENCODED_CDATA_REPLACEMENT = b"<content:encoded><![CDATA["
@@ -367,11 +370,42 @@ def fetch_rss_feeds(
     max_workers=10,
     request_attempts=2,
     retry_delay=0.25,
+    source_state_path=None,
+):
+    """Fetch RSS with optional live-only persistent failure cooldown.
+
+    Omit source_state_path for deterministic fixture/test isolation. Corrupt or
+    concurrently locked state stops collection, never silently resets memory.
+    """
+    arguments = dict(now=now, return_health=True, request_timeout=request_timeout,
+                     max_workers=max_workers, request_attempts=request_attempts,
+                     retry_delay=retry_delay)
+    if source_state_path is None:
+        articles, health = _fetch_rss_feeds(feeds, hours_back, **arguments)
+    else:
+        clock = _as_utc(now or datetime.now(timezone.utc))
+        arguments["now"] = clock
+        with locked_source_state(source_state_path) as state:
+            # Validate every configured source clock before starting any request.
+            for url in feeds:
+                active_cooldown(state["sources"].get(url), clock)
+            articles, health = _fetch_rss_feeds(
+                feeds, hours_back, source_state=state["sources"], **arguments)
+            record_results(state, health, clock)
+    return (articles, health) if return_health else articles
+
+
+def _fetch_rss_feeds(
+    feeds, hours_back=168, *, now=None, return_health=False,
+    request_timeout=15, max_workers=10, request_attempts=2, retry_delay=0.25,
+    source_state=None,
 ):
     """Fetch recent RSS articles and optionally return per-source health state.
 
     Timestamps are normalized to UTC. Entries without a trustworthy timestamp are
-    quarantined rather than being presented as newly published.
+    quarantined rather than being presented as newly published. A timeout gets a
+    bounded longer wait on the next existing attempt, not an extra attempt or a
+    substitute source. Explicit timeouts above the retry cap are not shortened.
     """
     if type(request_attempts) is not int or request_attempts < 1:
         raise ValueError("request_attempts must be a positive integer")
@@ -409,7 +443,16 @@ def fetch_rss_feeds(
             "error": "",
             "latency_ms": 0.0,
             "attempts": 0,
+            "attempt_history": [],
+            "cooldown_active": False,
         }
+        record = (source_state or {}).get(feed_url)
+        if active_cooldown(record, now_utc):
+            health.update(cooldown_active=True, prior_error=record["prior_error"],
+                          retry_after=record["retry_after"],
+                          consecutive_failures=record["consecutive_failures"],
+                          error=f"source cooldown until {record['retry_after']}: {record['prior_error']}")
+            return [], health
         try:
             headers = {
                 "User-Agent": (
@@ -420,27 +463,51 @@ def fetch_rss_feeds(
             }
             scraper = cloudscraper.create_scraper()
             response = None
+            attempt_timeout = request_timeout
             for attempt in range(1, request_attempts + 1):
                 health["attempts"] = attempt
+                # Do not let a previous HTTP response classify a later timeout.
+                response = None
+                attempt_audit = {"attempt": attempt, "timeout": attempt_timeout}
+                health["attempt_history"].append(attempt_audit)
                 try:
                     response = scraper.get(
                         feed_url,
                         headers=headers,
-                        timeout=request_timeout,
+                        timeout=attempt_timeout,
                     )
                     status_code = int(getattr(response, "status_code", 200))
                     if hasattr(response, "raise_for_status"):
                         response.raise_for_status()
                     elif status_code >= 400:
                         raise RuntimeError(f"HTTP {status_code}")
+                    attempt_audit.update(status="received", status_code=status_code)
                     break
                 except Exception as exc:
                     status_code = int(
-                        getattr(locals().get("response"), "status_code", 0) or 0
+                        getattr(response, "status_code", 0) or 0
                     )
-                    retryable = not (400 <= status_code < 500 and status_code != 429)
+                    # Respect explicit client/rate-limit refusal: a later run may
+                    # probe, but this invocation must not immediately retry it.
+                    retryable = not (400 <= status_code < 500)
+                    attempt_audit.update(
+                        status="failed", status_code=status_code,
+                        error_type=type(exc).__name__, error=str(exc),
+                        will_retry=attempt < request_attempts and retryable,
+                    )
                     if attempt >= request_attempts or not retryable:
                         raise
+                    if isinstance(exc, requests.exceptions.Timeout):
+                        def longer_timeout(value):
+                            if value is None:
+                                return None
+                            return max(value, min(value * 2, RSS_TIMEOUT_RETRY_CAP_SECONDS))
+
+                        attempt_timeout = (
+                            tuple(longer_timeout(value) for value in attempt_timeout)
+                            if isinstance(attempt_timeout, tuple)
+                            else longer_timeout(attempt_timeout)
+                        )
                     log_provider_error(
                         logger,
                         exc,
@@ -543,6 +610,11 @@ def fetch_rss_feeds(
         except Exception as exc:
             health["status"] = "failed"
             health["error"] = str(exc)
+            health["cooldown_eligible"] = (
+                isinstance(exc, requests.exceptions.Timeout)
+                or bool(health["attempt_history"] and
+                        health["attempt_history"][-1].get("status_code") in {403, 429})
+            )
             log_provider_error(
                 logger,
                 exc,
