@@ -33,6 +33,7 @@ def run_smoke(root):
     import yaml
 
     import event_contract
+    import cache_manager
     import evidence_policy
     import main as radar_main
     import pipeline_selection
@@ -40,6 +41,8 @@ def run_smoke(root):
     import source_registry
 
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    if cache_manager.is_revoked_manual_score({"manual_review_provenance": {"run_id": "public-smoke"}}):
+        raise RuntimeError("public smoke manual score unexpectedly revoked")
     registry = source_registry.load_source_registry(config)
     rss_registry = [
         entry for entry in registry.values() if entry.get("adapter") == "rss"
@@ -80,6 +83,7 @@ def run_smoke(root):
         raise RuntimeError("Research Watch decision contract is unavailable")
     return {
         "status": "ok",
+        "manual_cache_policy": True,
         "rss_sources": len(rss_registry),
         "official_newsroom_sources": len(newsroom_registry),
         "event_types": len(event_contract.INDUSTRIAL_EVENT_TYPES),

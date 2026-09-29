@@ -3,8 +3,12 @@ import os
 import tempfile
 
 from hotspot_evidence import publish_hotspot_evidence
-from pipeline_selection import select_report_articles
+from pipeline_selection import review_is_pending, select_report_articles
 from run_date import logical_today
+from score import unscored_priority_industry_eligibility
+from llm_cost_policy import validate_unscored_priority_display
+from datetime import timedelta
+from url_identity import canonicalize_article_url
 
 
 def _has_primary_evidence_warning(diagnostics, threshold):
@@ -20,7 +24,16 @@ def _has_primary_evidence_warning(diagnostics, threshold):
     return bool((selected and ratio < threshold) or (not selected and excluded))
 
 
-def _write_selection_health(output_dir, report_date, diagnostics, config):
+def _write_selection_health(
+    output_dir,
+    report_date,
+    diagnostics,
+    config,
+    *,
+    unscored_priority_count=0,
+    review_pending_count=0,
+    priority_selection_decisions=(),
+):
     threshold = float(
         config.get("output", {}).get(
             "report_min_primary_supported_ratio",
@@ -49,6 +62,21 @@ def _write_selection_health(output_dir, report_date, diagnostics, config):
         "llm_cost": dict(config.get("_runtime", {}).get("llm_cost", {})),
         "llm_review_bundle_path": config.get("_runtime", {}).get(
             "llm_review_bundle_path"
+        ),
+        "unscored_priority_count": int(unscored_priority_count),
+        "review_pending_count": int(review_pending_count),
+        "priority_selection_decisions": list(priority_selection_decisions),
+        "unscored_priority_filtered_count": int(
+            config.get("_runtime", {}).get(
+                "unscored_priority_filtered_count", 0
+            )
+            or 0
+        ),
+        "unscored_priority_filtered_reasons": dict(
+            config.get("_runtime", {}).get(
+                "unscored_priority_filtered_reasons", {}
+            )
+            or {}
         ),
         "schema_version": 1,
         "run_id": os.environ.get("PIPELINE_RUN_ID", "standalone"),
@@ -90,6 +118,11 @@ def _evidence_text(article):
 
 def _write_article_block(handle, article):
     score = article["score_data"]
+    if score.get("is_relevant") is True:
+        validate_unscored_priority_display({
+            "translated_title": score.get("translated_title"),
+            "translated_summary": score.get("translated_summary"),
+        })
     title = score.get("translated_title", article["title"])
     handle.write(
         "### "
@@ -124,6 +157,26 @@ def _write_article_block(handle, article):
     handle.write(f"[阅读原文]({article['link']})\n\n---\n")
 
 
+def _write_unscored_priority_block(handle, article):
+    display = validate_unscored_priority_display(article.get("priority_display"))
+    title = display["translated_title"]
+    handle.write(f"### {title}\n")
+    if title != article["title"] and display.get("translated_title"):
+        handle.write(f"*{article['title']}*\n\n")
+    handle.write(
+        f"**来源**: {article['source']} | "
+        f"**日期**: {article['published_at'][:10]}\n\n"
+    )
+    summary = display["translated_summary"]
+    if summary:
+        handle.write(f"**摘要**: {summary}\n\n")
+    handle.write(
+        "> **未评分说明**: 此条触发审阅执行器的评分限制，"
+        "未生成任何数值分数；置顶仅供人工判断，不进入常规选股或交易证据流程。\n\n"
+    )
+    handle.write(f"[阅读原文]({article['link']})\n\n---\n")
+
+
 def generate_markdown_report(
     scored_articles,
     config,
@@ -132,7 +185,7 @@ def generate_markdown_report(
     deduplicate=True,
 ):
     from score import apply_industry_relevance_gate
-    from pipeline_scoring import deterministic_deduplicate_articles
+    from pipeline_selection import deterministic_report_event_deduplicate
 
     output_dir = output_dir or os.environ.get(
         "RADAR_REPORTS_DIR",
@@ -150,13 +203,76 @@ def generate_markdown_report(
             f"Deduplicating {len(items)} high-scoring articles...",
             flush=True,
         )
-        result = deterministic_deduplicate_articles(items, selection_config)
+        result = deterministic_report_event_deduplicate(items, selection_config)
         print(
             f"After deduplication: {len(result)} articles remaining.",
             flush=True,
         )
         return result
 
+    review_pending_count = sum(
+        review_is_pending(article)
+        for article in scored_articles
+    )
+    unscored_priority = []
+    priority_selection_decisions = []
+    priority_filtered_reasons = {}
+    priority_seen_links = set()
+    priority_seen_titles = set()
+    priority_source_counts = {}
+    lookback_days = int(config.get("output", {}).get("report_days_lookback", 2))
+    priority_cutoff = (report_date - timedelta(days=lookback_days)).isoformat()
+    priority_source_cap = config.get("output", {}).get("max_selected_per_discovery_source")
+    for article in scored_articles:
+        if article.get("review_outcome") != "unscored_priority":
+            continue
+        eligible, reason = unscored_priority_industry_eligibility(article)
+        published = str(article.get("published_at") or "")[:10]
+        link = canonicalize_article_url(article.get("link") or "")
+        title_key = " ".join(str(article.get("title") or "").casefold().split())
+        source_key = str(article.get("source_id") or article.get("source") or "unknown")
+        if eligible and published and not (priority_cutoff <= published <= report_date.isoformat()):
+            eligible, reason = False, "outside_effective_window"
+        if eligible and (link in priority_seen_links or title_key in priority_seen_titles):
+            eligible, reason = False, "duplicate_priority_event"
+        if (eligible and priority_source_cap is not None
+                and article.get("source_lane") == "discovery"
+                and priority_source_counts.get(source_key, 0) >= priority_source_cap):
+            eligible, reason = False, "priority_source_cap"
+        if eligible:
+            validate_unscored_priority_display(article.get("priority_display"))
+            unscored_priority.append(article)
+            priority_seen_links.add(link)
+            priority_seen_titles.add(title_key)
+            if article.get("source_lane") == "discovery":
+                priority_source_counts[source_key] = priority_source_counts.get(source_key, 0) + 1
+        else:
+            priority_filtered_reasons[reason] = (
+                priority_filtered_reasons.get(reason, 0) + 1
+            )
+        priority_selection_decisions.append({
+            "link": article.get("link"),
+            "rendered": bool(eligible),
+            "report_lane": "unscored_priority" if eligible else "not_rendered",
+            "reason": "reviewed_unscored_priority" if eligible else reason,
+        })
+    scored_articles = [
+        article for article in scored_articles
+        if article.get("review_outcome") != "unscored_priority"
+    ]
+    if priority_filtered_reasons:
+        runtime = config.setdefault("_runtime", {})
+        runtime["unscored_priority_filtered_count"] = int(
+            runtime.get("unscored_priority_filtered_count", 0) or 0
+        ) + sum(priority_filtered_reasons.values())
+        merged_reasons = dict(
+            runtime.get("unscored_priority_filtered_reasons", {}) or {}
+        )
+        for reason, count in priority_filtered_reasons.items():
+            merged_reasons[reason] = merged_reasons.get(reason, 0) + count
+        runtime["unscored_priority_filtered_reasons"] = dict(
+            sorted(merged_reasons.items())
+        )
     selection = select_report_articles(
         scored_articles,
         config,
@@ -171,12 +287,28 @@ def generate_markdown_report(
         + json.dumps(diagnostics, ensure_ascii=False, sort_keys=True),
         flush=True,
     )
-    _write_selection_health(output_dir, report_date, diagnostics, config)
+    _write_selection_health(
+        output_dir,
+        report_date,
+        diagnostics,
+        config,
+        unscored_priority_count=len(unscored_priority),
+        review_pending_count=review_pending_count,
+        priority_selection_decisions=priority_selection_decisions,
+    )
     with open(report_path, "w", encoding="utf-8") as handle:
         handle.write(
             "# 科技产业情报雷达 - Daily Report "
             f"({report_date.isoformat()})\n\n"
         )
+        if unscored_priority:
+            handle.write(
+                "## ⚠️ 未评分优先新闻\n"
+                "_以下条目已通过产业相关性过滤，但因审阅执行器评分限制"
+                "未计分；不进入数值排名或交易证据流程，置顶仅供人工查看。_\n\n"
+            )
+            for article in unscored_priority:
+                _write_unscored_priority_block(handle, article)
         handle.write(
             "> **选题覆盖**："
             f"双高 {diagnostics['supernova']} · "

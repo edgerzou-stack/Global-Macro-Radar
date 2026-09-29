@@ -18,6 +18,22 @@ llm_semaphore = threading.Semaphore(_max_concurrent)
 logger = logging.getLogger(__name__)
 
 
+class LLMInsufficientBalance(RuntimeError):
+    """A provider has reported a permanent lack of paid balance."""
+
+    def __init__(self, provider):
+        self.provider = provider
+        super().__init__(f"{provider} LLM API balance exhausted")
+
+
+def _is_insufficient_balance(exc, provider):
+    return (
+        provider == "deepseek"
+        and getattr(exc, "status_code", None) == 402
+        and "insufficient balance" in str(exc).casefold()
+    )
+
+
 class _LazyGeminiModule:
     def Client(self, **kwargs):
         from google import genai as module
@@ -287,6 +303,8 @@ def _call_llm_with_fallback(
                 retryable=False,
                 degraded_allowed=index + 1 < len(enabled_order),
             )
+            if _is_insufficient_balance(exc, provider):
+                raise LLMInsufficientBalance(provider) from exc
             next_provider = (
                 enabled_order[index + 1]
                 if index + 1 < len(enabled_order)

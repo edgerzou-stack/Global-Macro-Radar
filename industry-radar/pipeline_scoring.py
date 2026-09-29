@@ -9,11 +9,16 @@ from dataclasses import dataclass
 
 from cache_manager import (
     build_cache_key,
+    build_priority_display_cache_key,
     build_semantic_cache_key,
+    get_cached_priority_display,
     get_cached_score,
     load_cache,
+    load_priority_display_cache,
     make_cache_entry,
+    make_priority_display_cache_entry,
     save_cache,
+    save_priority_display_cache,
 )
 from llm_cost_policy import (
     LLMBudgetExceeded,
@@ -22,10 +27,12 @@ from llm_cost_policy import (
     active_run,
     record_runtime,
     resolve_policy,
+    validate_unscored_priority_display,
     write_interactive_base_scores,
     write_manual_review_bundle,
 )
 from pipeline_selection import is_verified_deep_dive
+from llm_router import LLMInsufficientBalance
 from provider_errors import log_provider_error
 
 
@@ -61,6 +68,18 @@ class ScoringResult:
     cache_updates: int
 
 
+def _attach_unscored_priority_display(article, display, *, cache_hit):
+    """Attach only validated Chinese copy; never create a numerical score."""
+
+    article["review_outcome"] = "unscored_priority"
+    article["priority_display"] = validate_unscored_priority_display(display)
+    article["_score_cache_hit"] = bool(cache_hit)
+    article["_score_resolution"] = (
+        "unscored_priority_display_cache" if cache_hit else "unscored_priority"
+    )
+    article["_priority_reason"] = "platform_restricted_subject_matter"
+
+
 def scoring_rules_sha256():
     from event_contract import EVENT_TYPES
     from evidence_policy import EVIDENCE_POLICY_VERSION
@@ -88,6 +107,36 @@ def scoring_rules_sha256():
     return hashlib.sha256(encoded).hexdigest()
 
 
+_BACKWARD_COMPATIBLE_SCORING_RULE_SHA256 = frozenset(
+    {
+        # ``deterministic-industry-boundary-v2`` before the weekly-roundup
+        # rejection was added.  That addition is strictly more restrictive:
+        # every reused score is passed through ``apply_industry_relevance_gate``
+        # below, so a newly rejected roundup is zeroed before it can reach
+        # selection or delivery.  Keeping this one audited predecessor avoids
+        # turning an otherwise identical 100-item RSS capture into a new
+        # manual-review batch merely because a local rejection rule tightened.
+        "929df94457e42c1ba625bac41dd654ac99381f9ebca3a8937dac90a465e6f293",
+    }
+)
+
+
+def compatible_scoring_rules_sha256():
+    """Return approved cache-rule identities, newest first.
+
+    This is deliberately an allowlist rather than a version-prefix rule.  A
+    future scoring-policy change must opt in only after proving it is
+    monotonic (that is, it cannot make an old accepted score less strict).
+    """
+
+    current = scoring_rules_sha256()
+    return (current,) + tuple(
+        rule_hash
+        for rule_hash in sorted(_BACKWARD_COMPATIBLE_SCORING_RULE_SHA256)
+        if rule_hash != current
+    )
+
+
 def scoring_prompt_identity():
     from score import SCORING_PROMPT_SHA256, SCORING_PROMPT_VERSION
 
@@ -105,13 +154,33 @@ def semantic_cache_key(article, config):
     )
 
 
+def compatible_semantic_cache_keys(article, config):
+    """Yield the exact cache identities that are safe to reuse for ``article``."""
+
+    prompt_identity = scoring_prompt_identity()
+    cache_config = scoring_cache_config(config)
+    return tuple(
+        build_semantic_cache_key(
+            article,
+            cache_config,
+            prompt_identity,
+            rule_hash,
+        )
+        for rule_hash in compatible_scoring_rules_sha256()
+    )
+
+
 def scoring_cache_config(config):
+    from score import SCORING_RUBRIC_VERSION, scoring_rubric_sha256
+
     return {
         "industries": config.get("industries", []),
         "importance_criteria": config.get("importance_criteria", ""),
         "scoring_weights": config.get("scoring_weights", {}),
         "trusted_sources": config.get("trusted_sources", []),
         "language": config.get("output", {}).get("language", "Chinese"),
+        "rubric_version": SCORING_RUBRIC_VERSION,
+        "rubric_sha256": scoring_rubric_sha256(config),
     }
 
 
@@ -181,23 +250,27 @@ def validate_scoring_configuration(config):
 def find_cached_article(cache_data, article, config):
     from score import SCORING_PROMPT_VERSION
 
-    semantic_key = semantic_cache_key(article, config)
-    semantic_entry = cache_data.get(semantic_key)
-    score_data = get_cached_score(semantic_entry, semantic_key)
-    if (
-        score_data is not None
-        and isinstance(semantic_entry, dict)
-        and "manual_review_provenance" in semantic_entry
-        and _verified_manual_review_provenance(
-            semantic_entry,
-            semantic_key,
-            score_data,
-        )
-        is None
+    for semantic_key, rule_hash in zip(
+        compatible_semantic_cache_keys(article, config),
+        compatible_scoring_rules_sha256(),
     ):
-        return None, None
-    if score_data is not None:
-        return score_data, semantic_key
+        semantic_entry = cache_data.get(semantic_key)
+        score_data = get_cached_score(semantic_entry, semantic_key)
+        if (
+            score_data is not None
+            and isinstance(semantic_entry, dict)
+            and "manual_review_provenance" in semantic_entry
+            and _verified_manual_review_provenance(
+                semantic_entry,
+                semantic_key,
+                score_data,
+                expected_rules_sha256=rule_hash,
+            )
+            is None
+        ):
+            continue
+        if score_data is not None:
+            return score_data, semantic_key
     # Backward-compatible, exact-provider lookup avoids a costly cold start for
     # valid v3 entries. A hit is migrated to the semantic key by the caller.
     for provider, model in configured_scoring_identities(
@@ -220,7 +293,13 @@ def find_cached_article(cache_data, article, config):
     return None, None
 
 
-def _verified_manual_review_provenance(entry, semantic_key, score_data):
+def _verified_manual_review_provenance(
+    entry,
+    semantic_key,
+    score_data,
+    *,
+    expected_rules_sha256=None,
+):
     """Return audited reuse provenance or ``None`` for an ordinary cache hit."""
 
     if not isinstance(entry, dict):
@@ -257,7 +336,12 @@ def _verified_manual_review_provenance(entry, semantic_key, score_data):
         return None
     if provenance.get("prompt_version") != scoring_prompt_identity():
         return None
-    if provenance.get("rules_sha256") != scoring_rules_sha256():
+    expected_rules_sha256 = (
+        scoring_rules_sha256()
+        if expected_rules_sha256 is None
+        else expected_rules_sha256
+    )
+    if provenance.get("rules_sha256") != expected_rules_sha256:
         return None
     score_sha256 = hashlib.sha256(
         _canonical_json(score_data).encode("utf-8")
@@ -303,7 +387,9 @@ def _verified_manual_review_provenance(entry, semantic_key, score_data):
     try:
         if production_state.is_file():
             state = json.loads(production_state.read_text(encoding="utf-8"))
-            allowed_status = {"completed", "completed_degraded"}
+            # Only a fully healthy production run may publish a reusable
+            # manual-review result.  Degraded attempts are terminal failures.
+            allowed_status = {"completed"}
             expected_component = "folder-agent-production-state"
         elif invocation_state.is_file():
             state = json.loads(invocation_state.read_text(encoding="utf-8"))
@@ -391,8 +477,20 @@ def run_validated_batch(batch, config, scorer, attempts=2, *, preauthorize=False
                     f"batch result count {count} does not match input count "
                     f"{len(batch)}"
                 )
+            expected_ids = [item.get("id") for item in batch]
+            returned_ids = [
+                item.get("id") if isinstance(item, dict) else None
+                for item in results
+            ]
+            if (
+                len(set(expected_ids)) != len(expected_ids)
+                or any(not isinstance(item, dict) for item in results)
+                or len(set(returned_ids)) != len(returned_ids)
+                or set(returned_ids) != set(expected_ids)
+            ):
+                raise ValueError("batch result ids do not exactly match input ids")
             return results
-        except LLMBudgetExceeded:
+        except (LLMBudgetExceeded, LLMInsufficientBalance):
             raise
         except Exception as error:
             last_error = error
@@ -421,6 +519,7 @@ def load_scored_articles_fixture(path, rss_articles, config):
         _apply_composite_scores,
         _validate_score_result,
         _validate_weights,
+        validate_priority_industry_review,
     )
 
     fixture_path = os.path.abspath(os.fspath(path))
@@ -464,9 +563,11 @@ def load_scored_articles_fixture(path, rss_articles, config):
         rss_by_url[link] = article
     score_by_url = {}
     for index, entry in enumerate(scores):
-        if (
-            not isinstance(entry, dict)
-            or set(entry) != {"link", "score_data"}
+        if not isinstance(entry, dict) or set(entry) not in (
+            {"link", "score_data"},
+            {"link", "review_outcome"},
+            {"link", "review_outcome", "priority_display"},
+            {"link", "review_outcome", "priority_display", "priority_industry_review"},
         ):
             raise ValueError(
                 f"scored-articles fixture entry {index} must contain "
@@ -482,7 +583,15 @@ def load_scored_articles_fixture(path, rss_articles, config):
                 f"scored-articles fixture entry {index} has "
                 "invalid/duplicate link"
             )
-        score_by_url[link] = entry.get("score_data")
+        if (
+            "review_outcome" in entry
+            and entry["review_outcome"] != "unscored_priority"
+        ):
+            raise ValueError(
+                "scored-articles fixture review_outcome must be "
+                "unscored_priority"
+            )
+        score_by_url[link] = entry
     if set(rss_by_url) != set(score_by_url):
         raise ValueError(
             "scored-articles fixture URL mismatch: "
@@ -492,7 +601,21 @@ def load_scored_articles_fixture(path, rss_articles, config):
     weights = _validate_weights(config)
     result = []
     for article_id, article in enumerate(rss_articles):
-        raw_score = score_by_url[article["link"]]
+        raw_entry = score_by_url[article["link"]]
+        if raw_entry.get("review_outcome") == "unscored_priority":
+            scored = dict(article)
+            scored["id"] = article_id
+            scored["review_outcome"] = "unscored_priority"
+            scored["priority_industry_review"] = validate_priority_industry_review(
+                raw_entry.get("priority_industry_review"), article
+            )
+            if "priority_display" in raw_entry:
+                scored["priority_display"] = validate_unscored_priority_display(
+                    raw_entry["priority_display"]
+                )
+            result.append(scored)
+            continue
+        raw_score = raw_entry.get("score_data")
         if not isinstance(raw_score, dict):
             raise ValueError(
                 "scored-articles fixture score_data for "
@@ -647,10 +770,28 @@ def score_articles_pipeline(articles, config):
         apply_industry_relevance_gate,
         local_article_route,
         pre_filter_articles_batch,
+        requires_unscored_priority,
         score_articles_batch,
+        translate_unscored_priority_batch,
+        unscored_priority_industry_eligibility,
     )
 
     policy = resolve_policy(config)
+    capture_input_sha256 = hashlib.sha256(
+        _canonical_json(
+            [
+                {
+                    key: article.get(key)
+                    for key in (
+                        "title", "summary", "content", "link", "published_at",
+                        "source", "source_id", "source_tier", "source_lane",
+                        "authority_for",
+                    )
+                }
+                for article in articles
+            ]
+        ).encode("utf-8")
+    ).hexdigest()
     # ``main`` owns the run lifecycle.  Reuse its controller so the telemetry
     # artifact and the budget ledger describe the same API calls.  Standalone
     # callers still get a controller lazily through ``active_run(config)``.
@@ -659,6 +800,11 @@ def score_articles_pipeline(articles, config):
     cache_data = load_cache()
     scored_articles = []
     new_articles = []
+    priority_articles = []
+    priority_display_cache = None
+    priority_display_cache_hits = 0
+    priority_display_cache_misses = 0
+    priority_filtered_reasons = {}
     updates = 0
     print(
         f"Loaded {len(cache_data)} articles from incremental cache.",
@@ -673,6 +819,46 @@ def score_articles_pipeline(articles, config):
     )
     for index, article in enumerate(articles):
         article["id"] = index
+        # Restricted material never reaches the numerical score cache or
+        # scorer.  It must still pass the deterministic industry boundary
+        # before any Chinese display is created or reused.
+        if policy.api_enabled and requires_unscored_priority(article):
+            eligible, reason = unscored_priority_industry_eligibility(article)
+            controller.increment("deterministic_count")
+            if not eligible:
+                article["_score_resolution"] = "unscored_priority_filtered"
+                article["_priority_reason"] = reason
+                priority_filtered_reasons[reason] = (
+                    priority_filtered_reasons.get(reason, 0) + 1
+                )
+                continue
+            if priority_display_cache is None:
+                priority_display_cache = load_priority_display_cache()
+            priority_key = build_priority_display_cache_key(article)
+            cached_display = get_cached_priority_display(
+                priority_display_cache.get(priority_key), priority_key
+            )
+            if cached_display is not None:
+                try:
+                    _attach_unscored_priority_display(
+                        article, cached_display, cache_hit=True
+                    )
+                except ValueError:
+                    # Cache data is untrusted. A malformed entry must not reach
+                    # the report and is treated as a fresh translation miss.
+                    priority_articles.append(article)
+                    priority_display_cache_misses += 1
+                    controller.increment("priority_display_cache_miss_count")
+                else:
+                    priority_display_cache_hits += 1
+                    controller.increment("priority_display_cache_hit_count")
+                    scored_articles.append(article)
+            else:
+                priority_articles.append(article)
+                priority_display_cache_misses += 1
+                controller.increment("priority_display_cache_miss_count")
+            controller.increment("deterministic_count")
+            continue
         score, cache_key = find_cached_article(
             cache_data,
             article,
@@ -685,13 +871,13 @@ def score_articles_pipeline(articles, config):
         controller.increment("cache_hit_count")
         score = apply_industry_relevance_gate(article, score)
         try:
-            innovation = float(score.get("innovation_score", 0))
-            traffic = float(score.get("traffic_score", 0))
+            tech = int(score.get("tech_score", 0) or 0)
+            comm = int(score.get("commercial_score", 0) or 0)
         except (TypeError, ValueError):
-            innovation = traffic = 0
+            tech = comm = 0
         print(
             f"[{index + 1}/{len(articles)}] (Cached) "
-            f"[I:{innovation:.1f} T:{traffic:.1f}] "
+            f"[Tech:{tech} Comm:{comm}] "
             f"{article['title'][:30]}...",
             flush=True,
         )
@@ -700,38 +886,104 @@ def score_articles_pipeline(articles, config):
         article["_score_resolution"] = "cache"
         semantic_key = semantic_cache_key(article, config)
         article["_cache_key"] = semantic_key
+        compatible_key_rules = dict(
+            zip(
+                compatible_semantic_cache_keys(article, config),
+                compatible_scoring_rules_sha256(),
+            )
+        )
+        cache_entry = cache_data.get(cache_key)
         provenance = _verified_manual_review_provenance(
-            cache_data.get(cache_key),
-            semantic_key,
+            cache_entry,
+            cache_key,
             (
-                cache_data.get(cache_key, {}).get("score_data")
-                if isinstance(cache_data.get(cache_key), dict)
+                cache_entry.get("score_data")
+                if isinstance(cache_entry, dict)
                 else score
+            ),
+            expected_rules_sha256=compatible_key_rules.get(
+                cache_key,
+                scoring_rules_sha256(),
             ),
         )
         if provenance is not None:
             article["_manual_review_reuse"] = provenance
             controller.increment("reused_manual_review_count")
-        if cache_key != semantic_key:
+        if cache_key != semantic_key and not isinstance(
+            cache_entry.get("manual_review_provenance")
+            if isinstance(cache_entry, dict)
+            else None,
+            dict,
+        ):
             cache_data[semantic_key] = make_cache_entry(
                 semantic_key,
                 score,
                 raw_title=article.get("title", ""),
                 raw_summary=article.get("summary", ""),
-                provider=cache_data[cache_key].get("provider", "legacy"),
-                model=cache_data[cache_key].get("model", "legacy"),
+                provider=cache_entry.get("provider", "legacy"),
+                model=cache_entry.get("model", "legacy"),
                 semantic_cache_key=semantic_key,
                 rules_sha256=scoring_rules_sha256(),
                 prompt_version=scoring_prompt_identity(),
             )
             updates += 1
-        cached_deep_dive = cache_data[cache_key].get("deep_dive")
+        cached_deep_dive = cache_entry.get("deep_dive")
         if is_verified_deep_dive(cached_deep_dive):
             article["deep_dive"] = cached_deep_dive
-        elif "deep_dive" in cache_data[cache_key]:
-            cache_data[cache_key].pop("deep_dive", None)
+        elif "deep_dive" in cache_entry:
+            cache_entry.pop("deep_dive", None)
             updates += 1
         scored_articles.append(article)
+    if priority_articles:
+        print(
+            "--- Priority Display: translation-only restricted articles ---",
+            flush=True,
+        )
+        priority_batch_size = min(20, policy.max_articles_per_run)
+        for batch_start in range(0, len(priority_articles), priority_batch_size):
+            batch = priority_articles[
+                batch_start : batch_start + priority_batch_size
+            ]
+            # A translation failure is intentionally fatal: sending an English
+            # fallback would violate the Chinese priority-display contract.
+            translated = run_validated_batch(
+                batch,
+                config,
+                translate_unscored_priority_batch,
+                preauthorize=True,
+            )
+            display_by_id = {
+                item["id"]: item["priority_display"]
+                for item in translated
+            }
+            for article in batch:
+                display = display_by_id[article["id"]]
+                _attach_unscored_priority_display(
+                    article, display, cache_hit=False
+                )
+                priority_key = build_priority_display_cache_key(article)
+                priority_display_cache[priority_key] = (
+                    make_priority_display_cache_entry(
+                        priority_key, article, article["priority_display"]
+                    )
+                )
+                scored_articles.append(article)
+            # Preserve each completed batch before the rest of the full flow.
+            # A later operational failure must not make the same news consume
+            # another translation request on a same-day rerun.
+            save_priority_display_cache(priority_display_cache)
+    runtime = config.setdefault("_runtime", {})
+    runtime["unscored_priority_count"] = (
+        len(priority_articles) + priority_display_cache_hits
+    )
+    runtime["unscored_priority_filtered_count"] = sum(
+        priority_filtered_reasons.values()
+    )
+    runtime["unscored_priority_filtered_reasons"] = dict(
+        sorted(priority_filtered_reasons.items())
+    )
+    runtime["priority_display_cache_hit_count"] = priority_display_cache_hits
+    runtime["priority_display_cache_miss_count"] = priority_display_cache_misses
     print(
         f"Found {len(new_articles)} new articles to process.",
         flush=True,
@@ -742,7 +994,7 @@ def score_articles_pipeline(articles, config):
     # A folder-AI request is an auditable compilation unit. It must cover every
     # cache miss in the sealed RSS input; an API-oriented article budget or a
     # second lossy deduplication pass must never make entries disappear.
-    if policy.mode != "interactive":
+    if policy.mode != "interactive" and not policy.complete_review:
         new_articles = _local_deduplicate(new_articles)
     duplicate_count = original_new_count - len(new_articles)
     if duplicate_count:
@@ -867,7 +1119,7 @@ def score_articles_pipeline(articles, config):
             "--- AI Review: Detailed Scoring (Batches of 5) ---",
             flush=True,
         )
-    for batch in scoring_batches:
+    for batch_index, batch in enumerate(scoring_batches, start=1):
         try:
             results = run_validated_batch(
                 batch,
@@ -908,19 +1160,20 @@ def score_articles_pipeline(articles, config):
                     },
                 )
                 matched["_score_cache_hit"] = False
+                matched["_score_resolution"] = "ai"
                 scored_articles.append(matched)
                 try:
-                    innovation = float(
-                        matched["score_data"]["innovation_score"]
+                    tech = int(
+                        matched["score_data"].get("tech_score", 0) or 0
                     )
-                    traffic = float(
-                        matched["score_data"]["traffic_score"]
+                    comm = int(
+                        matched["score_data"].get("commercial_score", 0) or 0
                     )
                 except (TypeError, ValueError):
-                    innovation = traffic = 0
+                    tech = comm = 0
                 print(
                     f"  -> Scored [{matched['id']}] "
-                    f"[I:{innovation:.1f} T:{traffic:.1f}] "
+                    f"[Tech:{tech} Comm:{comm}] "
                     f"{matched['title'][:30]}",
                     flush=True,
                 )
@@ -931,22 +1184,86 @@ def score_articles_pipeline(articles, config):
                     config,
                 )
                 updates += 1
+        # A completed provider batch is run-local audit evidence.  It is not
+        # a reusable global score cache while this run may still fail.
+        snapshot = controller.snapshot()
+        batch_payload = {
+            "schema_version": 1,
+            "component": "validated-scoring-batch",
+            "run_id": controller.run_id,
+            "effective_date": controller.effective_date,
+            "code_source_sha256": os.environ.get("PIPELINE_CODE_SOURCE_SHA256", ""),
+            "batch_index": batch_index,
+            "capture_article_count": len(articles),
+            "capture_input_sha256": capture_input_sha256,
+            "policy_sha256": snapshot["policy_sha256"],
+            "scoring_config_sha256": hashlib.sha256(
+                _canonical_json(scoring_cache_config(config)).encode("utf-8")
+            ).hexdigest(),
+            "prompt_identity": scoring_prompt_identity(),
+            "rules_sha256": scoring_rules_sha256(),
+            "validated_score_count": len(batch),
+            "results": [
+                {
+                    "id": article["id"],
+                    "link": article.get("link"),
+                    "source": article.get("source"),
+                    "source_tier": article.get("source_tier"),
+                    "semantic_input_sha256": semantic_cache_key(article, config),
+                    "score_data": article["score_data"],
+                }
+                for article in batch
+            ],
+        }
+        batch_payload["batch_sha256"] = hashlib.sha256(
+            _canonical_json(batch_payload).encode("utf-8")
+        ).hexdigest()
+        _write_json_atomic(
+            Path(os.environ.get("RADAR_REPORTS_DIR", "reports"))
+            / "validated-scoring-batches"
+            / f"batch-{batch_index:04d}.json",
+            batch_payload,
+        )
+        config.setdefault("_runtime", {}).setdefault(
+            "validated_scoring_batch_paths", []
+        ).append(
+            str(
+                (
+                    Path(os.environ.get("RADAR_REPORTS_DIR", "reports"))
+                    / "validated-scoring-batches"
+                    / f"batch-{batch_index:04d}.json"
+                ).resolve()
+            )
+        )
     if policy.mode == "interactive":
         runtime = config.setdefault("_runtime", {})
-        reuse_items = [
-            {
-                "link": article.get("link"),
-                "resolved_score_data_sha256": hashlib.sha256(
-                    _canonical_json(article.get("score_data")).encode("utf-8")
-                ).hexdigest(),
-                **article["_manual_review_reuse"],
-            }
-            for article in scored_articles
-            if isinstance(article.get("_manual_review_reuse"), dict)
-        ]
-        reuse_items.sort(key=lambda item: item["semantic_input_sha256"])
+        reuse_items = []
+        for article in scored_articles:
+            provenance = article.get("_manual_review_reuse")
+            if not isinstance(provenance, dict):
+                continue
+            # The source review's semantic identity must remain immutable for
+            # audit and revocation.  A monotonic local-policy update can give
+            # the same RSS item a new *current* base-score identity, though.
+            # Bind both explicitly instead of silently replacing either one.
+            reuse_items.append(
+                {
+                    "link": article.get("link"),
+                    "resolved_score_data_sha256": hashlib.sha256(
+                        _canonical_json(article.get("score_data")).encode("utf-8")
+                    ).hexdigest(),
+                    **provenance,
+                    "resolved_base_semantic_input_sha256": semantic_cache_key(
+                        article,
+                        config,
+                    ),
+                }
+            )
+        reuse_items.sort(
+            key=lambda item: item["resolved_base_semantic_input_sha256"]
+        )
         reuse_manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "component": "manual-review-reuse",
             "run_id": controller.run_id,
             "effective_date": controller.effective_date,

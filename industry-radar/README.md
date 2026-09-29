@@ -73,9 +73,18 @@ feed 应由官方一手技术源替换，而不是通过降低 freshness 门槛�
 - `offline`：冻结 fixture 或严格 cache-only，普通回归费用为零；
 - `interactive`：确定性过滤和缓存后，仅把新增疑难文章写入
   `llm-review-request.json`，供 Gemini/Codex 等文件夹工具审阅，项目不发 API 请求；
-- `unattended`：只对缓存未命中的少量疑难文章使用已启用 provider，并受文章数、
-  API 调用数和每日人民币预算三重限制；
+- `unattended`：对缓存未命中的候选使用已启用 provider；配置
+  `complete_review: true` 时分批完成全部可审候选并记录用量，否则按文章数、
+  API 调用数和每日人民币预算限制；
 - `deepseek`：兼容原 DeepSeek 工作流，但只构造 DeepSeek 客户端且仍受相同预算。
+
+生产零 LLM API 审阅使用根目录的 Folder-Agent prepare、官方分页会话和同 run
+resume，`interactive` 阶段由当前对话模型逐条审阅；单独执行 `offline` 只查缓存，
+不会给未命中新闻评分。DeepSeek 返回 402 且明确余额不足时本轮立即停止请求它；
+已经校验完成的批次留在本 run 的 `validated-scoring-batches/` 供审计，不会在失败
+run 自动进入全局评分缓存。评分中断另写 `radar_scoring_failure.json` 和用量文件，
+明确区分 `review_pending_input_count` 与 `completed_score_count`，旧
+`scored_input_count` 仍表示总输入数。待审新闻不算“不相关”，也不构成可交付报告。
 
 Provider 顺序由配置决定，只有具备凭证且被启用的 provider 才参与。评分缓存使用
 provider 无关的语义身份，绑定规范化 URL、正文、发布时间、来源证据、稳定 prompt、
@@ -93,8 +102,11 @@ provider 无关的语义身份，绑定规范化 URL、正文、发布时间、�
 fully healthy。
 
 市场行情、摘要/合集、广告和没有独立产业事实的明确负例先由确定性规则排除；其余新增
-或正文变化的疑难文章直接进入一次详细评分，不再先付费做 LLM pre-filter。报告去重只
-使用确定性 URL/正文相似度，不再隐式调用 LLM 合成。Deep Dive 默认关闭，只有显式设置
+或正文变化的疑难文章直接进入一次详细评分，不再先付费做 LLM pre-filter。报告展示层
+另按同一事件类型、标题中的版本/金额锚点、发布动作和相似度做高置信度跨媒体去重；被合并
+文章仍保留在逐条审计和交易证据输入中，并记录保留报道链接。模型发布与后续渠道上线、
+不同版本及后续修补不会因公司或产品名相同就合并；无法确认同一发布事件的报道保留原样。去重不调用 LLM，也不合成报道。
+Deep Dive 默认关闭，只有显式设置
 `RADAR_ENABLE_DEEP_DIVE=1` 且本轮存在新 AI 评分文章时才运行，并继续受统一预算约束。
 
 每轮写出 `radar_llm_usage.json`，并把同一份摘要嵌入 selection health 和 run snapshot。
