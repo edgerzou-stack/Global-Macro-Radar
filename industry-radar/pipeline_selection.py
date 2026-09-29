@@ -3,6 +3,7 @@ from datetime import timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from collections import Counter
 import math
+import re
 
 from evidence_policy import (
     annotate_article_evidence,
@@ -13,6 +14,21 @@ from url_identity import canonicalize_article_url
 
 
 REPORT_SCORE_HARD_FLOOR = 8.0
+UNSCORED_PLACEHOLDER_CONTRACT = "unscored-placeholder-v1"
+
+
+def review_is_pending(article):
+    """Distinguish an unfinished review from a completed manual score."""
+    resolution = article.get("_score_resolution")
+    if resolution in {"unscored", "interactive_manual_pending"}:
+        return True
+    score = article.get("score_data") or {}
+    return (
+        resolution == "manual"
+        and isinstance(score, dict)
+        and score.get("_unscored_placeholder_contract")
+        == UNSCORED_PLACEHOLDER_CONTRACT
+    )
 
 
 @dataclass(frozen=True)
@@ -63,6 +79,132 @@ def report_score(article):
         normalize_score(score.get("innovation_score", 0)),
         normalize_score(score.get("traffic_score", 0)),
     )
+
+
+_EVENT_TITLE_WORD = re.compile(r"[a-z0-9]+(?:[.-][a-z0-9]+)*")
+_EVENT_TITLE_STOPWORDS = frozenset({
+    "a", "an", "and", "as", "at", "by", "for", "from", "in", "into",
+    "is", "it", "its", "new", "now", "of", "on", "or", "the", "to",
+    "two", "with", "model", "models", "api", "apis", "lower", "cheaper",
+    "cost", "costs", "price", "pricing", "claims", "claim", "more",
+    "release", "releases", "released", "launch", "launches", "launched",
+    "unveil", "unveils", "unveiled", "introduce", "introduces",
+    "introducing", "debut", "debuts", "announces", "announced",
+})
+_EVENT_RELEASE_WORDS = frozenset({
+    "release", "releases", "released", "launch", "launches", "launched",
+    "unveil", "unveils", "unveiled", "introduce", "introduces",
+    "introducing", "debut", "debuts", "announces", "announced",
+})
+_EVENT_DEPLOY_WORDS = frozenset({
+    "available", "availability", "deploy", "deploys", "deployed",
+    "integrates", "integrated", "adds", "rolls", "rollout",
+})
+_EVENT_FUNDING_WORDS = frozenset({"raises", "raised", "secures", "secured", "funding"})
+_EVENT_UPDATE_WORDS = frozenset({
+    "patch", "patches", "patched", "fix", "fixes", "fixed", "update",
+    "updates", "updated", "upgrade", "upgrades", "upgraded",
+})
+
+
+def _report_event_title_features(article):
+    """Extract conservative, source-visible anchors; never infer an event."""
+    raw = _EVENT_TITLE_WORD.findall(str(article.get("title") or "").casefold())
+    words = set(raw)
+    if words & _EVENT_UPDATE_WORDS:
+        action = "update"
+    elif words & _EVENT_DEPLOY_WORDS:
+        action = "deployment"
+    elif words & _EVENT_FUNDING_WORDS:
+        action = "funding"
+    elif words & _EVENT_RELEASE_WORDS:
+        action = "release"
+    else:
+        action = ""
+    tokens = frozenset(
+        word for word in raw
+        if word not in _EVENT_TITLE_STOPWORDS and not word.isdecimal()
+    )
+    anchor = ""
+    for index, word in enumerate(raw):
+        if not any(char.isdigit() for char in word):
+            continue
+        if any(char.isalpha() for char in word):
+            anchor = word
+            break
+        if "." in word and index > 0:
+            anchor = f"{raw[index - 1]}:{word}"
+            break
+    return action, anchor, tokens
+
+
+def _same_report_event(first, second):
+    first_type = str((first.get("score_data") or {}).get("event_type") or "")
+    second_type = str((second.get("score_data") or {}).get("event_type") or "")
+    if not first_type or first_type != second_type:
+        return False
+    first_action, first_anchor, first_tokens = _report_event_title_features(first)
+    second_action, second_anchor, second_tokens = _report_event_title_features(second)
+    if not first_anchor or first_anchor != second_anchor:
+        return False
+    # Only release coverage has a reliable event anchor here. Follow-up
+    # deployments, patches and funding can be distinct industrial events even
+    # when they share the same model and version in their headlines.
+    if first_action != "release" or second_action != "release":
+        return False
+    shared = first_tokens & second_tokens
+    union = first_tokens | second_tokens
+    return len(shared) >= 3 and len(shared) / len(union) >= 0.25
+
+
+def deterministic_report_event_deduplicate(articles, config=None):
+    """Collapse only high-confidence same-event report coverage, without API calls.
+
+    Every original article remains in the scored/evidence input. The chosen
+    representative favors stronger source evidence when its report score is
+    close to the best score; no article text or numerical score is synthesized.
+    """
+    items = list(articles)
+    for article in items:
+        article.pop("_report_event_representative_link", None)
+    ordered = sorted(items, key=lambda item: _stable_rank_key(item, report_score))
+    groups = []
+    for article in ordered:
+        for group in groups:
+            if all(_same_report_event(article, member) for member in group):
+                group.append(article)
+                break
+        else:
+            groups.append([article])
+
+    tolerance = float(
+        (config or {}).get("output", {}).get("primary_evidence_score_tolerance", 0.75)
+    )
+    if not math.isfinite(tolerance) or tolerance < 0:
+        raise ValueError("primary_evidence_score_tolerance must be non-negative")
+    tier_rank = {"T0": 0, "T1": 1, "T2": 2, "T3": 3}
+    retained = []
+    for group in groups:
+        best_score = max(report_score(item) for item in group)
+        near_best = [
+            item for item in group
+            if report_score(item) >= best_score - tolerance
+        ]
+        representative = min(
+            near_best,
+            key=lambda item: (
+                -int(item.get("trade_evidence_eligible") is True),
+                -int(_is_primary_supported(item)),
+                tier_rank.get(str(item.get("source_tier") or ""), 9),
+                -report_score(item),
+                canonicalize_article_url(item.get("link") or ""),
+            ),
+        )
+        retained.append(representative)
+        for item in group:
+            if item is not representative:
+                item["_report_event_representative_link"] = representative.get("link") or ""
+    return sorted(retained, key=lambda item: _stable_rank_key(item, report_score))
 
 
 def is_verified_deep_dive(deep_dive):
@@ -260,7 +402,12 @@ def select_report_articles(
         if published and (published < cutoff or published > date_text):
             evidence_input_rejections["outside_effective_window"] += 1
             continue
+        # A captured primary record can corroborate a separate reviewed story
+        # even while its own display score is unfinished.
         corroboration_articles.append(article)
+        if review_is_pending(article):
+            evidence_input_rejections["review_pending"] += 1
+            continue
         score = relevance_gate(article, article.get("score_data", {}))
         article["score_data"] = score
         if not score.get("is_relevant"):
@@ -317,7 +464,9 @@ def select_report_articles(
         for item in before_deduplication:
             if id(item) not in retained_ids:
                 report_exclusion_reasons[id(item)] = (
-                    "deduplicated_from_report_selection"
+                    "duplicate_event_report"
+                    if item.get("_report_event_representative_link")
+                    else "deduplicated_from_report_selection"
                 )
 
     max_discovery_per_source = config.get("output", {}).get(
@@ -333,7 +482,10 @@ def select_report_articles(
             )
         bounded = []
         discovery_counts = Counter()
-        for article in selected:
+        for article in sorted(
+            selected,
+            key=lambda item: _stable_rank_key(item, report_score),
+        ):
             if article.get("source_lane") == "discovery":
                 source_id = str(
                     article.get("source_id") or article.get("source") or "unknown"
@@ -507,6 +659,11 @@ def select_report_articles(
                 or evidence_exclusion_reasons.get(id(item))
                 or "eligible_but_section_capacity_exceeded"
             ),
+            **(
+                {"representative_link": item["_report_event_representative_link"]}
+                if item.get("_report_event_representative_link")
+                else {}
+            ),
         }
         for item in evidence_input
     ]
@@ -532,6 +689,12 @@ def select_report_articles(
             "selected": selected_count,
             "eligible_selected": len(selected),
             "scored_input_count": len(scored_articles),
+            "completed_score_count": sum(
+                not review_is_pending(article) for article in scored_articles
+            ),
+            "review_pending_input_count": sum(
+                review_is_pending(article) for article in scored_articles
+            ),
             "evidence_input_count": len(evidence_input),
             "evidence_selected": len(evidence_selection),
             "trade_evidence_eligible": evidence_trade_count,

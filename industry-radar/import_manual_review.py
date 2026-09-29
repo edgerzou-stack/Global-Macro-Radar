@@ -10,9 +10,33 @@ from llm_cost_policy import (
     _canonical_json,
     _write_json_atomic,
     manual_review_response_contract,
+    validate_unscored_priority_display,
 )
+from manual_review_response_contract import (
+    is_unscored_priority as _is_unscored_priority,
+    validate_manual_review_row_shape,
+)
+from score import validate_priority_industry_review, validate_scoring_rubric
 from cache_manager import make_cache_entry, merge_verified_cache_entries
 from score import _validate_score_result
+
+
+def _priority_display_by_id(response):
+    """Return already-validated display-only copy for scoreless entries."""
+
+    return {
+        item["request_id"]: dict(item["priority_display"])
+        for item in response["scores"]
+        if _is_unscored_priority(item.get("score_data"))
+    }
+
+
+def _priority_industry_review_by_id(response):
+    return {
+        item["request_id"]: dict(item["priority_industry_review"])
+        for item in response["scores"]
+        if _is_unscored_priority(item.get("score_data"))
+    }
 
 
 def _sha256_file(path):
@@ -35,7 +59,10 @@ def _request_identity(request):
         "rules_sha256": request.get("rules_sha256"),
         "articles": request.get("articles"),
     }
-    if request.get("schema_version") in {2, 3}:
+    if request.get("schema_version") == 4 or "rubric" in request or "rubric_sha256" in request:
+        identity["rubric"] = request.get("rubric")
+        identity["rubric_sha256"] = request.get("rubric_sha256")
+    if request.get("schema_version") == 4:
         identity.update(
             {
                 "run_id": request.get("run_id"),
@@ -69,14 +96,14 @@ def _validate_manual_response(request, response):
         "link", "published_at", "source", "source_id", "source_tier",
         "source_lane", "authority_for",
     }
-    if request.get("schema_version") == 3:
+    if request.get("schema_version") == 4:
         expected_article_fields.update({"content_basis", "review_text"})
     for index, item in enumerate(articles):
         if not isinstance(item, dict) or set(item) != expected_article_fields:
             raise ValueError(f"manual review request article {index} has invalid fields")
         if item.get("request_id") != item.get("semantic_input_sha256"):
             raise ValueError("manual review request semantic identity mismatch")
-        if request.get("schema_version") == 3:
+        if request.get("schema_version") == 4:
             content = str(item.get("content") or "")
             summary = str(item.get("summary") or "")
             expected_basis = "feed_body" if content.strip() else "summary_only"
@@ -94,21 +121,44 @@ def _validate_manual_response(request, response):
         raise ValueError("manual review request ids must be unique")
     score_by_id = {}
     for index, item in enumerate(scores):
-        if not isinstance(item, dict) or set(item) != {"request_id", "score_data"}:
-            raise ValueError(f"manual score {index} has invalid fields")
+        try:
+            is_priority = validate_manual_review_row_shape(item)
+        except ValueError as error:
+            raise ValueError(f"manual score {index} has invalid fields: {error}") from error
         request_id = item.get("request_id")
         if request_id in score_by_id:
             raise ValueError("manual review response contains a duplicate request_id")
+        if request_id not in article_by_id:
+            raise ValueError("manual review response contains an unknown request_id")
         score_data = item.get("score_data")
-        if request.get("schema_version") in {2, 3}:
+        if is_priority:
+            try:
+                validate_unscored_priority_display(item["priority_display"])
+                validate_priority_industry_review(
+                    item["priority_industry_review"], article_by_id[request_id]
+                )
+            except ValueError as error:
+                raise ValueError(
+                    f"manual priority score {index} has invalid display: {error}"
+                ) from error
+        if request.get("schema_version") == 4:
             required = set(
                 request["response_contract"]["score_data_required_fields"]
             )
-            if not isinstance(score_data, dict) or set(score_data) != required:
+            if (
+                not isinstance(score_data, dict)
+                or (
+                    set(score_data) != required
+                    and not _is_unscored_priority(score_data)
+                )
+            ):
                 raise ValueError(
                     f"manual score {index} score_data fields do not match contract"
                 )
-        score_by_id[request_id] = _validate_score_result(dict(score_data))
+        if _is_unscored_priority(score_data):
+            score_by_id[request_id] = dict(score_data)
+        else:
+            score_by_id[request_id] = _validate_score_result(dict(score_data))
     if set(score_by_id) != set(article_by_id):
         raise ValueError("manual review response request set mismatch")
     return reviewer, article_by_id, score_by_id
@@ -126,7 +176,25 @@ def _bound_artifact(request_path, binding, label):
     return path
 
 
-def _compile_complete_fixture(request_path, request, article_by_id, score_by_id):
+def _compile_complete_fixture(
+    request_path,
+    request,
+    article_by_id,
+    score_by_id,
+    priority_display_by_id=None,
+    priority_industry_review_by_id=None,
+):
+    priority_display_by_id = priority_display_by_id or {}
+    priority_industry_review_by_id = priority_industry_review_by_id or {}
+    priority_ids = {
+        request_id for request_id, score_data in score_by_id.items()
+        if _is_unscored_priority(score_data)
+    }
+    if (
+        set(priority_display_by_id) != priority_ids
+        or set(priority_industry_review_by_id) != priority_ids
+    ):
+        raise ValueError("manual priority display/review set mismatch")
     rss_path = _bound_artifact(request_path, request.get("rss_fixture"), "RSS fixture")
     base_path = _bound_artifact(request_path, request.get("base_scores"), "base scores")
     rss = _load_json_object(rss_path, "RSS fixture")
@@ -196,7 +264,21 @@ def _compile_complete_fixture(request_path, request, article_by_id, score_by_id)
             if row["resolution"] == "manual"
             else row["score_data"]
         )
-        compiled.append({"link": link, "score_data": score_data})
+        if _is_unscored_priority(score_data):
+            compiled.append(
+                {
+                    "link": link,
+                    "review_outcome": "unscored_priority",
+                    "priority_display": priority_display_by_id[
+                        row["semantic_input_sha256"]
+                    ],
+                    "priority_industry_review": priority_industry_review_by_id[
+                        row["semantic_input_sha256"]
+                    ],
+                }
+            )
+        else:
+            compiled.append({"link": link, "score_data": score_data})
     return {"schema_version": 1, "scores": compiled}, rss_path, base_path
 
 
@@ -211,7 +293,7 @@ def _persist_verified_manual_scores(
 ):
     """Persist only scores that passed the complete manual-import contract."""
 
-    if request.get("schema_version") not in {2, 3} or not score_by_id:
+    if request.get("schema_version") != 4 or not score_by_id:
         return 0
     provenance_common = {
         "schema_version": 1,
@@ -236,6 +318,8 @@ def _persist_verified_manual_scores(
     }
     entries = {}
     for semantic_key, score_data in score_by_id.items():
+        if _is_unscored_priority(score_data):
+            continue
         score_sha256 = hashlib.sha256(
             _canonical_json(score_data).encode("utf-8")
         ).hexdigest()
@@ -254,7 +338,8 @@ def _persist_verified_manual_scores(
             prompt_version=request.get("prompt_version"),
             manual_review_provenance=provenance,
         )
-    merge_verified_cache_entries(entries)
+    if entries:
+        merge_verified_cache_entries(entries)
     return len(entries)
 
 
@@ -270,12 +355,15 @@ def import_review(
     output_path = Path(output_path).resolve()
     request = _load_json_object(request_path, "manual review request")
     response = _load_json_object(response_path, "manual review response")
-    if request.get("schema_version") not in {1, 2, 3} or request.get("mode") != "interactive":
+    if request.get("schema_version") not in {1, 4} or request.get("mode") != "interactive":
         raise ValueError("unsupported manual review request")
-    if request.get("schema_version") in {2, 3}:
+    if request.get("schema_version") == 4 or "rubric" in request or "rubric_sha256" in request:
+        validate_scoring_rubric(request.get("rubric"), request.get("rubric_sha256"))
+    if request.get("schema_version") == 4:
         expected_request_fields = {
             "schema_version", "run_id", "effective_date", "mode",
-            "prompt_version", "rules_sha256", "request_sha256", "item_count",
+            "prompt_version", "rules_sha256", "rubric", "rubric_sha256",
+            "request_sha256", "item_count",
             "articles", "config_sha256", "no_manual_review_needed",
             "response_contract",
             "rss_fixture", "base_scores",
@@ -296,18 +384,34 @@ def import_review(
     if request.get("request_sha256") != expected_request_sha:
         raise ValueError("manual review request content hash mismatch")
     reviewer, article_by_id, score_by_id = _validate_manual_response(request, response)
-    if request.get("schema_version") in {2, 3}:
+    priority_display_by_id = _priority_display_by_id(response)
+    priority_industry_review_by_id = _priority_industry_review_by_id(response)
+    if request.get("schema_version") == 4:
         fixture, rss_path, base_path = _compile_complete_fixture(
-            request_path, request, article_by_id, score_by_id
+            request_path,
+            request,
+            article_by_id,
+            score_by_id,
+            priority_display_by_id,
+            priority_industry_review_by_id,
         )
     else:
         fixture = {
             "schema_version": 1,
             "scores": [
-                {
-                    "link": article_by_id[request_id]["link"],
-                    "score_data": score_by_id[request_id],
-                }
+                (
+                    {
+                        "link": article_by_id[request_id]["link"],
+                        "review_outcome": "unscored_priority",
+                        "priority_display": priority_display_by_id[request_id],
+                        "priority_industry_review": priority_industry_review_by_id[request_id],
+                    }
+                    if _is_unscored_priority(score_by_id[request_id])
+                    else {
+                        "link": article_by_id[request_id]["link"],
+                        "score_data": score_by_id[request_id],
+                    }
+                )
                 for request_id in sorted(article_by_id)
             ],
         }
@@ -323,6 +427,9 @@ def import_review(
         "run_id": request.get("run_id"),
         "effective_date": request.get("effective_date"),
         "manual_item_count": len(score_by_id),
+        "unscored_priority_count": sum(
+            _is_unscored_priority(value) for value in score_by_id.values()
+        ),
         "total_item_count": len(fixture["scores"]),
         "output": str(output_path),
         "output_sha256": _sha256_file(output_path),
@@ -332,7 +439,10 @@ def import_review(
         receipt["rss_fixture_sha256"] = _sha256_file(rss_path)
         receipt["base_scores_sha256"] = _sha256_file(base_path)
     if persist_verified_cache:
-        receipt["verified_cache_persisted_count"] = len(score_by_id)
+        receipt["verified_cache_persisted_count"] = sum(
+            not _is_unscored_priority(score_data)
+            for score_data in score_by_id.values()
+        )
     receipt_path = output_path.with_suffix(output_path.suffix + ".receipt.json")
     _write_json_atomic(receipt_path, receipt)
     if persist_verified_cache:
@@ -356,17 +466,19 @@ def compile_without_manual_review(request_path, output_path):
     request = _load_json_object(request_path, "manual review request")
     expected_fields = {
         "schema_version", "run_id", "effective_date", "mode",
-        "prompt_version", "rules_sha256", "request_sha256", "item_count",
+        "prompt_version", "rules_sha256", "rubric", "rubric_sha256",
+        "request_sha256", "item_count",
         "articles", "config_sha256", "no_manual_review_needed",
         "response_contract",
         "rss_fixture", "base_scores",
     }
     if (
-        request.get("schema_version") not in {2, 3}
+        request.get("schema_version") != 4
         or request.get("mode") != "interactive"
         or set(request) != expected_fields
     ):
         raise ValueError("unsupported no-manual interactive request")
+    validate_scoring_rubric(request.get("rubric"), request.get("rubric_sha256"))
     expected_sha = hashlib.sha256(
         _canonical_json(_request_identity(request)).encode("utf-8")
     ).hexdigest()
@@ -424,8 +536,9 @@ def persist_completed_review_cache(request_path, response_path, output_path):
     response = _load_json_object(response_path, "manual review response")
     output = _load_json_object(output_path, "compiled scored fixture")
     receipt = _load_json_object(receipt_path, "manual review import receipt")
-    if request.get("schema_version") not in {2, 3}:
+    if request.get("schema_version") != 4:
         raise ValueError("cache publication requires a complete interactive request")
+    validate_scoring_rubric(request.get("rubric"), request.get("rubric_sha256"))
     expected_request_sha = hashlib.sha256(
         _canonical_json(_request_identity(request)).encode("utf-8")
     ).hexdigest()
@@ -434,8 +547,15 @@ def persist_completed_review_cache(request_path, response_path, output_path):
     reviewer, article_by_id, score_by_id = _validate_manual_response(
         request, response
     )
+    priority_display_by_id = _priority_display_by_id(response)
+    priority_industry_review_by_id = _priority_industry_review_by_id(response)
     expected_output, _rss_path, _base_path = _compile_complete_fixture(
-        request_path, request, article_by_id, score_by_id
+        request_path,
+        request,
+        article_by_id,
+        score_by_id,
+        priority_display_by_id,
+        priority_industry_review_by_id,
     )
     if output != expected_output:
         raise ValueError("compiled scored fixture changed before cache publication")
@@ -458,7 +578,10 @@ def persist_completed_review_cache(request_path, response_path, output_path):
     invocation_state_path = run_dir / "folder-agent-operator-invocation.json"
     if production_state_path.is_file():
         state = _load_json_object(production_state_path, "production operator state")
-        allowed_status = {"completed", "completed_degraded"}
+        # A degraded production attempt is a failed terminal state under the
+        # live contract.  Its manual judgment must not become reusable input
+        # for a later report.
+        allowed_status = {"completed"}
         expected_component = "folder-agent-production-state"
     elif invocation_state_path.is_file():
         state = _load_json_object(invocation_state_path, "Folder-Agent operator state")
@@ -485,7 +608,10 @@ def persist_completed_review_cache(request_path, response_path, output_path):
         "response_file_sha256": _sha256_file(response_path),
         "import_receipt_file_sha256": _sha256_file(receipt_path),
         "output_sha256": _sha256_file(output_path),
-        "persisted_count": len(score_by_id),
+        "persisted_count": sum(
+            not _is_unscored_priority(score_data)
+            for score_data in score_by_id.values()
+        ),
     }
     if promotion_path.exists():
         if _load_json_object(promotion_path, "cache promotion receipt") != promotion:

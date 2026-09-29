@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
 import cloudscraper
+from requests import exceptions as requests_exceptions
 
 
 ADAPTER_NAME = "official_space_newsroom"
@@ -36,6 +37,8 @@ SPACEX_CANONICAL_PREFIX = "https://www.spacex.com/updates/"
 MAX_RECORDS = 128
 MAX_FUTURE_SKEW = timedelta(minutes=5)
 MAX_CONTENT_CHARS = 30000
+REQUEST_TIMEOUT_SECONDS = 15
+REQUEST_ATTEMPTS = 3
 _SLUG = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?")
 _DOCUMENT_ID = re.compile(r"[a-z0-9]{8,64}")
 _ENTITY_PATTERN = re.compile(
@@ -78,6 +81,33 @@ def _response_json(response):
             f"SpaceX updates record count outside audited bounds: {len(payload)}"
         )
     return payload
+
+
+def _fetch_official_response(session, endpoint, *, request_timeout):
+    """Fetch the one audited endpoint, retrying transient transport failures.
+
+    A retry never changes the issuer endpoint, payload contract, or evidence
+    rules.  In particular, malformed payloads and 4xx responses are not
+    retried or replaced by a third-party source.
+    """
+    last_error = None
+    for attempt in range(1, REQUEST_ATTEMPTS + 1):
+        try:
+            response = session.get(endpoint, timeout=request_timeout)
+            if hasattr(response, "raise_for_status"):
+                response.raise_for_status()
+            return response
+        except requests_exceptions.RequestException as error:
+            response = getattr(error, "response", None)
+            status_code = getattr(response, "status_code", None)
+            transient = status_code is None or int(status_code) >= 500
+            last_error = error
+            if not transient or attempt == REQUEST_ATTEMPTS:
+                break
+    raise OfficialSpaceNewsroomError(
+        "SpaceX official endpoint failed after "
+        f"{REQUEST_ATTEMPTS} attempt(s)"
+    ) from last_error
 
 
 def _strict_endpoint(value):
@@ -208,7 +238,7 @@ def fetch_official_space_newsrooms(
     hours_back,
     now,
     session=None,
-    request_timeout=15,
+    request_timeout=REQUEST_TIMEOUT_SECONDS,
 ):
     """Fetch exact audited commercial-space sources in registry order."""
     now = now.astimezone(timezone.utc)
@@ -237,7 +267,11 @@ def fetch_official_space_newsrooms(
                 )
             _strict_endpoint(endpoint)
             payload = _response_json(
-                session.get(endpoint, timeout=request_timeout)
+                _fetch_official_response(
+                    session,
+                    endpoint,
+                    request_timeout=request_timeout,
+                )
             )
             health["total_entries"] = len(payload)
             parsed = []

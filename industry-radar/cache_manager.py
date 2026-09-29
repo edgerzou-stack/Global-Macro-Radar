@@ -4,6 +4,7 @@ import time
 import hashlib
 import tempfile
 import fcntl
+from functools import lru_cache
 
 from url_identity import canonicalize_article_url
 
@@ -22,9 +23,66 @@ SECONDS_IN_A_DAY = 86400
 MAX_CACHE_ENTRIES = int(os.environ.get("RADAR_MAX_CACHE_ENTRIES", "10000"))
 CACHE_SCHEMA_VERSION = 3
 SEMANTIC_CACHE_SCHEMA_VERSION = 1
+PRIORITY_DISPLAY_CACHE_SCHEMA_VERSION = 1
+PRIORITY_DISPLAY_CONTRACT_VERSION = "chinese-display-only-v1"
+PRIORITY_DISPLAY_CACHE_FILE = os.path.abspath(
+    os.environ.get(
+        "RADAR_PRIORITY_DISPLAY_CACHE_FILE",
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            ".cache",
+            "priority-display-cache.json",
+        ),
+    )
+)
 DEEP_DIVE_MISS_SCHEMA_VERSION = 1
 DEEP_DIVE_POLICY_VERSION = "verified-independent-primary-v1"
 DEEP_DIVE_MISS_TTL_SECONDS = 24 * 60 * 60
+MANUAL_REVIEW_REVOCATIONS_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "config", "manual_review_cache_revocations.json",
+)
+
+
+@lru_cache(maxsize=8)
+def _load_manual_review_revocations(path):
+    # This is deployment policy, not mutable runtime cache. A missing policy
+    # must not silently restore scores whose review evidence was invalidated.
+    try:
+        with open(path, encoding="utf-8") as handle:
+            policy = json.load(handle)
+        if policy.get("schema_version") != 1 or not isinstance(policy.get("incidents"), list):
+            raise ValueError("invalid schema")
+        revoked = set()
+        for incident in policy["incidents"]:
+            run_id = incident["source_run_id"]
+            if not isinstance(run_id, str) or not run_id or not incident["reason"]:
+                raise ValueError("invalid incident provenance")
+            for entry in incident["entries"]:
+                key = entry["semantic_input_sha256"]
+                fingerprint = entry["score_data_sha256"]
+                if any(not isinstance(v, str) or len(v) != 64 or
+                       any(c not in "0123456789abcdef" for c in v)
+                       for v in (key, fingerprint)):
+                    raise ValueError("invalid score identity")
+                revoked.add((run_id, key, fingerprint))
+        return frozenset(revoked)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+        raise RuntimeError("Manual review cache revocation policy unavailable or invalid") from error
+
+
+def is_revoked_manual_score(entry):
+    """Reject only the exact score and run provenance covered by an incident."""
+    if not isinstance(entry, dict) or "manual_review_provenance" not in entry:
+        return False
+    revoked = _load_manual_review_revocations(MANUAL_REVIEW_REVOCATIONS_FILE)
+    provenance = entry.get("manual_review_provenance") or {}
+    fingerprint = hashlib.sha256(_canonical_json(entry.get("score_data")).encode("utf-8")).hexdigest()
+    return (
+        provenance.get("source_run_id"),
+        entry.get("semantic_cache_key") or entry.get("cache_key"),
+        fingerprint,
+    ) in revoked
 
 
 def _canonical_json(value):
@@ -101,6 +159,57 @@ def build_semantic_cache_key(article, config, prompt_version, rules_sha256):
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
 
+def _priority_translation_input(article):
+    """Return exactly the source fields supplied to the display translator."""
+
+    return {
+        "url": _canonical_url(article.get("link") or article.get("url")),
+        "title": str(article.get("title") or ""),
+        "summary": str(article.get("summary") or "")[:600],
+        "content": str(article.get("content") or "")[:1200],
+    }
+
+
+def build_priority_display_cache_key(article):
+    """Content-address a Chinese-only priority display, never a score."""
+
+    payload = {
+        "schema_version": PRIORITY_DISPLAY_CACHE_SCHEMA_VERSION,
+        "translation_contract_version": PRIORITY_DISPLAY_CONTRACT_VERSION,
+        "input": _priority_translation_input(article),
+    }
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def get_cached_priority_display(entry, expected_cache_key):
+    """Return an untrusted cached display only for an exact source identity."""
+
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("schema_version") != PRIORITY_DISPLAY_CACHE_SCHEMA_VERSION:
+        return None
+    if entry.get("cache_key") != expected_cache_key:
+        return None
+    display = entry.get("priority_display")
+    return dict(display) if isinstance(display, dict) else None
+
+
+def make_priority_display_cache_entry(cache_key, article, priority_display):
+    """Build a cache entry whose provenance is limited to display translation."""
+
+    source_input = _priority_translation_input(article)
+    return {
+        "schema_version": PRIORITY_DISPLAY_CACHE_SCHEMA_VERSION,
+        "cache_key": cache_key,
+        "timestamp": time.time(),
+        "translation_contract_version": PRIORITY_DISPLAY_CONTRACT_VERSION,
+        "source_input_sha256": hashlib.sha256(
+            _canonical_json(source_input).encode("utf-8")
+        ).hexdigest(),
+        "priority_display": dict(priority_display),
+    }
+
+
 def make_cache_entry(cache_key, score_data, **extra):
     entry = {
         "schema_version": CACHE_SCHEMA_VERSION,
@@ -118,6 +227,8 @@ def get_cached_score(entry, expected_cache_key):
     if entry.get("schema_version") != CACHE_SCHEMA_VERSION:
         return None
     if entry.get("cache_key") != expected_cache_key:
+        return None
+    if is_revoked_manual_score(entry):
         return None
     score_data = entry.get("score_data")
     return score_data if isinstance(score_data, dict) else None
@@ -180,6 +291,55 @@ def load_cache():
             print(f"Error loading cache: {e}. Starting with empty cache.", flush=True)
             return {}
     return {}
+
+
+def load_priority_display_cache():
+    """Load display-only cache entries; malformed entries are cache misses."""
+
+    if not os.path.exists(PRIORITY_DISPLAY_CACHE_FILE):
+        return {}
+    try:
+        with open(PRIORITY_DISPLAY_CACHE_FILE, "r", encoding="utf-8") as handle:
+            cache_data = json.load(handle)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        print(
+            f"Error loading priority display cache: {error}. Starting empty.",
+            flush=True,
+        )
+        return {}
+    if not isinstance(cache_data, dict):
+        print("Priority display cache must be an object. Starting empty.", flush=True)
+        return {}
+    return cache_data
+
+
+def save_priority_display_cache(cache_data):
+    """Atomically checkpoint validated display translations after each batch."""
+
+    if not isinstance(cache_data, dict):
+        raise ValueError("priority display cache must be an object")
+    target_path = os.path.abspath(PRIORITY_DISPLAY_CACHE_FILE)
+    target_dir = os.path.dirname(target_path)
+    os.makedirs(target_dir, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target_dir,
+            prefix=f".{os.path.basename(target_path)}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = handle.name
+            json.dump(cache_data, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, target_path)
+        temporary_path = None
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
 
 def save_cache(cache_data):
     # Ensure newly added entries have a timestamp
@@ -261,10 +421,12 @@ def merge_verified_cache_entries(entries):
                 cache_data = {}
 
             for key, entry in entries.items():
+                if is_revoked_manual_score(entry):
+                    raise RuntimeError("Cannot import revoked manual review score " + key)
                 existing = cache_data.get(key)
                 if isinstance(existing, dict) and existing.get(
                     "score_data"
-                ) != entry.get("score_data"):
+                ) != entry.get("score_data") and not is_revoked_manual_score(existing):
                     raise RuntimeError(
                         "Conflicting validated scores for semantic cache key " + key
                     )

@@ -17,6 +17,7 @@ from pipeline_health import (
     validate_rss_health,
 )
 from pipeline_selection import deduplicate_input_articles
+from url_identity import canonicalize_article_url
 from run_date import logical_today
 from source_registry import enrich_articles, enrich_health, load_source_registry
 
@@ -28,6 +29,7 @@ class IngestionResult:
     reference_time: datetime
     duplicate_count: int
     health_summary: dict
+    duplicate_inputs: tuple = ()
 
 
 def collect_articles(
@@ -67,8 +69,13 @@ def collect_articles(
         ) - timedelta(microseconds=1)
         if replay_sha:
             raw = Path(fixture).read_bytes()
-            if os.environ.get("PIPELINE_MODE") != "production":
-                raise ValueError("Capture clock replay requires production mode")
+            if os.environ.get("PIPELINE_MODE") not in {
+                "production",
+                "live-shadow",
+            }:
+                raise ValueError(
+                    "Capture clock replay requires production or live-shadow mode"
+                )
             if hashlib.sha256(raw).hexdigest() != replay_sha:
                 raise ValueError("Capture clock RSS fixture hash mismatch")
             clock = json.loads(raw).get("capture_clock", {})
@@ -87,11 +94,20 @@ def collect_articles(
             validate_rss_fixture_effective_date(articles, health, effective_date)
     else:
         reference_time = rss_reference_time_utc()
+        fetch_options = {}
+        if (config.get("rss_source_cooldown_enabled") is True
+                and os.environ.get("PIPELINE_MODE") == "production"):
+            # Mutable collection scheduling state is never consulted on replay
+            # or by a shadow run. It contains no article bodies or scores.
+            fetch_options["source_state_path"] = str(
+                Path(__file__).resolve().parent / ".cache" / "rss-source-state.json"
+            )
         articles, health = fetch_feeds(
             config.get("rss_feeds", []),
             hours_back=hours_back,
             now=reference_time,
             return_health=True,
+            **fetch_options,
         )
         newsroom_entries = [
             entry
@@ -199,10 +215,22 @@ def collect_articles(
         flush=True,
     )
     unique = deduplicate_input_articles(articles)
+    representatives = {}
+    duplicate_inputs = []
+    for article in articles:
+        link = canonicalize_article_url(article.get("link") or "")
+        title = " ".join(str(article.get("title") or "").casefold().split())
+        representative = representatives.get(("url", link)) or representatives.get(("title", title))
+        if representative is not None:
+            duplicate_inputs.append({"article": article, "representative_link": representative})
+        else:
+            representatives[("url", link)] = link
+            representatives[("title", title)] = link
     return IngestionResult(
         articles=tuple(unique),
         health=tuple(health),
         reference_time=reference_time,
         duplicate_count=len(articles) - len(unique),
         health_summary=health_summary,
+        duplicate_inputs=tuple(duplicate_inputs),
     )
