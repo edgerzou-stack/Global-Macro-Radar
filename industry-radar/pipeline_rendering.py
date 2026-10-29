@@ -429,8 +429,8 @@ def generate_markdown_report(
         if selection.strategic_watch:
             handle.write(
                 "## 🧭 战略硬科技追踪 (Research Watch)\n"
-                "_包括尚未达到主榜阈值的技术里程碑，以及因缺少同事件"
-                "一手佐证而退出主榜的高分二手线索；默认仅供研究，"
+                "_以下条目已达到同一分数门槛，但因缺少同事件一手佐证"
+                "或主榜证据比例要求而移入研究区；默认仅供研究，"
                 "不直接驱动热点交易。_\n\n"
             )
             for article in selection.strategic_watch:

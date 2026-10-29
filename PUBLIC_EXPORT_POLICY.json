@@ -29,6 +29,7 @@
     {"source": "industry-radar/evidence_policy.py", "destination": "industry-radar/evidence_policy.py"},
     {"source": "industry-radar/hotspot_evidence.py", "destination": "industry-radar/hotspot_evidence.py"},
     {"source": "industry-radar/import_manual_review.py", "destination": "industry-radar/import_manual_review.py"},
+    {"source": "industry-radar/manual_review_response_contract.py", "destination": "industry-radar/manual_review_response_contract.py"},
     {"source": "industry-radar/ingest.py", "destination": "industry-radar/ingest.py"},
     {"source": "industry-radar/rss_source_state.py", "destination": "industry-radar/rss_source_state.py"},
     {"source": "industry-radar/llm_cost_policy.py", "destination": "industry-radar/llm_cost_policy.py"},

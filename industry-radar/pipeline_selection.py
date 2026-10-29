@@ -105,6 +105,13 @@ _EVENT_UPDATE_WORDS = frozenset({
     "patch", "patches", "patched", "fix", "fixes", "fixed", "update",
     "updates", "updated", "upgrade", "upgrades", "upgraded",
 })
+_EVENT_PRODUCT_BOUNDARIES = frozenset({
+    "as", "at", "by", "for", "from", "in", "into", "is", "now", "on",
+    "to", "via", "with", "while", "after", "before", "during",
+}) | _EVENT_RELEASE_WORDS | _EVENT_DEPLOY_WORDS | _EVENT_UPDATE_WORDS
+# Scope can occur before a model number or after "for", not only as a suffix.
+# Unequal source-visible scopes are evidence against merging, not admission.
+_EVENT_PRODUCT_SCOPES = frozenset({"enterprise", "consumer", "laptop", "desktop"})
 
 
 def _report_event_title_features(article):
@@ -138,6 +145,42 @@ def _report_event_title_features(article):
     return action, anchor, tokens
 
 
+def _report_event_product_identity(article):
+    """Require matching source-visible model identifiers and variant suffixes.
+
+    A shared base version cannot identify Sol versus Luna, laptop versus
+    desktop, or a multi-product story. Ambiguous suffixes remain distinct;
+    retaining another copy is preferable to dropping an independent launch.
+    """
+    raw = _EVENT_TITLE_WORD.findall(str(article.get("title") or "").casefold())
+    identifiers = []
+    first_index = None
+    for index, word in enumerate(raw):
+        if not any(char.isdigit() for char in word):
+            continue
+        if any(char.isalpha() for char in word):
+            identifiers.append(word)
+        elif "." in word and index > 0:
+            identifiers.append(f"{raw[index - 1]}:{word}")
+        else:
+            continue
+        if first_index is None:
+            first_index = index
+    if first_index is None:
+        return None
+    suffix = []
+    for word in raw[first_index + 1:]:
+        if word in _EVENT_PRODUCT_BOUNDARIES or any(char.isdigit() for char in word):
+            break
+        if word not in {"and", "model", "models"}:
+            suffix.append(word)
+    return (
+        tuple(sorted(set(identifiers))),
+        tuple(sorted(set(suffix))),
+        tuple(sorted(set(raw) & _EVENT_PRODUCT_SCOPES)),
+    )
+
+
 def _same_report_event(first, second):
     first_type = str((first.get("score_data") or {}).get("event_type") or "")
     second_type = str((second.get("score_data") or {}).get("event_type") or "")
@@ -146,6 +189,9 @@ def _same_report_event(first, second):
     first_action, first_anchor, first_tokens = _report_event_title_features(first)
     second_action, second_anchor, second_tokens = _report_event_title_features(second)
     if not first_anchor or first_anchor != second_anchor:
+        return False
+    first_product = _report_event_product_identity(first)
+    if first_product is None or first_product != _report_event_product_identity(second):
         return False
     # Only release coverage has a reliable event anchor here. Follow-up
     # deployments, patches and funding can be distinct industrial events even
