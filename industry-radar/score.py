@@ -17,7 +17,7 @@ from event_contract import (
 logger = logging.getLogger(__name__)
 
 SCORING_PROMPT_VERSION = "dual-track-v8-shared-industry-rubric"
-SCORING_RULE_VERSION = "deterministic-industry-boundary-v5-reviewed-priority"
+SCORING_RULE_VERSION = "deterministic-industry-boundary-v6-semantic-market-review"
 SCORING_RUBRIC_VERSION = "industry-evidence-v1"
 
 _MARKET_ONLY_PATTERNS = tuple(
@@ -64,15 +64,43 @@ _LOCAL_REJECTION_PATTERNS = tuple(
         r"购物指南|优惠精选|限时优惠",
     )
 )
+
+# An absent industry keyword is not evidence that a story is price-only. This
+# deliberately narrow vocabulary proves only a wholly market-text shortcut;
+# company names, product names and any other prose require semantic review.
+_PURE_MARKET_WORDS = frozenset({
+    "a", "an", "and", "at", "by", "for", "from", "in", "is", "it",
+    "after", "before", "open", "opening", "close", "closed",
+    "of", "on", "the", "to", "with", "market", "move", "moves", "stock",
+    "stocks", "share", "shares", "price", "prices", "cap", "capitalization",
+    "trading", "volume", "turnover", "valuation", "valuations", "index",
+    "indices", "rose", "rise", "rises", "rising", "surge", "surged",
+    "surges", "fell", "fall", "falls", "dropped", "drop", "drops", "gained",
+    "gain", "gains", "jump", "jumped", "jumps", "up", "down", "higher",
+    "lower", "percent", "per", "cent", "today", "yesterday", "usd", "hkd",
+    "cny", "dollar", "dollars", "million", "billion", "trillion",
+    "increase", "increased", "decrease", "decreased",
+})
+
+
 class ScoreValidationError(ValueError):
     """Raised when scoring configuration or LLM output violates the contract."""
 
 
-def _article_policy_text(article):
+def _article_source_text(article):
     return " ".join(
         str(article.get(field) or "")
         for field in ("title", "summary", "content")
-    )[:4000]
+    )
+
+
+def _article_policy_text(article):
+    return _article_source_text(article)[:4000]
+
+
+def _is_explicit_price_only_text(article):
+    words = re.findall(r"[^\W\d_]+", _article_source_text(article).casefold())
+    return bool(words) and all(word in _PURE_MARKET_WORDS for word in words)
 
 
 def local_article_route(article):
@@ -92,7 +120,8 @@ def local_article_route(article):
     has_industrial_action = any(
         pattern.search(text) for pattern in _INDUSTRIAL_ACTION_PATTERNS
     )
-    if has_market_signal and not has_industrial_action:
+    if (has_market_signal and not has_industrial_action
+            and _is_explicit_price_only_text(article)):
         return "market_only"
     if has_industrial_action:
         return "industry_candidate"
@@ -131,7 +160,7 @@ def validate_priority_industry_review(value, article):
     for field in ("factual_basis", "reason"):
         if not isinstance(value[field], str) or not value[field].strip():
             raise ValueError(f"priority industry review {field} is empty")
-    if value["factual_basis"].strip().casefold() not in _article_policy_text(article).casefold():
+    if value["factual_basis"].strip().casefold() not in _article_source_text(article).casefold():
         raise ValueError("priority industry review factual_basis is not in source")
     if value["is_relevant"]:
         if value["event_type"] not in INDUSTRIAL_EVENT_TYPES or not claims:

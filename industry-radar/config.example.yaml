@@ -29,6 +29,16 @@ importance_criteria: |
   - 8-10分：现象级流量风口。
   - 【强制审查】：纯二级市场交易信息扣分。
 
+# 复合分权重：必须与 config.yaml 对齐；缺失时代码回退 0.6/0.4 默认，
+# 会导致示例部署与生产打出口径不同的分。
+scoring_weights:
+  innovation:
+    tech: 0.7
+    commercial: 0.3
+  traffic:
+    hype: 0.6
+    macro: 0.4
+
 trusted_sources:
   # 白名单媒体，若在此列表内，打分将在代码中自动享受硬核分数加权 (+1.0)
   - "Nature"
@@ -48,6 +58,14 @@ rss_feeds:
   - "https://www.intc.com/news-events/press-releases/rss" # Intel 官方投资者关系新闻
   - "https://www.microsoft.com/en-us/research/feed/" # Microsoft Research
   - "https://aws.amazon.com/blogs/machine-learning/feed/" # AWS Machine Learning
+  - "https://www.gsk.com/en-gb/media/rss/" # GSK 官方新闻稿 RSS
+  - "https://www.apple.com/newsroom/rss-feed.rss" # Apple 官方 Newsroom
+  - "https://ir.amd.com/rss/news-releases.xml" # AMD 官方 IR 新闻稿
+  - "https://www.tencent.com/newsroom/all-news/feed/"
+  - "https://research.ibm.com/rss" # IBM Research 官方博客
+  - "https://www.coreweave.com/blog/rss.xml" # CoreWeave 官方博客（T1 对手方）
+  - "https://www.hpe.com/us/en/newsroom/rss.xml" # HPE 官方 Newsroom
+  - "https://news.samsung.com/global/rss" # 三星全球官方 Newsroom（佐证对手腿，无映射）
   - "https://www.marktechpost.com/feed/" # MarkTechPost
   
   # 全球顶级科技媒体 & 产业动态
@@ -88,6 +106,7 @@ official_newsrooms:
   - "https://news.modernatx.com/sitemap.xml"
   - "https://www.merck.com/media/news/"
   - "https://www.smics.com/en/site/news"
+  - "https://www.qualcomm.com/sitemap.xml"
 
 # SpaceX's official site is a client-rendered app. Its audited content API is
 # parsed by a separate fail-closed adapter; NASA/JPL remains authoritative only
@@ -122,6 +141,14 @@ rss_critical_source_groups:
       - "https://www.sec.gov/news/pressreleases.rss"
       - "https://www.jpl.nasa.gov/feeds/news/"
       - "https://www.hkexgroup.com/Global/RSS-Feeds/NewsRelease?sc_lang=en"
+      - "https://www.gsk.com/en-gb/media/rss/"
+      - "https://www.apple.com/newsroom/rss-feed.rss"
+      - "https://ir.amd.com/rss/news-releases.xml"
+      - "https://www.tencent.com/newsroom/all-news/feed/"
+      - "https://research.ibm.com/rss"
+      - "https://www.coreweave.com/blog/rss.xml"
+      - "https://www.hpe.com/us/en/newsroom/rss.xml"
+      - "https://news.samsung.com/global/rss"
     min_available_sources: 7
     min_current_sources: 0
     content_max_age_hours: 336
@@ -190,6 +217,7 @@ strategic_hardtech:
 delivery:
   enabled: false
   sender_email: "your_sender@example.com" # 填写你的发送邮箱地址
+  smtp_username: "your_sender@example.com" # SMTP 登录用户名，与 config.yaml 保持同构
   recipient_email: "your_recipient@example.com"      # 接收报告的邮箱
   subject: "Global Macro Radar Daily Report"
   smtp_server: "smtp.mail.me.com"

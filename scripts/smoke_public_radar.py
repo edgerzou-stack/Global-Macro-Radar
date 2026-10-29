@@ -36,6 +36,7 @@ def run_smoke(root):
     import cache_manager
     import evidence_policy
     import main as radar_main
+    import import_manual_review
     import pipeline_selection
     import score
     import source_registry
@@ -91,6 +92,7 @@ def run_smoke(root):
         "delivery_enabled": False,
         "scoring_prompt_version": score.SCORING_PROMPT_VERSION,
         "main_module": radar_main.__name__,
+        "manual_review_module": import_manual_review.__name__,
         "selection_module": pipeline_selection.__name__,
     }
 

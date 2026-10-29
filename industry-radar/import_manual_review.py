@@ -290,6 +290,7 @@ def _persist_verified_manual_scores(
     request_path,
     response_path,
     output_path,
+    review_certificate=None,
 ):
     """Persist only scores that passed the complete manual-import contract."""
 
@@ -316,6 +317,31 @@ def _persist_verified_manual_scores(
             _canonical_json(request.get("response_contract")).encode("utf-8")
         ).hexdigest(),
     }
+    certificate_path = (
+        Path(request_path).resolve().parent / "review-completion-certificate.json"
+    )
+    session_receipt_path = certificate_path.parent / "folder-agent-review-receipt.json"
+    if session_receipt_path.is_file() and _load_json_object(
+        session_receipt_path, "manual review session receipt"
+    ).get("schema_version") == 5 and not certificate_path.is_file():
+        raise ValueError("v5 manual review requires its completion certificate")
+    if certificate_path.is_file() or review_certificate is not None:
+        # This is the new v5 transport certificate, not a relaxation of the
+        # schema-v1 provenance/completed-run gate. Never fabricate a certificate
+        # for an older sealed or failed session.
+        if review_certificate is None:
+            review_certificate = _validated_review_completion_certificate(
+                Path(request_path).resolve().parent.parent,
+                receipt["reviewer"],
+            )
+        _validate_certificate_import_binding(
+            review_certificate, request, request_path, response_path,
+        )
+        provenance_common.update({
+            "schema_version": 2,
+            "review_certificate_path": str(certificate_path),
+            "review_certificate_file_sha256": _sha256_file(certificate_path),
+        })
     entries = {}
     for semantic_key, score_data in score_by_id.items():
         if _is_unscored_priority(score_data):
@@ -341,6 +367,278 @@ def _persist_verified_manual_scores(
     if entries:
         merge_verified_cache_entries(entries)
     return len(entries)
+
+
+def _validated_review_completion_certificate(run_dir, reviewer):
+    """Read the private transport's pure validator without an import cycle.
+
+    Public Radar exports do not include private production operators. Missing
+    private validation code must fail closed for certified provenance, while
+    ordinary public imports and the legacy cache path remain independent.
+    """
+
+    import importlib.util
+    import sys
+
+    run_dir = Path(run_dir).resolve()
+    certificate_path = run_dir / "radar" / "review-completion-certificate.json"
+    if not certificate_path.is_file():
+        raise ValueError("review completion certificate is missing")
+    module_path = (
+        Path(__file__).resolve().parents[1]
+        / "scripts" / "folder_agent_parallel_review.py"
+    )
+    if not module_path.is_file():
+        raise ValueError("certified review transport validator is unavailable")
+    module_name = "_gmr_certified_parallel_review"
+    try:
+        module = sys.modules.get(module_name)
+        if module is None:
+            spec = importlib.util.spec_from_file_location(module_name, module_path)
+            if spec is None or spec.loader is None:
+                raise ValueError("cannot load certified review transport validator")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            try:
+                spec.loader.exec_module(module)
+            except Exception:
+                sys.modules.pop(module_name, None)
+                raise
+        certificate = module.validate_review_completion_certificate(run_dir, reviewer)
+    except (OSError, ValueError, RuntimeError, TypeError, KeyError) as error:
+        raise ValueError(f"invalid review completion certificate: {error}") from error
+    if not isinstance(certificate, dict):
+        raise ValueError("review completion certificate validator returned invalid data")
+    return certificate
+
+
+def _validate_certificate_import_binding(
+    certificate, request, request_path, response_path,
+):
+    expected = {
+        "schema_version": 1,
+        "component": "folder-agent-review-completion-certificate",
+        "validation": "passed",
+        "run_id": request.get("run_id"),
+        "reviewer": _load_json_object(response_path, "manual review response").get("reviewer"),
+        "request_sha256": request.get("request_sha256"),
+        "request_file_sha256": _sha256_file(request_path),
+        "response_sha256": _sha256_file(response_path),
+        "rules_sha256": request.get("rules_sha256"),
+        "config_sha256": request.get("config_sha256"),
+        "prompt_version": request.get("prompt_version"),
+        "rubric_sha256": request.get("rubric_sha256"),
+    }
+    if any(certificate.get(key) != value for key, value in expected.items()):
+        raise ValueError("review completion certificate/import binding mismatch")
+
+
+def _validated_imported_review_artifacts(request_path, response_path, output_path):
+    """Rebuild the complete immutable import chain without writing anything."""
+
+    request_path = Path(request_path).resolve()
+    response_path = Path(response_path).resolve()
+    output_path = Path(output_path).resolve()
+    radar_dir = request_path.parent
+    if (
+        radar_dir.name != "radar"
+        or request_path.name != "llm-review-request.json"
+        or response_path != radar_dir / "llm-review-response.json"
+        or output_path != radar_dir / "llm-review-scored-articles.json"
+    ):
+        raise ValueError("certified cache publication requires canonical run-local paths")
+    request = _load_json_object(request_path, "manual review request")
+    response = _load_json_object(response_path, "manual review response")
+    output = _load_json_object(output_path, "compiled scored fixture")
+    receipt_path = output_path.with_suffix(output_path.suffix + ".receipt.json")
+    receipt = _load_json_object(receipt_path, "manual review import receipt")
+    expected_fields = {
+        "schema_version", "run_id", "effective_date", "mode",
+        "prompt_version", "rules_sha256", "rubric", "rubric_sha256",
+        "request_sha256", "item_count", "articles", "config_sha256",
+        "no_manual_review_needed", "response_contract", "rss_fixture", "base_scores",
+    }
+    if (
+        set(request) != expected_fields
+        or request.get("schema_version") != 4
+        or request.get("mode") != "interactive"
+        or request.get("run_id") != radar_dir.parent.name
+        or not isinstance(request.get("articles"), list)
+        or not request["articles"]
+        or request.get("item_count") != len(request["articles"])
+        or request.get("no_manual_review_needed") is not False
+        or request.get("response_contract") != manual_review_response_contract()
+    ):
+        raise ValueError("certified cache requires a complete non-empty interactive request")
+    validate_scoring_rubric(request.get("rubric"), request.get("rubric_sha256"))
+    expected_request_sha = hashlib.sha256(
+        _canonical_json(_request_identity(request)).encode("utf-8")
+    ).hexdigest()
+    if request.get("request_sha256") != expected_request_sha:
+        raise ValueError("manual review request content hash mismatch")
+    reviewer, article_by_id, score_by_id = _validate_manual_response(request, response)
+    expected_output, rss_path, base_path = _compile_complete_fixture(
+        request_path, request, article_by_id, score_by_id,
+        _priority_display_by_id(response), _priority_industry_review_by_id(response),
+    )
+    if output != expected_output:
+        raise ValueError("compiled scored fixture differs from complete sealed review")
+    expected_receipt = {
+        "schema_version": 1,
+        "component": "manual-review-import",
+        "request_sha256": request["request_sha256"],
+        "request_file_sha256": _sha256_file(request_path),
+        "response_file_sha256": _sha256_file(response_path),
+        "reviewer": reviewer,
+        "run_id": request["run_id"],
+        "effective_date": request["effective_date"],
+        "manual_item_count": len(score_by_id),
+        "unscored_priority_count": sum(
+            _is_unscored_priority(value) for value in score_by_id.values()
+        ),
+        "total_item_count": len(expected_output["scores"]),
+        "output": str(output_path),
+        "output_sha256": _sha256_file(output_path),
+        "validation": "passed",
+        "rss_fixture_sha256": _sha256_file(rss_path),
+        "base_scores_sha256": _sha256_file(base_path),
+    }
+    if "verified_cache_persisted_count" in receipt:
+        expected_receipt["verified_cache_persisted_count"] = sum(
+            not _is_unscored_priority(value) for value in score_by_id.values()
+        )
+    if receipt != expected_receipt:
+        raise ValueError("manual review import receipt changed before certified publication")
+    return request, response, score_by_id, receipt, receipt_path
+
+
+def validate_certified_cache_provenance(provenance, semantic_key, score_data):
+    """Reject unsealed, changed, partial or self-rehashed cached judgments."""
+
+    if not isinstance(provenance, dict) or provenance.get("schema_version") != 2:
+        raise ValueError("certified cache provenance schema mismatch")
+    certificate_path = Path(
+        str(provenance.get("review_certificate_path") or "")
+    ).resolve()
+    if (
+        certificate_path.name != "review-completion-certificate.json"
+        or certificate_path.parent.name != "radar"
+        or not certificate_path.is_file()
+        or _sha256_file(certificate_path)
+        != provenance.get("review_certificate_file_sha256")
+    ):
+        raise ValueError("certified cache certificate hash/path mismatch")
+    radar_dir = certificate_path.parent
+    run_dir = radar_dir.parent
+    canonical_paths = {
+        "request_path": radar_dir / "llm-review-request.json",
+        "response_path": radar_dir / "llm-review-response.json",
+        "output_path": radar_dir / "llm-review-scored-articles.json",
+        "receipt_path": radar_dir / "llm-review-scored-articles.json.receipt.json",
+    }
+    if any(
+        str(path) != provenance.get(field)
+        for field, path in canonical_paths.items()
+    ):
+        raise ValueError("certified cache provenance has noncanonical artifact paths")
+    request, _response, scores, receipt, receipt_path = _validated_imported_review_artifacts(
+        canonical_paths["request_path"],
+        canonical_paths["response_path"],
+        canonical_paths["output_path"],
+    )
+    certificate = _validated_review_completion_certificate(
+        run_dir, receipt["reviewer"],
+    )
+    _validate_certificate_import_binding(
+        certificate, request, canonical_paths["request_path"],
+        canonical_paths["response_path"],
+    )
+    expected_score = scores.get(semantic_key)
+    if (
+        expected_score is None
+        or _is_unscored_priority(expected_score)
+        or score_data != expected_score
+    ):
+        raise ValueError("cached score differs from its exact sealed article judgment")
+    expected_provenance = {
+        "schema_version": 2,
+        "source_run_id": request["run_id"],
+        "source_effective_date": request["effective_date"],
+        "request_sha256": request["request_sha256"],
+        "request_file_sha256": _sha256_file(canonical_paths["request_path"]),
+        "request_path": str(canonical_paths["request_path"]),
+        "response_file_sha256": _sha256_file(canonical_paths["response_path"]),
+        "response_path": str(canonical_paths["response_path"]),
+        "receipt_file_sha256": _sha256_file(receipt_path),
+        "receipt_path": str(receipt_path),
+        "output_sha256": _sha256_file(canonical_paths["output_path"]),
+        "output_path": str(canonical_paths["output_path"]),
+        "reviewer": receipt["reviewer"],
+        "prompt_version": request["prompt_version"],
+        "rules_sha256": request["rules_sha256"],
+        "config_sha256": request["config_sha256"],
+        "response_contract_sha256": hashlib.sha256(
+            _canonical_json(request["response_contract"]).encode("utf-8")
+        ).hexdigest(),
+        "semantic_input_sha256": semantic_key,
+        "score_data_sha256": hashlib.sha256(
+            _canonical_json(expected_score).encode("utf-8")
+        ).hexdigest(),
+        "review_certificate_path": str(certificate_path),
+        "review_certificate_file_sha256": _sha256_file(certificate_path),
+    }
+    if provenance != expected_provenance:
+        raise ValueError("certified cache provenance differs from immutable review evidence")
+    return dict(provenance)
+
+
+def persist_certified_review_cache(request_path, response_path, output_path):
+    """Publish a v5-certified review independently of downstream run success."""
+
+    request_path = Path(request_path).resolve()
+    response_path = Path(response_path).resolve()
+    output_path = Path(output_path).resolve()
+    certificate_path = request_path.parent / "review-completion-certificate.json"
+    if not certificate_path.is_file():
+        raise ValueError("certified cache publication requires a v5 completion certificate")
+    request, _response, scores, receipt, receipt_path = _validated_imported_review_artifacts(
+        request_path, response_path, output_path,
+    )
+    certificate = _validated_review_completion_certificate(
+        request_path.parent.parent, receipt["reviewer"],
+    )
+    _validate_certificate_import_binding(
+        certificate, request, request_path, response_path,
+    )
+    promotion = {
+        "schema_version": 1,
+        "component": "certified-manual-review-cache-promotion",
+        "validation": "passed",
+        "run_id": request["run_id"],
+        "effective_date": request["effective_date"],
+        "reviewer": receipt["reviewer"],
+        "request_file_sha256": _sha256_file(request_path),
+        "response_file_sha256": _sha256_file(response_path),
+        "import_receipt_file_sha256": _sha256_file(receipt_path),
+        "output_sha256": _sha256_file(output_path),
+        "review_certificate_file_sha256": _sha256_file(certificate_path),
+        "persisted_count": sum(
+            not _is_unscored_priority(value) for value in scores.values()
+        ),
+    }
+    promotion_path = output_path.with_suffix(
+        output_path.suffix + ".certified-cache-promotion.json"
+    )
+    if promotion_path.exists():
+        if _load_json_object(promotion_path, "certified cache promotion receipt") != promotion:
+            raise ValueError("a different certified cache promotion receipt already exists")
+        return promotion_path
+    _persist_verified_manual_scores(
+        request, scores, receipt, receipt_path, request_path,
+        response_path, output_path, review_certificate=certificate,
+    )
+    _write_json_atomic(promotion_path, promotion)
+    return promotion_path
 
 
 def import_review(
@@ -636,8 +934,18 @@ def main(argv=None):
     parser.add_argument("--response", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--no-persist-verified-cache", action="store_true")
-    parser.add_argument("--persist-completed-cache-only", action="store_true")
+    promotion_group = parser.add_mutually_exclusive_group()
+    promotion_group.add_argument("--persist-completed-cache-only", action="store_true")
+    promotion_group.add_argument("--persist-certified-cache-only", action="store_true")
     args = parser.parse_args(argv)
+    if args.persist_certified_cache_only:
+        receipt = persist_certified_review_cache(
+            args.request,
+            args.response,
+            args.output,
+        )
+        print(f"MANUAL_REVIEW_CERTIFIED_CACHE_PROMOTION_RECEIPT={receipt}")
+        return
     if args.persist_completed_cache_only:
         receipt = persist_completed_review_cache(
             args.request,

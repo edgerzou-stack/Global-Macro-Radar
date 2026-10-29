@@ -88,6 +88,7 @@ def scoring_rules_sha256():
         _INDUSTRIAL_ACTION_PATTERNS,
         _LOCAL_REJECTION_PATTERNS,
         _MARKET_ONLY_PATTERNS,
+        _PURE_MARKET_WORDS,
     )
 
     payload = {
@@ -95,6 +96,7 @@ def scoring_rules_sha256():
         "evidence_policy_version": EVIDENCE_POLICY_VERSION,
         "event_types": sorted(EVENT_TYPES),
         "market_patterns": [item.pattern for item in _MARKET_ONLY_PATTERNS],
+        "pure_market_words": sorted(_PURE_MARKET_WORDS),
         "industrial_patterns": [item.pattern for item in _INDUSTRIAL_ACTION_PATTERNS],
         "rejection_patterns": [item.pattern for item in _LOCAL_REJECTION_PATTERNS],
     }
@@ -107,34 +109,15 @@ def scoring_rules_sha256():
     return hashlib.sha256(encoded).hexdigest()
 
 
-_BACKWARD_COMPATIBLE_SCORING_RULE_SHA256 = frozenset(
-    {
-        # ``deterministic-industry-boundary-v2`` before the weekly-roundup
-        # rejection was added.  That addition is strictly more restrictive:
-        # every reused score is passed through ``apply_industry_relevance_gate``
-        # below, so a newly rejected roundup is zeroed before it can reach
-        # selection or delivery.  Keeping this one audited predecessor avoids
-        # turning an otherwise identical 100-item RSS capture into a new
-        # manual-review batch merely because a local rejection rule tightened.
-        "929df94457e42c1ba625bac41dd654ac99381f9ebca3a8937dac90a465e6f293",
-    }
-)
-
-
 def compatible_scoring_rules_sha256():
-    """Return approved cache-rule identities, newest first.
+    """Reuse only the exact current rules; preserve older entries as history.
 
-    This is deliberately an allowlist rather than a version-prefix rule.  A
-    future scoring-policy change must opt in only after proving it is
-    monotonic (that is, it cannot make an old accepted score less strict).
+    Correcting false market-only rejections is not a monotonic tightening:
+    applying the current gate cannot restore facts already erased by an older
+    rule.  Those articles require a fresh semantic review, not a cache alias.
     """
 
-    current = scoring_rules_sha256()
-    return (current,) + tuple(
-        rule_hash
-        for rule_hash in sorted(_BACKWARD_COMPATIBLE_SCORING_RULE_SHA256)
-        if rule_hash != current
-    )
+    return (scoring_rules_sha256(),)
 
 
 def scoring_prompt_identity():
@@ -271,8 +254,8 @@ def find_cached_article(cache_data, article, config):
             continue
         if score_data is not None:
             return score_data, semantic_key
-    # Backward-compatible, exact-provider lookup avoids a costly cold start for
-    # valid v3 entries. A hit is migrated to the semantic key by the caller.
+    # Provider keys do not include deterministic rules.  Migrate only entries
+    # with an explicit current-rule identity, never unidentified/older scores.
     for provider, model in configured_scoring_identities(
         config,
         require_credentials=False,
@@ -284,10 +267,14 @@ def find_cached_article(cache_data, article, config):
             provider,
             model,
         )
-        score_data = get_cached_score(
-            cache_data.get(cache_key),
-            cache_key,
-        )
+        entry = cache_data.get(cache_key)
+        if (
+            not isinstance(entry, dict)
+            or entry.get("rules_sha256") != scoring_rules_sha256()
+            or "manual_review_provenance" in entry
+        ):
+            continue
+        score_data = get_cached_score(entry, cache_key)
         if score_data is not None:
             return score_data, cache_key
     return None, None
@@ -305,6 +292,29 @@ def _verified_manual_review_provenance(
     if not isinstance(entry, dict):
         return None
     provenance = entry.get("manual_review_provenance")
+    if isinstance(provenance, dict) and provenance.get("schema_version") == 2:
+        # A v5 review completion certificate authenticates only the review;
+        # downstream production success remains a separate operator verdict.
+        # Never apply this branch to old schema-v1 provenance.
+        expected_rules_sha256 = (
+            scoring_rules_sha256()
+            if expected_rules_sha256 is None
+            else expected_rules_sha256
+        )
+        if (
+            provenance.get("semantic_input_sha256") != semantic_key
+            or provenance.get("prompt_version") != scoring_prompt_identity()
+            or provenance.get("rules_sha256") != expected_rules_sha256
+        ):
+            return None
+        try:
+            from import_manual_review import validate_certified_cache_provenance
+
+            return validate_certified_cache_provenance(
+                provenance, semantic_key, score_data,
+            )
+        except (OSError, ValueError, RuntimeError, TypeError, KeyError):
+            return None
     if not isinstance(provenance, dict) or provenance.get("schema_version") != 1:
         return None
     required_text = {

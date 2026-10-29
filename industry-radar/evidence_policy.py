@@ -9,6 +9,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 
 EVIDENCE_POLICY_VERSION = "industrial-evidence-v10-spacex-event-bound"
+# Downstream annotation identity, not the frozen human scoring rubric.
+MILESTONE_CLASSIFIER_VERSION = "article-event-attribution-v1"
 
 SAME_BATCH_CORROBORATION_METHOD = "same_batch_event_match_v1"
 EXPLICIT_PRIMARY_URL_METHOD = "same_batch_explicit_primary_url_v1"
@@ -346,13 +348,7 @@ def _trade_maturity(article):
     result = (
         hardtech
         if hardtech["topic"] != "unrelated"
-        else classify_industrial_milestone(
-            text,
-            event_type=score.get("event_type"),
-            audited_platform_aliases=_normalized_aliases(
-                article, "audited_platform_aliases"
-            ),
-        )
+        else _classify_article_industrial_milestone(article)
     )
     if (
         result.get("production_state") == "current"
@@ -1303,7 +1299,7 @@ def classify_hardtech_milestone(text):
     }
 
 
-_INDUSTRIAL_CLAUSE_BOUNDARY = re.compile(r"[.!?;。！？；\n]+")
+_INDUSTRIAL_CLAUSE_BOUNDARY = re.compile(r"(?<!\d)\.|\.(?!\d)|[!?;。！？；\n]+")
 _FUTURE_OR_NEGATED_STATE = re.compile(
     r"\b(?:planned|plans?|planning|expected|expects?|scheduled|aims?|intends?|"
     r"will|would|could|may|might|upcoming|future|roadmap)\b|"
@@ -1318,6 +1314,155 @@ _PRECOMMERCIAL_STATE = re.compile(
     r"预览|测试版|试点|试用|概念验证",
     re.IGNORECASE,
 )
+_CLINICAL_PHASE = r"\bphase\s+(?:[123]|III|II|I)[ab]?\b"
+_CLINICAL_READOUT = (
+    _CLINICAL_PHASE + r"[^.!?;。！？；\n]{0,180}\b(?:results?|data|readout)\b|"
+    + _CLINICAL_PHASE + r"[^.!?;。！？；\n]{0,180}\b(?:met|achieved|reached|did not meet|failed to meet)\b"
+    r"[^.!?;。！？；\n]{0,100}\b(?:endpoint|endpoints)\b|"
+    r"\b(?:met|achieved|reached)\b[^.!?;。！？；\n]{0,100}\bendpoints?\b"
+    r"[^.!?;。！？；\n]{0,180}" + _CLINICAL_PHASE + r"|"
+    r"pivotal trial[^.!?;。！？；\n]{0,140}\b(?:results?|data|readout|endpoints?)\b|"
+    r"临床.{0,8}(?:达到终点|结果|数据)"
+)
+_COMPLETED_CLINICAL_READOUT = re.compile(
+    r"\b(?:met|achieved|reached|did not meet|failed to meet)\b"
+    r"[^.!?;。！？；\n]{0,100}\bendpoints?\b|"
+    r"\b(?:reports?|reported|announces?|announced|presents?|presented|publishes?|published)\b"
+    r"[^.!?;。！？；\n]{0,180}\b(?:results?|data|readout)\b|"
+    r"\b(?:positive|negative|top[- ]line)\b[^.!?;。！？；\n]{0,100}\bresults?\b|"
+    r"\b(?:results?|data)\b[^.!?;。！？；\n]{0,100}\b(?:show|showed|demonstrate|demonstrated)\b|"
+    r"临床.{0,8}达到终点|(?:公布|发布).{0,20}临床.{0,8}(?:结果|数据)|临床.{0,8}结果显示",
+    re.IGNORECASE,
+)
+_UNAVAILABLE_CLINICAL_RESULTS = re.compile(
+    r"\bno\s+(?:clinical\s+)?results?\b|\bresults?\s+(?:are\s+|is\s+)?not\s+available\b|"
+    r"\b(?:not|never)\s+(?:(?:yet|actually|ever|formally|been|already|officially)\s+){0,3}"
+    r"(?:announce[ds]?|report(?:ed|s)?|publish(?:ed|es)?|present(?:ed|s)?)\b|"
+    r"\b(?:tomorrow|next (?:week|month|quarter|year))\b|"
+    r"\bto\s+(?:report|announce|publish|present)\b|"
+    r"尚无.{0,8}(?:结果|数据)|尚未.{0,8}(?:公布|发布).{0,8}(?:结果|数据)",
+    re.IGNORECASE,
+)
+_COMPLETED_APPROVAL = re.compile(
+    r"\b(?:fda|ema|regulator)\s+(?:has\s+)?approv(?:ed|es?)\b|"
+    r"\b(?:granted|received|obtained|secured)\s+(?:the\s+)?"
+    r"(?:(?:necessary|regulatory|accelerated|marketing)\s+)*approvals?\b|"
+    r"\bapproval\s+(?:(?:was|has been)\s+)?granted\b|"
+    r"authorized for commercial use|获批|批准上市|监管批准|获准商业使用",
+    re.IGNORECASE,
+)
+_NEGATED_APPROVAL = re.compile(
+    r"\b(?:not|never)\s+(?:(?:yet|actually|ever|formally|been|already|officially)\s+){0,3}"
+    r"(?:granted|received|obtained|secured|approved|authorized)\b|"
+    r"\bno\s+(?:regulatory\s+)?approval\b|"
+    r"(?:未|没有|尚未|不)(?:被)?(?:获批|批准上市|获得.{0,8}批准)|"
+    r"\b(?:denied|refused)\s+(?:regulatory\s+)?approval\b",
+    re.IGNORECASE,
+)
+_ACQUISITION_EVENT = re.compile(
+    r"\bacquir(?:e|es|ed|ing)\b|\bacquisition\b|"
+    r"\bagreed\s+(?:to\s+)?(?:buy|purchase)\b|收购|并购", re.I,
+)
+_PENDING_ACQUISITION = re.compile(
+    r"\bagreed\s+(?:agreed\s+)?to\s+(?:acquire|buy|purchase)\b|"
+    r"\b(?:deal|transaction|acquisition)\b.{0,100}\b(?:expected|will|pending|subject to)\b|"
+    r"\b(?:pending|subject to)\b.{0,80}\b(?:approval|closing|clearance)\b|"
+    r"\b(?:not yet|not)\s+(?:completed|closed|finalized)\b|"
+    r"同意.{0,20}收购|待.{0,10}(?:审批|交割)|尚未.{0,10}完成", re.I,
+)
+_COMPLETED_ACQUISITION = re.compile(
+    r"\b(?:completed|closed|finalized)\s+(?:the\s+|its\s+|an?\s+)?acquisition\b|"
+    r"\bacquisition\s+(?:has\s+)?(?:closed|completed)\b|完成.{0,10}(?:收购|并购)", re.I,
+)
+_MODEL_NAME = re.compile(
+    r"\b[A-Za-z][A-Za-z0-9]*[- ]\d+(?:\.\d+)+(?:[- ]+[A-Za-z][A-Za-z0-9]*)?\b"
+)
+_LAUNCHED_PRODUCT = re.compile(
+    r"\b(?i:releases?|released|launch(?:es|ed)?|introduc(?:es|ed)|unveils?)\s+"
+    r"([A-Z][A-Za-z0-9]*(?:[-_.][A-Za-z0-9]+)*)\b"
+)
+_COMPARISON_TABLE = re.compile(
+    r"\bFeature\s+(?P<names>.{1,600}?)\s+Developer\s*/\s*API\s+ID\s+"
+    r"(?P<ids>.{1,800}?)\s+Status\s+(?P<states>.{1,250}?)\s+Input price\b",
+    re.I | re.S,
+)
+_COMPARISON_ID = re.compile(
+    r"[A-Za-z][A-Za-z0-9]*\s*/\s*([a-z][a-z0-9]*(?:[.-][a-z0-9]+)+)", re.I,
+)
+_COMPARISON_STATE = re.compile(r"Generally available|Not available|Preview|Beta", re.I)
+_ANONYMOUS_DEPLOYMENT_LIMIT = re.compile(
+    r"^(?:it|this (?:model|product|service)|the (?:model|product|service))\b", re.I,
+)
+_NEGATED_DEPLOYMENT = re.compile(
+    r"\b(?:not|never|no longer|(?:is|are|was|were|has|have|wo|ca)n['’]t)\s+"
+    r"(?:(?:yet|currently|generally|been|be|actually|broadly|fully|publicly|commercially)\s+){0,4}"
+    r"(?:available|live|deployed)\b|尚未.{0,8}(?:可用|上线|部署)|不再.{0,8}(?:可用|上线)", re.I,
+)
+
+
+def _compact_identity(text):
+    return re.sub(r"[^a-z0-9]", "", str(text).casefold())
+
+
+def _bind_comparison_status(text, title):
+    """Interpret only a complete, uniquely attributed flattened API table.
+
+    This never changes stored source material and cannot alone prove a current
+    deployment. Ambiguous layouts remain untouched and therefore fail closed.
+    """
+    def bind(match):
+        id_matches = list(_COMPARISON_ID.finditer(match["ids"]))
+        ids = [item[1] for item in id_matches]
+        states = _COMPARISON_STATE.findall(match["states"])
+        if (
+            not 2 <= len(ids) <= 8 or len(ids) != len(states)
+            or len(set(ids)) != len(ids)
+            or _COMPARISON_ID.sub("", match["ids"]).strip()
+            or _COMPARISON_STATE.sub("", match["states"]).strip()
+            or "".join(_compact_identity(value) for value in ids) != _compact_identity(match["names"])
+        ):
+            return match[0] + ". Unattributed commercial deployment is not currently verified."
+        focal = [index for index, value in enumerate(ids) if _compact_identity(value) in _compact_identity(title)]
+        if len(focal) != 1:
+            return match[0] + ". Unattributed commercial deployment is not currently verified."
+        state = states[focal[0]].casefold()
+        if state == "generally available":
+            # Raw prose, not a comparison row or reviewer claim, must provide
+            # the affirmative deployment evidence.
+            return "Attributed comparison status: current. Input price"
+        if state == "not available":
+            return "Attributed commercial deployment is not currently available. Input price"
+        return f"Attributed commercial deployment is in {state}. Input price"
+    original = str(text or "")
+    result, count = _COMPARISON_TABLE.subn(bind, original)
+    if not count and re.search(r"Developer\s*/\s*API\s+ID", original, re.I):
+        result += "\nUnattributed commercial deployment is not currently verified."
+    return result
+
+
+def _classify_article_industrial_milestone(article):
+    """Shared display/corroboration entry point with raw headline event scope."""
+    title = str(article.get("title") or "")
+    raw_text = "\n".join(str(article.get(field) or "") for field in ("title", "summary", "content"))
+    primary_milestone = None
+    if re.search(r"funding round|financing round|raised \$|融资|募集资金", title, re.I):
+        primary_milestone = "funding"
+    elif _ACQUISITION_EVENT.search(title):
+        primary_milestone = "acquisition"
+    model_names = tuple(match[0] for match in _MODEL_NAME.finditer(title))
+    launch = _LAUNCHED_PRODUCT.search(title)
+    subjects = model_names if model_names else ((launch[1],) if launch else ())
+    # Comparison/model prose needs independently present raw deployment evidence;
+    # reviewer summaries cannot fill in absent facts or ambiguous table cells.
+    text = raw_text if subjects or re.search(r"Developer\s*/\s*API\s+ID", raw_text, re.I) else _article_evidence_text(article)
+    return classify_industrial_milestone(
+        _bind_comparison_status(text, title),
+        event_type=(article.get("score_data") or {}).get("event_type"),
+        audited_platform_aliases=_normalized_aliases(article, "audited_platform_aliases"),
+        primary_milestone=primary_milestone,
+        deployment_subjects=subjects,
+        acquisition_completed=bool(_COMPLETED_ACQUISITION.search(title + "\n" + str(article.get("summary") or ""))),
+    )
 
 
 def _industrial_clauses(text):
@@ -1328,11 +1473,23 @@ def _industrial_clauses(text):
     ]
 
 
+def _current_clinical_readout(clauses):
+    return bool(clauses) and all(
+        _COMPLETED_CLINICAL_READOUT.search(clause)
+        and not _UNAVAILABLE_CLINICAL_RESULTS.search(clause)
+        and not _FUTURE_OR_NEGATED_STATE.search(clause)
+        for clause in clauses
+    )
+
+
 def classify_industrial_milestone(
     text,
     *,
     event_type=None,
     audited_platform_aliases=(),
+    primary_milestone=None,
+    deployment_subjects=(),
+    acquisition_completed=None,
 ):
     """Classify progress and maturity from the clause carrying the claim.
 
@@ -1359,7 +1516,7 @@ def classify_industrial_milestone(
         ),
         (
             "regulatory_approval",
-            r"regulator approved|regulatory approval|granted (?:accelerated )?approval|"
+            r"regulator approved|regulatory approvals?\b|granted (?:accelerated )?approval|"
             r"\b(?:fda|ema) approves?\b|authorized for commercial use|"
             r"获批|批准上市|监管批准|获准商业使用",
         ),
@@ -1370,12 +1527,7 @@ def classify_industrial_milestone(
         ),
         (
             "clinical_readout",
-            r"phase [123] (?:trial )?(?:met|results)|"
-            r"phase [123]\b[^.!?;。！？；\n]{0,180}\b(?:trial|study)\b"
-            r"[^.!?;。！？；\n]{0,140}\b(?:met|achieved|reached)\b"
-            r"[^.!?;。！？；\n]{0,100}\b(?:endpoint|endpoints|results?)\b|"
-            r"pivotal trial|"
-            r"临床.{0,8}(?:达到终点|结果|数据)",
+            _CLINICAL_READOUT,
         ),
         (
             "commercial_deployment",
@@ -1383,6 +1535,10 @@ def classify_industrial_milestone(
             r"deployed\s+(?:more than\s+|over\s+)?\d[\d,]*(?:\+)?\s+"
             r"(?:agents|workloads)\b|"
             r"generally available|"
+            r"\bavailable\s+(?:now\s+)?(?:through|via|in)\s+(?:the\s+)?"
+            r"(?:[a-z0-9.-]+\s+){0,3}api\b|"
+            r"\blive\s+(?:today|now)\s+(?:in|on|through)\s+(?:the\s+)?"
+            r"(?:[a-z0-9.-]+\s+){0,3}api\b|"
             r"(?:now )?available to (?:(?:eligible|select|enterprise)\s+)?"
             r"(?:[a-z0-9.-]+\s+){0,3}(?:customers|users|enterprises)|"
             r"entered (?:commercial |customer )?production use|in production use|"
@@ -1411,6 +1567,7 @@ def classify_industrial_milestone(
             "funding",
             r"funding round|raised \$|financing round|融资|募集资金",
         ),
+        ("acquisition", _ACQUISITION_EVENT.pattern),
         (
             "policy",
             r"final rule|new regulation|policy announced|guidance issued|"
@@ -1428,6 +1585,30 @@ def classify_industrial_milestone(
     )
     milestone = "none"
     matched_clauses = []
+    if primary_milestone in {"acquisition", "funding"}:
+        patterns = tuple(item for item in patterns if item[0] == primary_milestone) + tuple(
+            item for item in patterns if item[0] != primary_milestone
+        )
+    if primary_milestone != "acquisition":
+        # A background takeover is not the subject of every industrial story.
+        patterns = tuple(item for item in patterns if item[0] != "acquisition")
+
+    def deployment_bound(clause):
+        return (
+            not deployment_subjects
+            or clause.startswith(("Attributed commercial", "Unattributed commercial"))
+            # Unknown pronouns may constrain maturity, but must not supply
+            # affirmative evidence borrowed from a preceding competitor.
+            or (_ANONYMOUS_DEPLOYMENT_LIMIT.search(clause) and (
+                _PRECOMMERCIAL_STATE.search(clause)
+                or _NEGATED_DEPLOYMENT.search(clause)
+                or _FUTURE_OR_NEGATED_STATE.search(clause)
+            ))
+            or any(
+                re.search(re.escape(subject).replace(r"\-", "[- _]*").replace(r"\ ", "[- _]*"), clause, re.I)
+                for subject in deployment_subjects
+            )
+        )
     for name, pattern in patterns:
         matches = [clause for clause in clauses if re.search(pattern, clause, re.I)]
         if name == "commercial_deployment" and audited_platform_aliases:
@@ -1442,6 +1623,43 @@ def classify_industrial_milestone(
             )
             matches = list(dict.fromkeys(matches))
         if matches:
+            if name == "commercial_deployment":
+                matches = [clause for clause in matches if deployment_bound(clause)]
+                for clause in clauses:
+                    if not (_PRECOMMERCIAL_STATE.search(clause) or _NEGATED_DEPLOYMENT.search(clause)):
+                        continue
+                    named_subject = any(
+                        re.search(re.escape(subject).replace(r"\-", "[- _]*").replace(r"\ ", "[- _]*"), clause, re.I)
+                        for subject in deployment_subjects
+                    )
+                    if named_subject or _ANONYMOUS_DEPLOYMENT_LIMIT.search(clause):
+                        matches.append(clause)
+                if not matches:
+                    continue
+            if name == "regulatory_approval":
+                event_matches = [
+                    clause for clause in matches
+                    if _COMPLETED_APPROVAL.search(clause)
+                    or _FUTURE_OR_NEGATED_STATE.search(clause)
+                    or _NEGATED_APPROVAL.search(clause)
+                ]
+                # A bare risk noun is not a separate event and must not
+                # cancel an explicitly completed approval elsewhere.
+                matches = event_matches or matches
+                approval_current = all(
+                    _COMPLETED_APPROVAL.search(clause)
+                    and not _FUTURE_OR_NEGATED_STATE.search(clause)
+                    and not _NEGATED_APPROVAL.search(clause)
+                    for clause in matches
+                )
+                clinical = [clause for clause in clauses if re.search(_CLINICAL_READOUT, clause, re.I)]
+                if not approval_current and _current_clinical_readout(clinical):
+                    # Legal forward-looking approval boilerplate is not the
+                    # event. Preserve the full original text, but classify its
+                    # separately evidenced current clinical result as research.
+                    milestone = "clinical_readout"
+                    matched_clauses = clinical
+                    break
             milestone = name
             matched_clauses = matches
             break
@@ -1462,6 +1680,20 @@ def classify_industrial_milestone(
     has_future_or_negation = any(
         _FUTURE_OR_NEGATED_STATE.search(clause) for clause in matched_clauses
     )
+    if milestone == "regulatory_approval":
+        has_future_or_negation = has_future_or_negation or any(
+            _NEGATED_APPROVAL.search(clause)
+            or not _COMPLETED_APPROVAL.search(clause)
+            for clause in matched_clauses
+        )
+    if milestone == "acquisition":
+        has_future_or_negation = has_future_or_negation or any(
+            _PENDING_ACQUISITION.search(clause) for clause in clauses
+        )
+    if milestone == "commercial_deployment":
+        has_future_or_negation = has_future_or_negation or any(
+            _NEGATED_DEPLOYMENT.search(clause) for clause in matched_clauses
+        )
     has_precommercial_qualifier = any(
         _PRECOMMERCIAL_STATE.search(clause) for clause in matched_clauses
     )
@@ -1469,6 +1701,11 @@ def classify_industrial_milestone(
     if milestone != "none":
         if has_future_or_negation:
             production_state = "future"
+        elif milestone == "clinical_readout" and not _current_clinical_readout(matched_clauses):
+            production_state = "not_production"
+        elif milestone == "acquisition":
+            completed = acquisition_completed if acquisition_completed is not None else any(_COMPLETED_ACQUISITION.search(clause) for clause in matched_clauses)
+            production_state = "current" if completed else "not_production"
         elif has_precommercial_qualifier and milestone == "commercial_deployment":
             production_state = "not_production"
         elif milestone in current_milestones:
@@ -1556,13 +1793,7 @@ def annotate_article_evidence(article):
         milestone = hardtech["milestone"]
         production_state = hardtech["production_state"]
     else:
-        industrial = classify_industrial_milestone(
-            text,
-            event_type=event_type,
-            audited_platform_aliases=_normalized_aliases(
-                article, "audited_platform_aliases"
-            ),
-        )
+        industrial = _classify_article_industrial_milestone(article)
         milestone = industrial["milestone"]
         production_state = industrial["production_state"]
         domains = article.get("source_domains") or []
@@ -1575,6 +1806,7 @@ def annotate_article_evidence(article):
     article["strategic_topic"] = strategic_topic
     article["industrial_milestone"] = milestone
     article["production_state"] = production_state
+    article["milestone_classifier_version"] = MILESTONE_CLASSIFIER_VERSION
 
     tier = article.get("source_tier")
     deep_dive = article.get("deep_dive") or {}

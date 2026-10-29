@@ -545,6 +545,10 @@ def _fetch_one(entry, *, now, hours_back, session, timeout, max_workers):
         from smic_newsroom import fetch_smic_newsroom
         return fetch_smic_newsroom(entry, now=now, hours_back=hours_back,
                                    session=session, timeout=timeout)
+    if source_id == "qualcomm_newsroom":
+        from qualcomm_newsroom import fetch_qualcomm_newsroom
+        return fetch_qualcomm_newsroom(entry, now=now, hours_back=hours_back,
+                                       session=session, timeout=timeout)
     sitemap_url = str(entry.get("url") or "")
     expected_url = {
         "moderna_newsroom": MODERNA_SITEMAP_URL,
@@ -728,14 +732,23 @@ def fetch_official_newsrooms(
     articles = []
     health = []
     for entry in entries:
-        local_articles, local_health = _fetch_one(
-            entry,
-            now=now,
-            hours_back=hours_back,
-            session=session,
-            timeout=request_timeout,
-            max_workers=max_workers,
-        )
+        try:
+            local_articles, local_health = _fetch_one(
+                entry,
+                now=now,
+                hours_back=hours_back,
+                session=session,
+                timeout=request_timeout,
+                max_workers=max_workers,
+            )
+        except Exception as error:
+            # One misconfigured or unsupported registry row (or an adapter
+            # raising before its own try block) must fail alone and leave a
+            # health record, not abort the whole official sweep.
+            local_articles = []
+            local_health = _health(str(entry.get("url") or ""))
+            local_health["status"] = "failed"
+            local_health["error"] = f"{type(error).__name__}: {error}"
         articles.extend(local_articles)
         health.append(local_health)
     articles.sort(

@@ -632,6 +632,39 @@ def write_telemetry(path, config, controller=None):
     return str(Path(path).resolve())
 
 
+def balance_review_entries(entries):
+    """Freeze deterministic, complete five-item batches with balanced text load.
+
+    This changes only new request order, never evidence, judgments or semantic
+    keys. Old sealed requests and their certificates remain in original order.
+    Estimate the v5 transport after eliminating only proven duplicate fields.
+    """
+    if len(entries) <= 5:
+        return sorted(entries, key=lambda item: item["request_id"])
+    capacities = [5] * (len(entries) // 5)
+    if len(entries) % 5:
+        capacities.append(len(entries) % 5)
+    groups = [[] for _ in capacities]
+    loads = [0] * len(groups)
+
+    def transport_length(entry):
+        projected = dict(entry)
+        projected.pop("content", None)
+        if entry["content_basis"] == "summary_only":
+            projected.pop("review_text", None)
+        elif entry["summary"] == entry["review_text"]:
+            projected.pop("summary", None)
+        return len(json.dumps(projected, ensure_ascii=False, sort_keys=True))
+
+    weighted = [(transport_length(entry), entry) for entry in entries]
+    for length, entry in sorted(weighted, key=lambda item: (-item[0], item[1]["request_id"])):
+        index = min((i for i, group in enumerate(groups) if len(group) < capacities[i]),
+                    key=lambda i: (loads[i], i))
+        groups[index].append(entry)
+        loads[index] += length
+    return [entry for group in groups for entry in group]
+
+
 def write_manual_review_bundle(
     path,
     articles,
@@ -685,7 +718,10 @@ def write_manual_review_bundle(
             entry["content_basis"] = content_basis
             entry["review_text"] = review_text
         entries.append(entry)
-    entries.sort(key=lambda item: item["request_id"])
+    if complete_interactive_bundle:
+        entries = balance_review_entries(entries)
+    else:
+        entries.sort(key=lambda item: item["request_id"])
     request_identity = {
         "prompt_version": str(prompt_version),
         "rules_sha256": str(rules_sha256),

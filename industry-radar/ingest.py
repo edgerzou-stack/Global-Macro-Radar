@@ -620,7 +620,10 @@ def _fetch_rss_feeds(
                 exc,
                 health["attempt_history"][-1] if health["attempt_history"] else {},
             )
-            health["status"] = "degraded" if health["cooldown_eligible"] else "failed"
+            # Retry/cooldown policy describes a future recovery attempt, not
+            # successful reachability in this capture. Keep parsed quiet feeds
+            # degraded, but never count a transport refusal/timeout as usable.
+            health["status"] = "failed"
             health["error"] = str(exc)
             log_provider_error(
                 logger,
