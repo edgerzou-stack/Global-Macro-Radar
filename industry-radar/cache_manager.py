@@ -2,10 +2,13 @@ import os
 import json
 import time
 import hashlib
-import tempfile
-import fcntl
 from functools import lru_cache
 
+from json_io import (
+    canonical_json as _canonical_json,
+    locked_file as _locked_cache_file,
+    write_json_atomic as _shared_write_json_atomic,
+)
 from url_identity import canonicalize_article_url
 
 CACHE_FILE = os.path.abspath(
@@ -83,10 +86,6 @@ def is_revoked_manual_score(entry):
         entry.get("semantic_cache_key") or entry.get("cache_key"),
         fingerprint,
     ) in revoked
-
-
-def _canonical_json(value):
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _canonical_url(url):
@@ -266,9 +265,35 @@ def is_fresh_deep_dive_miss(entry, *, now=None):
 def _prune_cache(cache_data, *, now=None):
     # Validated scores are content-addressed facts. Evicting them by age or an
     # arbitrary capacity cap would violate the no-rescore contract and create
-    # avoidable API charges. Time-bounded deep-dive failures are evaluated by
-    # ``is_fresh_deep_dive_miss`` and do not require deleting the score entry.
-    return 0, 0
+    # avoidable API charges. Prune expired deep-dive negative caches and
+    # malformed/stale miss-only entries without deleting validated score_data.
+    if not isinstance(cache_data, dict):
+        return 0, 0
+    current_time = float(time.time() if now is None else now)
+    expired = 0
+    for key, value in list(cache_data.items()):
+        if not isinstance(value, dict):
+            del cache_data[key]
+            expired += 1
+            continue
+        has_score = isinstance(value.get("score_data"), dict)
+        if "deep_dive_miss" in value and not is_fresh_deep_dive_miss(
+            value, now=current_time
+        ):
+            value.pop("deep_dive_miss", None)
+            if not has_score:
+                del cache_data[key]
+            expired += 1
+            continue
+        if not has_score and "deep_dive_miss" not in value:
+            try:
+                age = current_time - float(value.get("timestamp", 0.0))
+            except (TypeError, ValueError):
+                age = CACHE_TTL_DAYS * SECONDS_IN_A_DAY + 1
+            if age >= CACHE_TTL_DAYS * SECONDS_IN_A_DAY:
+                del cache_data[key]
+                expired += 1
+    return expired, 0
 
 
 def load_cache():
@@ -313,33 +338,27 @@ def load_priority_display_cache():
     return cache_data
 
 
+def _write_json_atomic(target_path, payload, *, allow_nan=True):
+    _shared_write_json_atomic(
+        target_path,
+        payload,
+        indent=None,
+        sort_keys=False,
+        allow_nan=allow_nan,
+        compact=True,
+        replace_fn=os.replace,
+    )
+
+
 def save_priority_display_cache(cache_data):
     """Atomically checkpoint validated display translations after each batch."""
 
     if not isinstance(cache_data, dict):
         raise ValueError("priority display cache must be an object")
     target_path = os.path.abspath(PRIORITY_DISPLAY_CACHE_FILE)
-    target_dir = os.path.dirname(target_path)
-    os.makedirs(target_dir, exist_ok=True)
-    temporary_path = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=target_dir,
-            prefix=f".{os.path.basename(target_path)}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temporary_path = handle.name
-            json.dump(cache_data, handle, ensure_ascii=False, indent=2)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, target_path)
-        temporary_path = None
-    finally:
-        if temporary_path and os.path.exists(temporary_path):
-            os.unlink(temporary_path)
+    with _locked_cache_file(target_path):
+        _write_json_atomic(target_path, cache_data)
+
 
 def save_cache(cache_data):
     # Ensure newly added entries have a timestamp
@@ -353,34 +372,13 @@ def save_cache(cache_data):
             f"Pruned cache before save: expired={expired}, overflow={overflow}.",
             flush=True,
         )
-            
-    temp_path = None
+
+    target_path = os.path.abspath(CACHE_FILE)
     try:
-        target_path = os.path.abspath(CACHE_FILE)
-        target_dir = os.path.dirname(target_path)
-        os.makedirs(target_dir, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=target_dir,
-            prefix=f".{os.path.basename(target_path)}.",
-            suffix=".tmp",
-            delete=False,
-        ) as f:
-            temp_path = f.name
-            json.dump(cache_data, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(temp_path, target_path)
-        temp_path = None
+        with _locked_cache_file(target_path):
+            _write_json_atomic(target_path, cache_data)
     except Exception as e:
         print(f"Error saving cache: {e}", flush=True)
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
 
 
 def merge_verified_cache_entries(entries):
@@ -401,61 +399,30 @@ def merge_verified_cache_entries(entries):
     ):
         raise ValueError("verified cache entries are malformed")
     target_path = os.path.abspath(CACHE_FILE)
-    target_dir = os.path.dirname(target_path)
-    os.makedirs(target_dir, exist_ok=True)
-    lock_path = target_path + ".lock"
-    with open(lock_path, "a+", encoding="utf-8") as lock_handle:
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-        try:
-            if os.path.exists(target_path):
-                try:
-                    with open(target_path, "r", encoding="utf-8") as handle:
-                        cache_data = json.load(handle)
-                except (OSError, UnicodeError, json.JSONDecodeError) as error:
-                    raise RuntimeError(
-                        f"Cannot read score cache for verified merge: {error}"
-                    ) from error
-                if not isinstance(cache_data, dict):
-                    raise RuntimeError("Score cache root must be a JSON object")
-            else:
-                cache_data = {}
-
-            for key, entry in entries.items():
-                if is_revoked_manual_score(entry):
-                    raise RuntimeError("Cannot import revoked manual review score " + key)
-                existing = cache_data.get(key)
-                if isinstance(existing, dict) and existing.get(
-                    "score_data"
-                ) != entry.get("score_data") and not is_revoked_manual_score(existing):
-                    raise RuntimeError(
-                        "Conflicting validated scores for semantic cache key " + key
-                    )
-                cache_data[key] = entry
-
-            temporary = None
+    with _locked_cache_file(target_path):
+        if os.path.exists(target_path):
             try:
-                with tempfile.NamedTemporaryFile(
-                    mode="w",
-                    encoding="utf-8",
-                    dir=target_dir,
-                    prefix=f".{os.path.basename(target_path)}.",
-                    suffix=".tmp",
-                    delete=False,
-                ) as handle:
-                    temporary = handle.name
-                    json.dump(
-                        cache_data,
-                        handle,
-                        ensure_ascii=False,
-                        indent=2,
-                        allow_nan=False,
-                    )
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temporary, target_path)
-                temporary = None
-            finally:
-                if temporary and os.path.exists(temporary):
-                    os.unlink(temporary)
-        finally:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                with open(target_path, "r", encoding="utf-8") as handle:
+                    cache_data = json.load(handle)
+            except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                raise RuntimeError(
+                    f"Cannot read score cache for verified merge: {error}"
+                ) from error
+            if not isinstance(cache_data, dict):
+                raise RuntimeError("Score cache root must be a JSON object")
+        else:
+            cache_data = {}
+
+        for key, entry in entries.items():
+            if is_revoked_manual_score(entry):
+                raise RuntimeError("Cannot import revoked manual review score " + key)
+            existing = cache_data.get(key)
+            if isinstance(existing, dict) and existing.get(
+                "score_data"
+            ) != entry.get("score_data") and not is_revoked_manual_score(existing):
+                raise RuntimeError(
+                    "Conflicting validated scores for semantic cache key " + key
+                )
+            cache_data[key] = entry
+
+        _write_json_atomic(target_path, cache_data, allow_nan=False)

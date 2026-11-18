@@ -6,6 +6,7 @@ import re
 from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
+import cloudscraper
 from dateutil import parser as date_parser
 import requests
 
@@ -16,7 +17,9 @@ APPLE_ARTICLE = re.compile(
     r"https://www\.apple\.com/newsroom/20\d{2}/(?:0[1-9]|1[0-2])/[a-z0-9-]+/\Z"
 )
 NVIDIA_FEED = "https://nvidianews.nvidia.com/releases.xml"
-NVIDIA_ARTICLE = re.compile(r"https://nvidianews\.nvidia\.com/news/[a-z0-9-]+\Z")
+NVIDIA_ARTICLE = re.compile(
+    r"https://(?:nvidianews\.nvidia\.com/news/[a-z0-9-]+|blogs\.nvidia\.com/blog/[a-z0-9-]+/?)\Z"
+)
 
 _HEADER_DATE = re.compile(r"[A-Z][a-z]+ \d{1,2}, 20\d\d")
 
@@ -89,10 +92,10 @@ def _verify_apple(soup, article):
 
 
 def _verify_nvidia(soup, article):
-    headline = soup.select_one("h1.article-title")
+    headline = soup.select_one("h1.article-title") or soup.select_one("h1.entry-title")
     if headline is None or _clean_title(headline.get_text(" ", strip=True)) != _clean_title(article["title"]):
         raise ValueError("article_title_mismatch")
-    body_node = soup.select_one(".article-body")
+    body_node = soup.select_one(".article-body") or soup.select_one(".entry-content")
     if body_node is None:
         raise ValueError("article_body_missing")
     body = " ".join(
@@ -106,6 +109,10 @@ def _verify_nvidia(soup, article):
         header_text = container.get_text(" ", strip=True)
     else:
         header_text = headline.get_text(" ", strip=True)
+    meta_published = soup.find("meta", attrs={"property": "article:published_time"})
+    if meta_published is not None and meta_published.get("content", "").strip():
+        page_date = date_parser.isoparse(meta_published["content"].strip()).date()
+        return page_date, body
     match = _HEADER_DATE.search(header_text)
     if match is None:
         raise ValueError("article_publication_date_missing")
@@ -158,7 +165,8 @@ def capture_official_bodies(articles, registry, *, now, session=None):
             published = date_parser.isoparse(article["published_at"])
             if published.tzinfo is None or not now - timedelta(hours=48) <= published <= now:
                 raise ValueError("publication_outside_capture_window")
-            response = (session or requests).get(
+            client = session if session is not None else cloudscraper.create_scraper()
+            response = client.get(
                 url, timeout=10, allow_redirects=False,
                 headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html"})
             if response.status_code != 200 or response.url != url:

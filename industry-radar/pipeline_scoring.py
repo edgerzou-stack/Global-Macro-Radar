@@ -20,10 +20,12 @@ from cache_manager import (
     save_cache,
     save_priority_display_cache,
 )
+from json_io import (
+    canonical_json as _canonical_json,
+    write_json_atomic as _write_json_atomic,
+)
 from llm_cost_policy import (
     LLMBudgetExceeded,
-    _canonical_json,
-    _write_json_atomic,
     active_run,
     record_runtime,
     resolve_policy,
@@ -34,10 +36,13 @@ from llm_cost_policy import (
 from pipeline_selection import is_verified_deep_dive
 from llm_router import LLMInsufficientBalance
 from provider_errors import log_provider_error
+from scoring_fixtures import (
+    SCORED_ARTICLES_FIXTURE_SCHEMA_VERSION,
+    load_scored_articles_fixture,
+)
 
 
 logger = logging.getLogger(__name__)
-SCORED_ARTICLES_FIXTURE_SCHEMA_VERSION = 1
 UNSCORED_PLACEHOLDER_CONTRACT = "unscored-placeholder-v1"
 UNSCORED_RESOLUTION = "unscored"
 INTERACTIVE_MANUAL_RESOLUTION = "manual"
@@ -230,7 +235,7 @@ def validate_scoring_configuration(config):
     return identities
 
 
-def find_cached_article(cache_data, article, config):
+def _find_cached_article_entry(cache_data, article, config):
     from score import SCORING_PROMPT_VERSION
 
     for semantic_key, rule_hash in zip(
@@ -239,21 +244,22 @@ def find_cached_article(cache_data, article, config):
     ):
         semantic_entry = cache_data.get(semantic_key)
         score_data = get_cached_score(semantic_entry, semantic_key)
+        verified_provenance = None
         if (
             score_data is not None
             and isinstance(semantic_entry, dict)
             and "manual_review_provenance" in semantic_entry
-            and _verified_manual_review_provenance(
+        ):
+            verified_provenance = _verified_manual_review_provenance(
                 semantic_entry,
                 semantic_key,
                 score_data,
                 expected_rules_sha256=rule_hash,
             )
-            is None
-        ):
-            continue
+            if verified_provenance is None:
+                continue
         if score_data is not None:
-            return score_data, semantic_key
+            return score_data, semantic_key, verified_provenance
     # Provider keys do not include deterministic rules.  Migrate only entries
     # with an explicit current-rule identity, never unidentified/older scores.
     for provider, model in configured_scoring_identities(
@@ -276,8 +282,13 @@ def find_cached_article(cache_data, article, config):
             continue
         score_data = get_cached_score(entry, cache_key)
         if score_data is not None:
-            return score_data, cache_key
-    return None, None
+            return score_data, cache_key, None
+    return None, None, None
+
+
+def find_cached_article(cache_data, article, config):
+    score_data, cache_key, _ = _find_cached_article_entry(cache_data, article, config)
+    return score_data, cache_key
 
 
 def _verified_manual_review_provenance(
@@ -522,126 +533,6 @@ def run_validated_batch(batch, config, scorer, attempts=2, *, preauthorize=False
     ) from last_error
 
 
-def load_scored_articles_fixture(path, rss_articles, config):
-    import json
-
-    from score import (
-        _apply_composite_scores,
-        _validate_score_result,
-        _validate_weights,
-        validate_priority_industry_review,
-    )
-
-    fixture_path = os.path.abspath(os.fspath(path))
-    try:
-        with open(fixture_path, "r", encoding="utf-8") as handle:
-            fixture = json.load(handle)
-    except (OSError, json.JSONDecodeError) as error:
-        raise ValueError(
-            f"Cannot load scored-articles fixture {fixture_path}: {error}"
-        ) from error
-    if (
-        not isinstance(fixture, dict)
-        or set(fixture) != {"schema_version", "scores"}
-    ):
-        raise ValueError(
-            "scored-articles fixture has invalid top-level fields"
-        )
-    if (
-        fixture.get("schema_version")
-        != SCORED_ARTICLES_FIXTURE_SCHEMA_VERSION
-    ):
-        raise ValueError(
-            "unsupported scored-articles fixture schema_version"
-        )
-    scores = fixture.get("scores")
-    if not isinstance(scores, list):
-        raise ValueError(
-            "scored-articles fixture scores must be a list"
-        )
-    rss_by_url = {}
-    for article in rss_articles:
-        link = article.get("link")
-        if (
-            not isinstance(link, str)
-            or not link.strip()
-            or link in rss_by_url
-        ):
-            raise ValueError(
-                "RSS articles must have unique non-empty links"
-            )
-        rss_by_url[link] = article
-    score_by_url = {}
-    for index, entry in enumerate(scores):
-        if not isinstance(entry, dict) or set(entry) not in (
-            {"link", "score_data"},
-            {"link", "review_outcome"},
-            {"link", "review_outcome", "priority_display"},
-            {"link", "review_outcome", "priority_display", "priority_industry_review"},
-        ):
-            raise ValueError(
-                f"scored-articles fixture entry {index} must contain "
-                "link and score_data"
-            )
-        link = entry.get("link")
-        if (
-            not isinstance(link, str)
-            or not link.strip()
-            or link in score_by_url
-        ):
-            raise ValueError(
-                f"scored-articles fixture entry {index} has "
-                "invalid/duplicate link"
-            )
-        if (
-            "review_outcome" in entry
-            and entry["review_outcome"] != "unscored_priority"
-        ):
-            raise ValueError(
-                "scored-articles fixture review_outcome must be "
-                "unscored_priority"
-            )
-        score_by_url[link] = entry
-    if set(rss_by_url) != set(score_by_url):
-        raise ValueError(
-            "scored-articles fixture URL mismatch: "
-            f"missing={sorted(set(rss_by_url) - set(score_by_url))}, "
-            f"unexpected={sorted(set(score_by_url) - set(rss_by_url))}"
-        )
-    weights = _validate_weights(config)
-    result = []
-    for article_id, article in enumerate(rss_articles):
-        raw_entry = score_by_url[article["link"]]
-        if raw_entry.get("review_outcome") == "unscored_priority":
-            scored = dict(article)
-            scored["id"] = article_id
-            scored["review_outcome"] = "unscored_priority"
-            scored["priority_industry_review"] = validate_priority_industry_review(
-                raw_entry.get("priority_industry_review"), article
-            )
-            if "priority_display" in raw_entry:
-                scored["priority_display"] = validate_unscored_priority_display(
-                    raw_entry["priority_display"]
-                )
-            result.append(scored)
-            continue
-        raw_score = raw_entry.get("score_data")
-        if not isinstance(raw_score, dict):
-            raise ValueError(
-                "scored-articles fixture score_data for "
-                f"{article['link']} must be an object"
-            )
-        score_data = _apply_composite_scores(
-            _validate_score_result(dict(raw_score)),
-            weights,
-        )
-        scored = dict(article)
-        scored["id"] = article_id
-        scored["score_data"] = score_data
-        result.append(scored)
-    return result
-
-
 def _local_deduplicate(articles):
     def evidence_priority(article):
         """Choose evidence, never fetch order, as a duplicate representative."""
@@ -774,6 +665,175 @@ def _assign_unscored_placeholder(
     return score
 
 
+def _emit_validated_scoring_batch(
+    batch,
+    *,
+    batch_index,
+    controller,
+    config,
+    capture_article_count,
+    capture_input_sha256,
+):
+    """Persist one validated provider batch as run-local audit evidence."""
+    snapshot = controller.snapshot()
+    batch_payload = {
+        "schema_version": 1,
+        "component": "validated-scoring-batch",
+        "run_id": controller.run_id,
+        "effective_date": controller.effective_date,
+        "code_source_sha256": os.environ.get("PIPELINE_CODE_SOURCE_SHA256", ""),
+        "batch_index": batch_index,
+        "capture_article_count": capture_article_count,
+        "capture_input_sha256": capture_input_sha256,
+        "policy_sha256": snapshot["policy_sha256"],
+        "scoring_config_sha256": hashlib.sha256(
+            _canonical_json(scoring_cache_config(config)).encode("utf-8")
+        ).hexdigest(),
+        "prompt_identity": scoring_prompt_identity(),
+        "rules_sha256": scoring_rules_sha256(),
+        "validated_score_count": len(batch),
+        "results": [
+            {
+                "id": article["id"],
+                "link": article.get("link"),
+                "source": article.get("source"),
+                "source_tier": article.get("source_tier"),
+                "semantic_input_sha256": semantic_cache_key(article, config),
+                "score_data": article["score_data"],
+            }
+            for article in batch
+        ],
+    }
+    batch_payload["batch_sha256"] = hashlib.sha256(
+        _canonical_json(batch_payload).encode("utf-8")
+    ).hexdigest()
+    batch_path = (
+        Path(os.environ.get("RADAR_REPORTS_DIR", "reports"))
+        / "validated-scoring-batches"
+        / f"batch-{batch_index:04d}.json"
+    )
+    _write_json_atomic(batch_path, batch_payload)
+    config.setdefault("_runtime", {}).setdefault(
+        "validated_scoring_batch_paths", []
+    ).append(str(batch_path.resolve()))
+
+
+def _persist_interactive_manual_review(scored_articles, *, config, controller):
+    """Write reuse manifest, base scores, manual review request, and empty-review receipt."""
+    runtime = config.setdefault("_runtime", {})
+    reuse_items = []
+    for article in scored_articles:
+        provenance = article.get("_manual_review_reuse")
+        if not isinstance(provenance, dict):
+            continue
+        # Bind both immutable source semantic identity and current base-score identity.
+        reuse_items.append(
+            {
+                "link": article.get("link"),
+                "resolved_score_data_sha256": hashlib.sha256(
+                    _canonical_json(article.get("score_data")).encode("utf-8")
+                ).hexdigest(),
+                **provenance,
+                "resolved_base_semantic_input_sha256": semantic_cache_key(
+                    article, config
+                ),
+            }
+        )
+    reuse_items.sort(key=lambda item: item["resolved_base_semantic_input_sha256"])
+    reuse_manifest = {
+        "schema_version": 2,
+        "component": "manual-review-reuse",
+        "run_id": controller.run_id,
+        "effective_date": controller.effective_date,
+        "reused_item_count": len(reuse_items),
+        "items": reuse_items,
+    }
+    reuse_manifest["manifest_sha256"] = hashlib.sha256(
+        _canonical_json(reuse_manifest).encode("utf-8")
+    ).hexdigest()
+    reports_dir = Path(os.environ.get("RADAR_REPORTS_DIR", "reports"))
+    reuse_path = reports_dir / "llm-review-reuse.json"
+    _write_json_atomic(reuse_path, reuse_manifest)
+    runtime["manual_review_reuse_path"] = str(reuse_path.resolve())
+
+    request_path = Path(
+        os.environ.get("RADAR_LLM_REVIEW_REQUEST")
+        or reports_dir / "llm-review-request.json"
+    )
+    rss_fixture_path = runtime.get("interactive_rss_fixture_path")
+    if not rss_fixture_path:
+        write_manual_review_bundle(
+            request_path,
+            [
+                article
+                for article in scored_articles
+                if article.get("_score_resolution") == "manual"
+            ],
+            config=config,
+            prompt_version=scoring_prompt_identity(),
+            rules_sha256=scoring_rules_sha256(),
+            semantic_key_for=lambda item: semantic_cache_key(item, config),
+            controller=controller,
+        )
+        return
+
+    base_path = Path(
+        os.environ.get("RADAR_LLM_BASE_SCORES")
+        or reports_dir / "llm-review-base-scores.json"
+    )
+    with open(rss_fixture_path, "r", encoding="utf-8") as handle:
+        rss_payload = json.load(handle)
+    rss_links = [item.get("link") for item in rss_payload.get("articles", [])]
+    scored_by_link = {
+        item.get("link"): item
+        for item in scored_articles
+        if isinstance(item.get("link"), str)
+    }
+    if len(scored_by_link) != len(scored_articles) or set(scored_by_link) != set(
+        rss_links
+    ):
+        raise RuntimeError(
+            "interactive scored URL set does not match sealed RSS input"
+        )
+    complete = [scored_by_link[link] for link in rss_links]
+    write_interactive_base_scores(
+        base_path,
+        complete,
+        config=config,
+        prompt_version=scoring_prompt_identity(),
+        rules_sha256=scoring_rules_sha256(),
+        rss_fixture_path=rss_fixture_path,
+        controller=controller,
+    )
+    manual_articles = [
+        article for article in complete if article.get("_score_resolution") == "manual"
+    ]
+    write_manual_review_bundle(
+        request_path,
+        manual_articles,
+        config=config,
+        prompt_version=scoring_prompt_identity(),
+        rules_sha256=scoring_rules_sha256(),
+        semantic_key_for=lambda item: semantic_cache_key(item, config),
+        controller=controller,
+        rss_fixture_path=rss_fixture_path,
+        base_scores_path=base_path,
+    )
+    runtime["interactive_base_scores_path"] = str(base_path.resolve())
+    runtime["llm_review_bundle_path"] = str(request_path.resolve())
+    if not manual_articles:
+        from import_manual_review import compile_without_manual_review
+
+        compiled_path = Path(
+            os.environ.get("RADAR_LLM_COMPILED_SCORES")
+            or reports_dir / "llm-review-scored-articles.json"
+        )
+        _, receipt_path = compile_without_manual_review(request_path, compiled_path)
+        runtime["interactive_compiled_scores_path"] = str(compiled_path.resolve())
+        runtime["interactive_import_receipt_path"] = str(receipt_path.resolve())
+        runtime["no_manual_review_needed"] = True
+
+
 def score_articles_pipeline(articles, config):
     from score import (
         SCORING_PROMPT_VERSION,
@@ -869,7 +929,7 @@ def score_articles_pipeline(articles, config):
                 controller.increment("priority_display_cache_miss_count")
             controller.increment("deterministic_count")
             continue
-        score, cache_key = find_cached_article(
+        score, cache_key, provenance = _find_cached_article_entry(
             cache_data,
             article,
             config,
@@ -896,26 +956,7 @@ def score_articles_pipeline(articles, config):
         article["_score_resolution"] = "cache"
         semantic_key = semantic_cache_key(article, config)
         article["_cache_key"] = semantic_key
-        compatible_key_rules = dict(
-            zip(
-                compatible_semantic_cache_keys(article, config),
-                compatible_scoring_rules_sha256(),
-            )
-        )
         cache_entry = cache_data.get(cache_key)
-        provenance = _verified_manual_review_provenance(
-            cache_entry,
-            cache_key,
-            (
-                cache_entry.get("score_data")
-                if isinstance(cache_entry, dict)
-                else score
-            ),
-            expected_rules_sha256=compatible_key_rules.get(
-                cache_key,
-                scoring_rules_sha256(),
-            ),
-        )
         if provenance is not None:
             article["_manual_review_reuse"] = provenance
             controller.increment("reused_manual_review_count")
@@ -1194,194 +1235,18 @@ def score_articles_pipeline(articles, config):
                     config,
                 )
                 updates += 1
-        # A completed provider batch is run-local audit evidence.  It is not
-        # a reusable global score cache while this run may still fail.
-        snapshot = controller.snapshot()
-        batch_payload = {
-            "schema_version": 1,
-            "component": "validated-scoring-batch",
-            "run_id": controller.run_id,
-            "effective_date": controller.effective_date,
-            "code_source_sha256": os.environ.get("PIPELINE_CODE_SOURCE_SHA256", ""),
-            "batch_index": batch_index,
-            "capture_article_count": len(articles),
-            "capture_input_sha256": capture_input_sha256,
-            "policy_sha256": snapshot["policy_sha256"],
-            "scoring_config_sha256": hashlib.sha256(
-                _canonical_json(scoring_cache_config(config)).encode("utf-8")
-            ).hexdigest(),
-            "prompt_identity": scoring_prompt_identity(),
-            "rules_sha256": scoring_rules_sha256(),
-            "validated_score_count": len(batch),
-            "results": [
-                {
-                    "id": article["id"],
-                    "link": article.get("link"),
-                    "source": article.get("source"),
-                    "source_tier": article.get("source_tier"),
-                    "semantic_input_sha256": semantic_cache_key(article, config),
-                    "score_data": article["score_data"],
-                }
-                for article in batch
-            ],
-        }
-        batch_payload["batch_sha256"] = hashlib.sha256(
-            _canonical_json(batch_payload).encode("utf-8")
-        ).hexdigest()
-        _write_json_atomic(
-            Path(os.environ.get("RADAR_REPORTS_DIR", "reports"))
-            / "validated-scoring-batches"
-            / f"batch-{batch_index:04d}.json",
-            batch_payload,
-        )
-        config.setdefault("_runtime", {}).setdefault(
-            "validated_scoring_batch_paths", []
-        ).append(
-            str(
-                (
-                    Path(os.environ.get("RADAR_REPORTS_DIR", "reports"))
-                    / "validated-scoring-batches"
-                    / f"batch-{batch_index:04d}.json"
-                ).resolve()
-            )
+        _emit_validated_scoring_batch(
+            batch,
+            batch_index=batch_index,
+            controller=controller,
+            config=config,
+            capture_article_count=len(articles),
+            capture_input_sha256=capture_input_sha256,
         )
     if policy.mode == "interactive":
-        runtime = config.setdefault("_runtime", {})
-        reuse_items = []
-        for article in scored_articles:
-            provenance = article.get("_manual_review_reuse")
-            if not isinstance(provenance, dict):
-                continue
-            # The source review's semantic identity must remain immutable for
-            # audit and revocation.  A monotonic local-policy update can give
-            # the same RSS item a new *current* base-score identity, though.
-            # Bind both explicitly instead of silently replacing either one.
-            reuse_items.append(
-                {
-                    "link": article.get("link"),
-                    "resolved_score_data_sha256": hashlib.sha256(
-                        _canonical_json(article.get("score_data")).encode("utf-8")
-                    ).hexdigest(),
-                    **provenance,
-                    "resolved_base_semantic_input_sha256": semantic_cache_key(
-                        article,
-                        config,
-                    ),
-                }
-            )
-        reuse_items.sort(
-            key=lambda item: item["resolved_base_semantic_input_sha256"]
+        _persist_interactive_manual_review(
+            scored_articles, config=config, controller=controller
         )
-        reuse_manifest = {
-            "schema_version": 2,
-            "component": "manual-review-reuse",
-            "run_id": controller.run_id,
-            "effective_date": controller.effective_date,
-            "reused_item_count": len(reuse_items),
-            "items": reuse_items,
-        }
-        reuse_manifest["manifest_sha256"] = hashlib.sha256(
-            _canonical_json(reuse_manifest).encode("utf-8")
-        ).hexdigest()
-        reuse_path = Path(
-            os.environ.get("RADAR_REPORTS_DIR", "reports")
-        ) / "llm-review-reuse.json"
-        _write_json_atomic(reuse_path, reuse_manifest)
-        runtime["manual_review_reuse_path"] = str(reuse_path.resolve())
-        rss_fixture_path = runtime.get("interactive_rss_fixture_path")
-        if not rss_fixture_path:
-            # Keep the low-level API usable for isolated callers. The complete
-            # resumable contract is intentionally enabled only when main has
-            # sealed ingestion health together with the article input.
-            request_path = Path(
-                os.environ.get("RADAR_LLM_REVIEW_REQUEST")
-                or Path(os.environ.get("RADAR_REPORTS_DIR", "reports"))
-                / "llm-review-request.json"
-            )
-            write_manual_review_bundle(
-                request_path,
-                [
-                    article for article in scored_articles
-                    if article.get("_score_resolution") == "manual"
-                ],
-                config=config,
-                prompt_version=scoring_prompt_identity(),
-                rules_sha256=scoring_rules_sha256(),
-                semantic_key_for=lambda item: semantic_cache_key(item, config),
-                controller=controller,
-            )
-        else:
-            reports_dir = Path(os.environ.get("RADAR_REPORTS_DIR", "reports"))
-            base_path = Path(
-                os.environ.get("RADAR_LLM_BASE_SCORES")
-                or reports_dir / "llm-review-base-scores.json"
-            )
-            request_path = Path(
-                os.environ.get("RADAR_LLM_REVIEW_REQUEST")
-                or reports_dir / "llm-review-request.json"
-            )
-            # Reconstruct in the sealed RSS order instead of trusting transient
-            # in-memory ids. This also proves the base is neither missing nor
-            # adding a URL before a reviewer sees the request.
-            with open(rss_fixture_path, "r", encoding="utf-8") as handle:
-                rss_payload = json.load(handle)
-            rss_links = [item.get("link") for item in rss_payload.get("articles", [])]
-            scored_by_link = {
-                item.get("link"): item for item in scored_articles
-                if isinstance(item.get("link"), str)
-            }
-            if (
-                len(scored_by_link) != len(scored_articles)
-                or set(scored_by_link) != set(rss_links)
-            ):
-                raise RuntimeError(
-                    "interactive scored URL set does not match sealed RSS input"
-                )
-            complete = [scored_by_link[link] for link in rss_links]
-            write_interactive_base_scores(
-                base_path,
-                complete,
-                config=config,
-                prompt_version=scoring_prompt_identity(),
-                rules_sha256=scoring_rules_sha256(),
-                rss_fixture_path=rss_fixture_path,
-                controller=controller,
-            )
-            manual_articles = [
-                article for article in complete
-                if article.get("_score_resolution") == "manual"
-            ]
-            write_manual_review_bundle(
-                request_path,
-                manual_articles,
-                config=config,
-                prompt_version=scoring_prompt_identity(),
-                rules_sha256=scoring_rules_sha256(),
-                semantic_key_for=lambda item: semantic_cache_key(item, config),
-                controller=controller,
-                rss_fixture_path=rss_fixture_path,
-                base_scores_path=base_path,
-            )
-            runtime["interactive_base_scores_path"] = str(base_path.resolve())
-            runtime["llm_review_bundle_path"] = str(request_path.resolve())
-            if not manual_articles:
-                from import_manual_review import compile_without_manual_review
-
-                compiled_path = Path(
-                    os.environ.get("RADAR_LLM_COMPILED_SCORES")
-                    or reports_dir / "llm-review-scored-articles.json"
-                )
-                _, receipt_path = compile_without_manual_review(
-                    request_path,
-                    compiled_path,
-                )
-                runtime["interactive_compiled_scores_path"] = str(
-                    compiled_path.resolve()
-                )
-                runtime["interactive_import_receipt_path"] = str(
-                    receipt_path.resolve()
-                )
-                runtime["no_manual_review_needed"] = True
     elif updates:
         save_cache(cache_data)
     record_runtime(config, controller)

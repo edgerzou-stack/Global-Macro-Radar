@@ -2,12 +2,11 @@ import yaml
 import os
 import json
 import logging
-import tempfile
-import hashlib
 from pathlib import Path
 from datetime import date, timedelta
 from score import score_article
 from cache_manager import load_cache
+from json_io import canonical_json_sha256 as _canonical_sha256, sha256_file as _file_sha256, write_json_atomic
 from dotenv import load_dotenv
 from pipeline_deep_dive import (
     emit_pipeline_metric,
@@ -51,41 +50,7 @@ logger = logging.getLogger(__name__)
 
 
 def save_json_atomic(path, payload):
-    path = os.path.abspath(path)
-    directory = os.path.dirname(path)
-    os.makedirs(directory, exist_ok=True)
-    temporary_path = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=directory, delete=False, suffix=".tmp"
-        ) as handle:
-            temporary_path = handle.name
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
-        temporary_path = None
-    finally:
-        if temporary_path and os.path.exists(temporary_path):
-            os.unlink(temporary_path)
-
-
-def _canonical_sha256(payload):
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _file_sha256(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    write_json_atomic(path, payload, indent=2, sort_keys=False)
 
 
 def _candidate_audit_entry(article):

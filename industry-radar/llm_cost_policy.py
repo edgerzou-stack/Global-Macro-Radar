@@ -7,12 +7,18 @@ import hashlib
 import json
 import math
 import os
-import tempfile
 import threading
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+from json_io import (
+    canonical_json as _canonical_json,
+    canonical_json_sha256 as _sha256,
+    sha256_file as _file_sha256,
+    write_json_atomic as _shared_write_json_atomic,
+)
 
 
 LLM_MODES = {"offline", "interactive", "unattended", "deepseek"}
@@ -32,28 +38,6 @@ AUTHORIZED_DAILY_TOPUP_CNY = 0.20
 
 class LLMBudgetExceeded(RuntimeError):
     """The configured run/day budget forbids another external request."""
-
-
-def _canonical_json(value):
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
-
-
-def _sha256(value):
-    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
-
-
-def _file_sha256(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _config_sha256(config):
@@ -603,27 +587,7 @@ def record_runtime(config, controller=None):
 
 
 def _write_json_atomic(path, payload):
-    path = Path(path).resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temporary = Path(handle.name)
-            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        temporary = None
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+    _shared_write_json_atomic(path, payload, indent=2, sort_keys=True)
 
 
 def write_telemetry(path, config, controller=None):
@@ -662,7 +626,32 @@ def balance_review_entries(entries):
                     key=lambda i: (loads[i], i))
         groups[index].append(entry)
         loads[index] += length
-    return [entry for group in groups for entry in group]
+
+    # Keep 5-item balanced groups intact while pairing them so consecutive
+    # 10-item v5 parallel review batches are also load-balanced.
+    full_groups = [
+        (loads[i], min(item["request_id"] for item in group), group)
+        for i, group in enumerate(groups)
+        if capacities[i] == 5
+    ]
+    partial_groups = [
+        group for i, group in enumerate(groups) if capacities[i] < 5
+    ]
+    pair_count = (len(full_groups) + 1) // 2
+    pairs = [[] for _ in range(pair_count)]
+    pair_loads = [0] * pair_count
+    for group_load, _, group in sorted(
+        full_groups, key=lambda item: (-item[0], item[1])
+    ):
+        pair_index = min(
+            (i for i, pair in enumerate(pairs) if len(pair) < 2),
+            key=lambda i: (pair_loads[i], len(pairs[i]), i),
+        )
+        pairs[pair_index].append(group)
+        pair_loads[pair_index] += group_load
+
+    ordered_groups = [group for pair in pairs for group in pair] + partial_groups
+    return [entry for group in ordered_groups for entry in group]
 
 
 def write_manual_review_bundle(

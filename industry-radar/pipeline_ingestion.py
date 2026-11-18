@@ -94,6 +94,22 @@ def collect_articles(
             validate_rss_fixture_effective_date(articles, health, effective_date)
     else:
         reference_time = rss_reference_time_utc()
+        pinned_override = bool(os.environ.get("PIPELINE_EFFECTIVE_DATE_OVERRIDE", "").strip())
+        mocked_clock = bool(os.environ.get("MOCK_NOW_UTC", "").strip())
+        effective_cutoff = None
+        if pinned_override and not mocked_clock:
+            effective_date = logical_today()
+            effective_cutoff = datetime.combine(
+                effective_date + timedelta(days=1),
+                time.min,
+                tzinfo=timezone.utc,
+            )
+            if effective_cutoff <= reference_time - timedelta(hours=hours_back):
+                raise ValueError(
+                    f"Pinned session {effective_date.isoformat()} predates live RSS "
+                    f"{hours_back}h window ending at {reference_time.isoformat()}; "
+                    "bind --rss-fixture or widen hours_back"
+                )
         fetch_options = {}
         if (config.get("rss_source_cooldown_enabled") is True
                 and os.environ.get("PIPELINE_MODE") == "production"):
@@ -136,6 +152,43 @@ def collect_articles(
             articles.extend(space_articles)
             health.extend(space_health)
         articles = capture_bodies(articles, registry, now=reference_time)
+        if effective_cutoff is not None and reference_time >= effective_cutoff:
+            filtered_articles = []
+            newest_by_source = {}
+            counts_by_source = {}
+            for item in articles:
+                pub_at = aware_utc_timestamp(
+                    item.get("published_at"), "article.published_at"
+                )
+                if pub_at >= effective_cutoff:
+                    continue
+                filtered_articles.append(item)
+                src = str(item.get("feed_url") or "")
+                counts_by_source[src] = counts_by_source.get(src, 0) + 1
+                prev = newest_by_source.get(src)
+                if prev is None or pub_at > prev:
+                    newest_by_source[src] = pub_at
+            articles = filtered_articles
+            capped_reference = effective_cutoff - timedelta(microseconds=1)
+            adjusted_health = []
+            for item in health:
+                copy_item = dict(item)
+                src = str(copy_item.get("url") or "")
+                newest_raw = copy_item.get("newest_published_at")
+                if newest_raw is not None:
+                    newest_dt = aware_utc_timestamp(
+                        newest_raw, "health.newest_published_at"
+                    )
+                    if newest_dt >= effective_cutoff:
+                        kept_newest = newest_by_source.get(src)
+                        copy_item["newest_published_at"] = (
+                            kept_newest.isoformat() if kept_newest is not None else None
+                        )
+                        copy_item["fresh_entries"] = counts_by_source.get(src, 0)
+                        copy_item["fresh"] = bool(copy_item["fresh_entries"])
+                adjusted_health.append(copy_item)
+            health = adjusted_health
+            reference_time = capped_reference
     articles = enrich_articles(articles, registry)
     health = enrich_health(health, registry)
     save_health(health)

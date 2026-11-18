@@ -1,5 +1,4 @@
 import hashlib
-import inspect
 import os
 import json
 import logging
@@ -431,9 +430,92 @@ def validate_scoring_rubric(rubric, rubric_sha256):
     return rubric
 
 
+_STRICT_RUBRIC_HEADER = (
+    "CRITICAL SCORING ANCHORS AND INDUSTRIAL REVIEW RULES (canonical JSON):\n"
+)
+
+_SINGLE_ARTICLE_PROMPT_TEMPLATE = """
+    You are an industry analyst. Apply the canonical policy below to this
+    article independently, using only the supplied evidence.
+
+    {rubric}
+
+    Article Title: {title}
+    Article Summary: {summary}
+    Article Content: {content}
+    Published At: {published_at}
+    Source: {source}
+    Source Evidence Metadata: tier={source_tier},
+    lane={source_lane},
+    domains={source_domains},
+    authority_for={authority_for}
+
+    Classify and score this article under the rubric, then return only JSON.
+
+    You must output strictly in JSON format matching this schema:
+    {{
+      "is_relevant": boolean,
+      "is_vague_or_roundup": boolean,
+      "event_type": string,
+      "industrial_claims": [string],
+      "market_only_claims": [string],
+      "barrier_to_entry": string,
+      "market_size": string,
+      "immediacy": string,
+      "reasoning_chain": string,
+      "tech_score": integer,
+      "commercial_score": integer,
+      "hype_score": integer,
+      "macro_score": integer,
+      "justification": string,
+      "translated_title": string,
+      "translated_summary": string
+    }}
+    """
+
+_BATCH_ARTICLE_PROMPT_TEMPLATE = """
+    You are an industry analyst. Apply the canonical policy below to EACH
+    supplied article independently using only its supplied evidence.
+    Published At and source metadata are supplied per article; content_excerpt is only a
+    bounded excerpt, so never claim to have read a full article from it.
+
+    {rubric}
+
+    Input Articles JSON:
+    {payload_json}
+
+    Classify and score each article under the rubric. Return only JSON.
+
+    Return STRICTLY a JSON object matching this schema exactly:
+    {{
+      "results": [
+        {{
+          "id": integer,
+          "is_relevant": boolean,
+          "is_vague_or_roundup": boolean,
+          "event_type": string,
+          "industrial_claims": [string],
+          "market_only_claims": [string],
+          "barrier_to_entry": string,
+          "market_size": string,
+          "immediacy": string,
+          "reasoning_chain": string,
+          "tech_score": integer (e.g. 83),
+          "commercial_score": integer (e.g. 76),
+          "hype_score": integer (e.g. 90),
+          "macro_score": integer (e.g. 60),
+          "justification": string,
+          "translated_title": string,
+          "translated_summary": string
+        }}
+      ]
+    }}
+    """
+
+
 def _strict_rubric(config):
     return (
-        "CRITICAL SCORING ANCHORS AND INDUSTRIAL REVIEW RULES (canonical JSON):\n"
+        _STRICT_RUBRIC_HEADER
         + json.dumps(
             build_scoring_rubric(config), ensure_ascii=False, sort_keys=True,
             separators=(",", ":"), allow_nan=False,
@@ -562,44 +644,18 @@ def _apply_composite_scores(result, weights):
 def score_article(article, config):
     weights = _validate_weights(config)
     rubric = _strict_rubric(config)
-    prompt = f"""
-    You are an industry analyst. Apply the canonical policy below to this
-    article independently, using only the supplied evidence.
-
-    {rubric}
-
-    Article Title: {article['title']}
-    Article Summary: {article['summary']}
-    Article Content: {str(article.get('content') or '')[:3000]}
-    Published At: {article.get('published_at', 'unknown')}
-    Source: {article.get('source', 'unknown')}
-    Source Evidence Metadata: tier={article.get('source_tier', 'unknown')},
-    lane={article.get('source_lane', 'unknown')},
-    domains={article.get('source_domains', [])},
-    authority_for={article.get('authority_for', [])}
-
-    Classify and score this article under the rubric, then return only JSON.
-
-    You must output strictly in JSON format matching this schema:
-    {{
-      "is_relevant": boolean,
-      "is_vague_or_roundup": boolean,
-      "event_type": string,
-      "industrial_claims": [string],
-      "market_only_claims": [string],
-      "barrier_to_entry": string,
-      "market_size": string,
-      "immediacy": string,
-      "reasoning_chain": string,
-      "tech_score": integer,
-      "commercial_score": integer,
-      "hype_score": integer,
-      "macro_score": integer,
-      "justification": string,
-      "translated_title": string,
-      "translated_summary": string
-    }}
-    """
+    prompt = _SINGLE_ARTICLE_PROMPT_TEMPLATE.format(
+        rubric=rubric,
+        title=article["title"],
+        summary=article["summary"],
+        content=str(article.get("content") or "")[:3000],
+        published_at=article.get("published_at", "unknown"),
+        source=article.get("source", "unknown"),
+        source_tier=article.get("source_tier", "unknown"),
+        source_lane=article.get("source_lane", "unknown"),
+        source_domains=article.get("source_domains", []),
+        authority_for=article.get("authority_for", []),
+    )
     
     result = _call_llm_with_fallback(prompt, config, title_context=article['title'][:30])
     result = _validate_score_result(result)
@@ -629,234 +685,6 @@ def _source_confidence(article, config):
         if article.get("source") in config.get("trusted_sources", [])
         else "standard"
     )
-
-def deduplicate_articles(articles, config):
-    if len(articles) <= 1:
-        return articles
-        
-    # Sort articles by published_at (earliest first)
-    sorted_articles = sorted(articles, key=lambda x: x.get('published_at', '9999-12-31'))
-    import difflib
-    
-    # Pre-deduplicate using local string matching to save LLM tokens
-    local_dedup_groups = [] # list of lists of articles
-    for a in sorted_articles:
-        long_text = a.get('content') or a.get('summary', '')
-        if long_text: long_text = long_text[:800]
-        text_to_match = (a.get('title', '') + " " + long_text).lower()
-        
-        found_group = False
-        for group in local_dedup_groups:
-            # Compare against the first article in the group
-            rep = group[0]
-            rep_text = rep.get('content') or rep.get('summary', '')
-            if rep_text: rep_text = rep_text[:800]
-            rep_match = (rep.get('title', '') + " " + rep_text).lower()
-            
-            similarity = difflib.SequenceMatcher(None, text_to_match, rep_match).ratio()
-            if similarity > 0.85:
-                group.append(a)
-                found_group = True
-                break
-                
-        if not found_group:
-            local_dedup_groups.append([a])
-            
-    print(f"Local pre-deduplication grouped {len(sorted_articles)} articles into {len(local_dedup_groups)} groups.", flush=True)
-
-    if len(local_dedup_groups) <= 1:
-        # If local grouping already reduced it to 1, just return the first of the group
-        final_list = []
-        for g in local_dedup_groups:
-            best_article = max(g, key=lambda x: x.get('score_data', {}).get('innovation_score', 0) + x.get('score_data', {}).get('traffic_score', 0))
-            final_list.append(best_article)
-        return final_list
-
-    # Prepare payload for LLM from the reduced groups
-    payload = []
-    for i, group in enumerate(local_dedup_groups):
-        a = group[0] # Use the representative for LLM scoring
-        long_text = a.get('content') or a.get('summary', '')
-        if long_text:
-            long_text = long_text[:250]
-        
-        payload.append({
-            "id": i,
-            "title": a.get('title', ''),
-            "text": long_text
-        })
-        
-    prompt = f"""
-    You are a professional industry analyst. I have a list of tech news articles. Some of them are reporting on the exact same underlying event, just from different news outlets (e.g., they might use slightly different numbers or phrasing to describe the same event).
-    Your task is to identify all duplicates and group them together.
-    
-    CRITICAL GROUPING RULES:
-    1. If two articles are about the EXACT SAME company's funding round, valuation, or acquisition, THEY ARE DUPLICATES. Even if one highlights "$5B valuation" and the other highlights "$800M funding" or "$1B sales", if it's the same company's milestone event, GROUP THEM.
-    2. If two articles are about the same product launch or major update from the same company, GROUP THEM.
-    3. Be aggressive in grouping. We want to avoid reading about the same company's event twice.
-
-    Here is the JSON list of articles:
-    {json.dumps(payload, ensure_ascii=False, indent=2)}
-
-    Return your answer strictly in JSON format matching this schema:
-    {{
-      "groups": [[int, ...], [int]] // A list of lists of IDs. Each inner list represents a unique event and contains the IDs of articles discussing it.
-    }}
-    """
-    
-    try:
-        res = _call_llm_with_fallback(prompt, config, system_prompt="You are a helpful assistant designed to output JSON.", title_context="dedup_batch")
-        groups = res.get("groups", [])
-    except Exception as e:
-        log_provider_error(
-            logger,
-            e,
-            provider="configured_llm_chain",
-            operation="deduplicate_articles",
-            retryable=False,
-            degraded_allowed=True,
-        )
-        print(f"LLM Deduplication error: {e}. Falling back to returning original articles.", flush=True)
-        # Fallback: just pick the best from each local group
-        final_list = []
-        for g in local_dedup_groups:
-            best_article = max(g, key=lambda x: x.get('score_data', {}).get('innovation_score', 0) + x.get('score_data', {}).get('traffic_score', 0))
-            final_list.append(best_article)
-        return final_list
-        
-    final_articles = []
-    processed_group_ids = set()
-    for group in groups:
-        if not isinstance(group, list) or not group:
-            continue
-        valid_group_indices = []
-        for idx in group:
-            if (
-                type(idx) is int
-                and 0 <= idx < len(local_dedup_groups)
-                and idx not in processed_group_ids
-                and idx not in valid_group_indices
-            ):
-                valid_group_indices.append(idx)
-        if not valid_group_indices:
-            continue
-            
-        # Flatten the local groups corresponding to the LLM chosen indices into a single big group
-        combined_articles = []
-        for idx in valid_group_indices:
-            combined_articles.extend(local_dedup_groups[idx])
-            processed_group_ids.add(idx)
-            
-        base_article = combined_articles[0]
-        
-        if len(combined_articles) > 1:
-            sources = set([base_article.get('source', '')])
-            max_inn = base_article.get('score_data', {}).get('innovation_score', 0)
-            max_tra = base_article.get('score_data', {}).get('traffic_score', 0)
-            
-            # Collect all unique titles, summaries, and justifications
-            titles_to_merge = []
-            summaries_to_merge = []
-            justs_to_merge = []
-            
-            # Add base article
-            ds_base = base_article.get('score_data', {})
-            if base_article.get('title'): titles_to_merge.append(base_article['title'])
-            if ds_base.get('translated_title'): titles_to_merge.append(ds_base['translated_title'])
-            if base_article.get('summary'): summaries_to_merge.append(base_article['summary'])
-            if ds_base.get('translated_summary'): summaries_to_merge.append(ds_base['translated_summary'])
-            if ds_base.get('justification'): justs_to_merge.append(ds_base['justification'])
-            
-            for dup_art in combined_articles[1:]:
-                sources.add(dup_art.get('source', ''))
-                ds = dup_art.get('score_data', {})
-                max_inn = max(max_inn, ds.get('innovation_score', 0))
-                max_tra = max(max_tra, ds.get('traffic_score', 0))
-                
-                if dup_art.get('title') and dup_art['title'] not in titles_to_merge: titles_to_merge.append(dup_art['title'])
-                if ds.get('translated_title') and ds['translated_title'] not in titles_to_merge: titles_to_merge.append(ds['translated_title'])
-                if dup_art.get('summary') and dup_art['summary'] not in summaries_to_merge: summaries_to_merge.append(dup_art['summary'])
-                if ds.get('translated_summary') and ds['translated_summary'] not in summaries_to_merge: summaries_to_merge.append(ds['translated_summary'])
-                just = ds.get('justification', '')
-                if just and just not in justs_to_merge: justs_to_merge.append(just)
-                    
-            if len(sources) > 1:
-                max_tra = min(10.0, max_tra + (len(sources) - 1) * 0.5)
-                
-            if 'score_data' not in base_article:
-                base_article['score_data'] = {}
-                
-            # Call LLM to synthesize
-            lang = config.get('output', {}).get('language', 'Chinese')
-            synth_prompt = f"""
-            You are a master news editor. I have multiple news articles reporting on the exact same event from different angles or highlighting different metrics.
-            Your task is to synthesize them into ONE perfect, comprehensive summary.
-            
-            Collected Titles:
-            {json.dumps(titles_to_merge, ensure_ascii=False)}
-            
-            Collected Summaries:
-            {json.dumps(summaries_to_merge, ensure_ascii=False)}
-            
-            Collected Editor Justifications:
-            {json.dumps(justs_to_merge, ensure_ascii=False)}
-            
-            Please generate:
-            1. A 'translated_title' in {lang} that captures all key metrics (e.g. if one says 800M funding and another says 5B valuation, include both if possible, or pick the most impactful).
-            2. A 'translated_summary' in {lang} that is ONE SINGLE SENTENCE (MAX 50 CHARS) synthesizing the most important facts.
-            3. A 'justification' in {lang} (1 sentence) combining the viewpoints of why this event is highly important.
-            
-            Return STRICTLY in JSON matching this schema:
-            {{
-              "translated_title": "string",
-              "translated_summary": "string",
-              "justification": "string"
-            }}
-            """
-                
-            try:
-                synth_res = _call_llm_with_fallback(synth_prompt, config, system_prompt="You are a helpful JSON-outputting news editor.", title_context="News Synthesis")
-                if synth_res:
-                    if synth_res.get("translated_title"):
-                        base_article['score_data']['translated_title'] = synth_res["translated_title"]
-                    if synth_res.get("translated_summary"):
-                        base_article['score_data']['translated_summary'] = synth_res["translated_summary"]
-                    if synth_res.get("justification"):
-                        base_article['score_data']['justification'] = synth_res["justification"]
-                else:
-                    base_article['score_data']['justification'] = " | ".join(justs_to_merge)
-            except Exception as e:
-                log_provider_error(
-                    logger,
-                    e,
-                    provider="configured_llm_chain",
-                    operation="synthesize_duplicate_event",
-                    retryable=False,
-                    degraded_allowed=True,
-                )
-                print(f"Synthesis failed: {e}")
-                base_article['score_data']['justification'] = " | ".join(justs_to_merge)
-                
-            base_article['source'] = ", ".join([s for s in sources if s])
-            base_article['score_data']['innovation_score'] = round(float(max_inn), 1)
-            base_article['score_data']['traffic_score'] = round(float(max_tra), 1)
-                
-            final_articles.append(base_article)
-        else:
-            final_articles.append(base_article)
-        
-    # Add each omitted local group exactly once. `processed_group_ids` contains
-    # local-group indices, never indices from the original article list.
-    for group_id, local_group in enumerate(local_dedup_groups):
-        if group_id not in processed_group_ids:
-            best_article = max(
-                local_group,
-                key=lambda x: x.get('score_data', {}).get('innovation_score', 0)
-                + x.get('score_data', {}).get('traffic_score', 0),
-            )
-            final_articles.append(best_article)
-            
-    return final_articles
 
 def pre_filter_articles_batch(articles_batch, config):
     payload = []
@@ -940,44 +768,10 @@ def score_articles_batch(articles_batch, config):
             "authority_for": a.get("authority_for", []),
         })
         
-    prompt = f"""
-    You are an industry analyst. Apply the canonical policy below to EACH
-    supplied article independently using only its supplied evidence.
-    Published At and source metadata are supplied per article; content_excerpt is only a
-    bounded excerpt, so never claim to have read a full article from it.
-
-    {rubric}
-    
-    Input Articles JSON:
-    {json.dumps(payload, ensure_ascii=False)}
-    
-    Classify and score each article under the rubric. Return only JSON.
-
-    Return STRICTLY a JSON object matching this schema exactly:
-    {{
-      "results": [
-        {{
-          "id": integer,
-          "is_relevant": boolean,
-          "is_vague_or_roundup": boolean,
-          "event_type": string,
-          "industrial_claims": [string],
-          "market_only_claims": [string],
-          "barrier_to_entry": string,
-          "market_size": string,
-          "immediacy": string,
-          "reasoning_chain": string,
-          "tech_score": integer (e.g. 83),
-          "commercial_score": integer (e.g. 76),
-          "hype_score": integer (e.g. 90),
-          "macro_score": integer (e.g. 60),
-          "justification": string,
-          "translated_title": string,
-          "translated_summary": string
-        }}
-      ]
-    }}
-    """
+    prompt = _BATCH_ARTICLE_PROMPT_TEMPLATE.format(
+        rubric=rubric,
+        payload_json=json.dumps(payload, ensure_ascii=False),
+    )
     
     result = _call_llm_with_fallback(prompt, config, title_context=f"Score Batch ({len(articles_batch)} items)")
     
@@ -1102,17 +896,32 @@ def translate_unscored_priority_batch(articles_batch, config):
     return {"results": displays}
 
 
-# Compute this once from the original prompt-building functions.  Keeping the
-# digest immutable for the lifetime of the process makes cache identity robust
-# to test doubles and runtime wrappers, while still invalidating persisted
-# scores whenever the real rubric or batch prompt implementation changes.
+_REFERENCE_RUBRIC_CONFIG = {
+    "industries": [{"name": "__INDUSTRY__"}],
+    "importance_criteria": "__CRITERIA__",
+    "output": {"language": "Chinese", "min_score_to_keep": 7},
+    "scoring_weights": {
+        "innovation": {"tech": 0.6, "commercial": 0.4},
+        "traffic": {"hype": 0.6, "macro": 0.4},
+    },
+}
+
+# Compute this from semantic prompt/rubric contracts rather than Python function
+# source so comments, formatting, and non-semantic refactors do not invalidate
+# validated caches while prompt/schema/rubric edits still bust stale entries.
 SCORING_PROMPT_SHA256 = hashlib.sha256(
-    "\n".join(
-        (
-            inspect.getsource(build_scoring_rubric),
-            inspect.getsource(_strict_rubric),
-            inspect.getsource(score_article),
-            inspect.getsource(score_articles_batch),
-        )
+    json.dumps(
+        {
+            "prompt_version": SCORING_PROMPT_VERSION,
+            "rubric_version": SCORING_RUBRIC_VERSION,
+            "reference_rubric": build_scoring_rubric(_REFERENCE_RUBRIC_CONFIG),
+            "strict_rubric_header": _STRICT_RUBRIC_HEADER,
+            "single_prompt_template": _SINGLE_ARTICLE_PROMPT_TEMPLATE,
+            "batch_prompt_template": _BATCH_ARTICLE_PROMPT_TEMPLATE,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
     ).encode("utf-8")
 ).hexdigest()
