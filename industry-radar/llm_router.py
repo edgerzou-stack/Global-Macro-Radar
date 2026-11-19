@@ -5,7 +5,7 @@ import threading
 import time
 
 from provider_errors import log_provider_error
-from llm_cost_policy import active_run, resolve_policy
+from llm_cost_policy import LLMBudgetExceeded, active_run, resolve_policy
 
 
 try:
@@ -290,10 +290,12 @@ def _call_llm_with_fallback(
                 result["_llm"] = {
                     "provider": provider,
                     "model": model,
-                    "degraded": index > 0 or len(enabled_order) == 1,
+                    "degraded": index > 0 or (len(enabled_order) == 1 and len(order) > 1),
                 }
                 return result
         except Exception as exc:
+            if isinstance(exc, LLMBudgetExceeded):
+                raise
             last_error = exc
             log_provider_error(
                 logger,

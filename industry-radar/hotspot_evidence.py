@@ -7,22 +7,18 @@ contains events that passed the deterministic first-party evidence policy.
 
 import hashlib
 import json
-import os
-import tempfile
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
+from json_io import (
+    canonical_json_sha256 as _canonical_json_sha256,
+    sha256_file as _sha256_file,
+    write_json_atomic,
+)
+
 
 HOTSPOT_EVIDENCE_SCHEMA_VERSION = 2
-
-
-def _sha256_file(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _unique_articles(articles):
@@ -81,16 +77,6 @@ def _canonical_articles_sha256(articles):
     )
     encoded = json.dumps(
         projections,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _canonical_json_sha256(value):
-    encoded = json.dumps(
-        value,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -248,23 +234,5 @@ def publish_hotspot_evidence(
     }
 
     destination = report.parent / f"hotspot_evidence_{effective_date}.json"
-    temporary_path = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=destination.parent,
-            prefix=".hotspot_evidence.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temporary_path = handle.name
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, destination)
-        temporary_path = None
-    finally:
-        if temporary_path and os.path.exists(temporary_path):
-            os.unlink(temporary_path)
+    write_json_atomic(destination, payload, indent=2, sort_keys=False)
     return str(destination)

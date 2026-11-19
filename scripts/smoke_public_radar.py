@@ -37,6 +37,9 @@ def run_smoke(root):
     import evidence_policy
     import main as radar_main
     import import_manual_review
+    import official_newsrooms
+    import qualcomm_newsroom
+    import smic_newsroom
     import pipeline_selection
     import score
     import source_registry
@@ -93,6 +96,9 @@ def run_smoke(root):
         "scoring_prompt_version": score.SCORING_PROMPT_VERSION,
         "main_module": radar_main.__name__,
         "manual_review_module": import_manual_review.__name__,
+        "official_newsrooms_module": official_newsrooms.__name__,
+        "qualcomm_newsroom_module": qualcomm_newsroom.__name__,
+        "smic_newsroom_module": smic_newsroom.__name__,
         "selection_module": pipeline_selection.__name__,
     }
 

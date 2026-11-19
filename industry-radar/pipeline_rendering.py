@@ -1,8 +1,8 @@
 import json
 import os
-import tempfile
 
 from hotspot_evidence import publish_hotspot_evidence
+from json_io import write_json_atomic
 from pipeline_selection import review_is_pending, select_report_articles
 from run_date import logical_today
 from score import unscored_priority_industry_eligibility
@@ -84,28 +84,13 @@ def _write_selection_health(
         "component": "radar-selection-health",
     }
     target = os.path.join(output_dir, "radar_selection_health.json")
-    temporary_path = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=output_dir,
-            prefix=".radar-selection-health.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temporary_path = handle.name
-            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, target)
-        temporary_path = None
-    finally:
-        if temporary_path is not None:
-            try:
-                os.unlink(temporary_path)
-            except FileNotFoundError:
-                pass
+    write_json_atomic(
+        target,
+        payload,
+        indent=2,
+        sort_keys=True,
+        prefix=".radar-selection-health.",
+    )
     return target
 
 

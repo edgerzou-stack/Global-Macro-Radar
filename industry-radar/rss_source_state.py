@@ -1,12 +1,11 @@
 """Opt-in live RSS failure memory; never supplies articles or hides failures."""
 
-import fcntl
-import json
-import os
-import tempfile
 from contextlib import contextmanager
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
+
+from json_io import locked_file, write_json_atomic
 
 
 def _timestamp(value):
@@ -43,31 +42,22 @@ def _validate(state):
 def locked_source_state(path):
     """Serialize fetch/update transactions; reject corrupt memory before fetching."""
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with Path(str(path) + ".lock").open("a") as lock:
-        # Fail promptly rather than hang behind an overlapping live fetch.
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with locked_file(path, blocking=False):
         try:
-            try:
-                state = json.loads(path.read_text()) if path.exists() else {"schema_version": 1, "sources": {}}
-            except (OSError, ValueError) as exc:
-                raise ValueError(f"RSS source state unreadable: {exc}") from exc
-            _validate(state)
-            yield state
-            _validate(state)
-            fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
-            try:
-                with os.fdopen(fd, "w") as output:
-                    json.dump(state, output, indent=2, sort_keys=True)
-                    output.write("\n")
-                    output.flush()
-                    os.fsync(output.fileno())
-                os.replace(temporary, path)
-            finally:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            state = json.loads(path.read_text()) if path.exists() else {"schema_version": 1, "sources": {}}
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"RSS source state unreadable: {exc}") from exc
+        _validate(state)
+        yield state
+        _validate(state)
+        write_json_atomic(
+            path,
+            state,
+            indent=2,
+            sort_keys=True,
+            prefix=path.name + ".",
+            trailing_newline=True,
+        )
 
 
 def active_cooldown(record, now):

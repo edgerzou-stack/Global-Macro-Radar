@@ -2,13 +2,16 @@
 """Validate an audited folder-agent review and compile a scored fixture."""
 
 import argparse
+from collections import OrderedDict
 import hashlib
 import json
 from pathlib import Path
 
+_CERTIFIED_BUNDLE_CACHE = OrderedDict()
+_CERTIFIED_BUNDLE_CACHE_MAX_SIZE = 64
+
+from json_io import canonical_json as _canonical_json, read_json, sha256_file as _sha256_file, write_json_atomic as _write_json_atomic
 from llm_cost_policy import (
-    _canonical_json,
-    _write_json_atomic,
     manual_review_response_contract,
     validate_unscored_priority_display,
 )
@@ -39,14 +42,10 @@ def _priority_industry_review_by_id(response):
     }
 
 
-def _sha256_file(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-
-
 def _load_json_object(path, label):
     try:
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        payload = read_json(path, label=label)
+    except ValueError as error:
         raise ValueError(f"cannot load {label}: {error}") from error
     if not isinstance(payload, dict):
         raise ValueError(f"{label} must be a JSON object")
@@ -512,6 +511,20 @@ def _validated_imported_review_artifacts(request_path, response_path, output_pat
     return request, response, score_by_id, receipt, receipt_path
 
 
+def _session_stat_fingerprint(radar_dir):
+    tokens = []
+    review_receipt = radar_dir / "folder-agent-review-receipt.json"
+    if review_receipt.exists():
+        st = review_receipt.stat()
+        tokens.append(("receipt", st.st_mtime_ns, st.st_size))
+    for subdir in sorted(p for p in radar_dir.iterdir() if p.is_dir() and not p.is_symlink()):
+        for child in sorted(subdir.rglob("*")):
+            if child.is_file() and not child.is_symlink() and not child.name.startswith("."):
+                st = child.stat()
+                tokens.append((str(child.relative_to(radar_dir)), st.st_mtime_ns, st.st_size))
+    return tuple(tokens)
+
+
 def validate_certified_cache_provenance(provenance, semantic_key, score_data):
     """Reject unsealed, changed, partial or self-rehashed cached judgments."""
 
@@ -520,12 +533,12 @@ def validate_certified_cache_provenance(provenance, semantic_key, score_data):
     certificate_path = Path(
         str(provenance.get("review_certificate_path") or "")
     ).resolve()
+    cert_sha = _sha256_file(certificate_path) if certificate_path.is_file() else None
     if (
         certificate_path.name != "review-completion-certificate.json"
         or certificate_path.parent.name != "radar"
-        or not certificate_path.is_file()
-        or _sha256_file(certificate_path)
-        != provenance.get("review_certificate_file_sha256")
+        or cert_sha is None
+        or cert_sha != provenance.get("review_certificate_file_sha256")
     ):
         raise ValueError("certified cache certificate hash/path mismatch")
     radar_dir = certificate_path.parent
@@ -541,18 +554,82 @@ def validate_certified_cache_provenance(provenance, semantic_key, score_data):
         for field, path in canonical_paths.items()
     ):
         raise ValueError("certified cache provenance has noncanonical artifact paths")
-    request, _response, scores, receipt, receipt_path = _validated_imported_review_artifacts(
-        canonical_paths["request_path"],
-        canonical_paths["response_path"],
-        canonical_paths["output_path"],
+    req_sha = _sha256_file(canonical_paths["request_path"])
+    resp_sha = _sha256_file(canonical_paths["response_path"])
+    out_sha = _sha256_file(canonical_paths["output_path"])
+    rcpt_sha = _sha256_file(canonical_paths["receipt_path"])
+    cache_key = (str(run_dir), cert_sha, req_sha, resp_sha, out_sha, rcpt_sha)
+    session_stat = _session_stat_fingerprint(radar_dir)
+    validators = (
+        _validated_imported_review_artifacts,
+        _validated_review_completion_certificate,
+        _validate_certificate_import_binding,
     )
-    certificate = _validated_review_completion_certificate(
-        run_dir, receipt["reviewer"],
-    )
-    _validate_certificate_import_binding(
-        certificate, request, canonical_paths["request_path"],
-        canonical_paths["response_path"],
-    )
+    cached_bundle = _CERTIFIED_BUNDLE_CACHE.get(cache_key)
+    if (
+        cached_bundle is not None
+        and cached_bundle["session_stat"] == session_stat
+        and cached_bundle["validators"] == validators
+        and cached_bundle["rss_path"].is_file()
+        and _sha256_file(cached_bundle["rss_path"]) == cached_bundle["rss_sha256"]
+        and cached_bundle["base_path"].is_file()
+        and _sha256_file(cached_bundle["base_path"]) == cached_bundle["base_sha256"]
+    ):
+        _CERTIFIED_BUNDLE_CACHE.move_to_end(cache_key)
+        scores = cached_bundle["scores"]
+        provenance_base = cached_bundle["provenance_base"]
+    else:
+        request, _response, scores, receipt, receipt_path = _validated_imported_review_artifacts(
+            canonical_paths["request_path"],
+            canonical_paths["response_path"],
+            canonical_paths["output_path"],
+        )
+        certificate = _validated_review_completion_certificate(
+            run_dir, receipt["reviewer"],
+        )
+        _validate_certificate_import_binding(
+            certificate, request, canonical_paths["request_path"],
+            canonical_paths["response_path"],
+        )
+        provenance_base = {
+            "schema_version": 2,
+            "source_run_id": request["run_id"],
+            "source_effective_date": request["effective_date"],
+            "request_sha256": request["request_sha256"],
+            "request_file_sha256": req_sha,
+            "request_path": str(canonical_paths["request_path"]),
+            "response_file_sha256": resp_sha,
+            "response_path": str(canonical_paths["response_path"]),
+            "receipt_file_sha256": rcpt_sha,
+            "receipt_path": str(receipt_path),
+            "output_sha256": out_sha,
+            "output_path": str(canonical_paths["output_path"]),
+            "reviewer": receipt["reviewer"],
+            "prompt_version": request["prompt_version"],
+            "rules_sha256": request["rules_sha256"],
+            "config_sha256": request["config_sha256"],
+            "response_contract_sha256": hashlib.sha256(
+                _canonical_json(request["response_contract"]).encode("utf-8")
+            ).hexdigest(),
+            "review_certificate_path": str(certificate_path),
+            "review_certificate_file_sha256": cert_sha,
+        }
+        rss_fixture = request["rss_fixture"]
+        base_scores = request["base_scores"]
+        _CERTIFIED_BUNDLE_CACHE[cache_key] = {
+            "session_stat": session_stat,
+            "validators": validators,
+            "rss_path": radar_dir / rss_fixture["name"],
+            "rss_sha256": rss_fixture["sha256"],
+            "base_path": radar_dir / base_scores["name"],
+            "base_sha256": base_scores["sha256"],
+            "scores": scores,
+            "provenance_base": provenance_base,
+        }
+        _CERTIFIED_BUNDLE_CACHE.move_to_end(cache_key)
+        while len(_CERTIFIED_BUNDLE_CACHE) > _CERTIFIED_BUNDLE_CACHE_MAX_SIZE:
+            _CERTIFIED_BUNDLE_CACHE.popitem(last=False)
+
     expected_score = scores.get(semantic_key)
     if (
         expected_score is None
@@ -561,31 +638,11 @@ def validate_certified_cache_provenance(provenance, semantic_key, score_data):
     ):
         raise ValueError("cached score differs from its exact sealed article judgment")
     expected_provenance = {
-        "schema_version": 2,
-        "source_run_id": request["run_id"],
-        "source_effective_date": request["effective_date"],
-        "request_sha256": request["request_sha256"],
-        "request_file_sha256": _sha256_file(canonical_paths["request_path"]),
-        "request_path": str(canonical_paths["request_path"]),
-        "response_file_sha256": _sha256_file(canonical_paths["response_path"]),
-        "response_path": str(canonical_paths["response_path"]),
-        "receipt_file_sha256": _sha256_file(receipt_path),
-        "receipt_path": str(receipt_path),
-        "output_sha256": _sha256_file(canonical_paths["output_path"]),
-        "output_path": str(canonical_paths["output_path"]),
-        "reviewer": receipt["reviewer"],
-        "prompt_version": request["prompt_version"],
-        "rules_sha256": request["rules_sha256"],
-        "config_sha256": request["config_sha256"],
-        "response_contract_sha256": hashlib.sha256(
-            _canonical_json(request["response_contract"]).encode("utf-8")
-        ).hexdigest(),
+        **provenance_base,
         "semantic_input_sha256": semantic_key,
         "score_data_sha256": hashlib.sha256(
             _canonical_json(expected_score).encode("utf-8")
         ).hexdigest(),
-        "review_certificate_path": str(certificate_path),
-        "review_certificate_file_sha256": _sha256_file(certificate_path),
     }
     if provenance != expected_provenance:
         raise ValueError("certified cache provenance differs from immutable review evidence")
