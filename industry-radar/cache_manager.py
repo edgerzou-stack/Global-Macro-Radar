@@ -262,14 +262,60 @@ def is_fresh_deep_dive_miss(entry, *, now=None):
         return False
     return 0 <= age < DEEP_DIVE_MISS_TTL_SECONDS
 
-def _prune_cache(cache_data, *, now=None):
+def _current_reachable_identity():
+    """Return the (prompt_version, rules_sha256) reachable via current keys."""
+    try:
+        from pipeline_scoring import (
+            scoring_prompt_identity,
+            scoring_rules_sha256,
+        )
+
+        return str(scoring_prompt_identity()), str(scoring_rules_sha256())
+    except Exception:
+        return None
+
+
+# A stale-version entry remains reachable while any older run's article still
+# carries its original _cache_key (cross-version manual-score reuse looks the
+# old key up directly). Only entries past every realistic reuse horizon may
+# therefore be evicted for their version alone.
+UNREACHABLE_VERSION_TTL_SECONDS = 90 * SECONDS_IN_A_DAY
+
+
+def _prune_cache(cache_data, *, now=None, reachable_identity=None):
     # Validated scores are content-addressed facts. Evicting them by age or an
     # arbitrary capacity cap would violate the no-rescore contract and create
     # avoidable API charges. Prune expired deep-dive negative caches and
     # malformed/stale miss-only entries without deleting validated score_data.
+    # A bounded exception exists for entries whose prompt/rules identity is
+    # provably unreachable via CURRENT semantic keys AND whose reuse horizon
+    # has passed (90 days): the semantic key binds the identity, and the
+    # 17.6MB cache had accumulated v6/v7/v8-era entries for months (OPT-12).
     if not isinstance(cache_data, dict):
         return 0, 0
     current_time = float(time.time() if now is None else now)
+    if reachable_identity is not None:
+        current_prompt, current_rules = (
+            str(reachable_identity[0]),
+            str(reachable_identity[1]),
+        )
+        if current_prompt and current_rules:
+            for key, value in list(cache_data.items()):
+                if not isinstance(value, dict):
+                    continue
+                entry_prompt = str(value.get("prompt_version") or "")
+                entry_rules = str(value.get("rules_sha256") or "")
+                if (
+                    entry_prompt
+                    and entry_rules
+                    and (entry_prompt, entry_rules) != (current_prompt, current_rules)
+                ):
+                    try:
+                        age = current_time - float(value.get("timestamp", 0.0))
+                    except (TypeError, ValueError):
+                        age = UNREACHABLE_VERSION_TTL_SECONDS + 1
+                    if age >= UNREACHABLE_VERSION_TTL_SECONDS:
+                        del cache_data[key]
     expired = 0
     for key, value in list(cache_data.items()):
         if not isinstance(value, dict):
@@ -302,7 +348,9 @@ def load_cache():
             with open(CACHE_FILE, 'r', encoding='utf-8') as f:
                 cache_data = json.load(f)
                 
-            expired, overflow = _prune_cache(cache_data)
+            expired, overflow = _prune_cache(
+                cache_data, reachable_identity=_current_reachable_identity()
+            )
             if expired:
                 print(f"Pruned {expired} expired cache entries.", flush=True)
             if overflow:
@@ -366,7 +414,11 @@ def save_cache(cache_data):
     for key, value in cache_data.items():
         if isinstance(value, dict) and "timestamp" not in value:
             value["timestamp"] = current_time
-    expired, overflow = _prune_cache(cache_data, now=current_time)
+    expired, overflow = _prune_cache(
+        cache_data,
+        now=current_time,
+        reachable_identity=_current_reachable_identity(),
+    )
     if expired or overflow:
         print(
             f"Pruned cache before save: expired={expired}, overflow={overflow}.",
@@ -425,4 +477,13 @@ def merge_verified_cache_entries(entries):
                 )
             cache_data[key] = entry
 
+        first = next(iter(entries.values()))
+        identity = (
+            str(first.get("prompt_version") or ""),
+            str(first.get("rules_sha256") or ""),
+        )
+        _prune_cache(
+            cache_data,
+            reachable_identity=identity if all(identity) else None,
+        )
         _write_json_atomic(target_path, cache_data, allow_nan=False)

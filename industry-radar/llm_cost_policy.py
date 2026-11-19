@@ -654,6 +654,31 @@ def balance_review_entries(entries):
     return [entry for group in ordered_groups for entry in group]
 
 
+_INTERACTIVE_REVIEW_TEXT_LIMIT = 4000
+_INTERACTIVE_REVIEW_TEXT_TAIL = 800
+
+
+def _bounded_interactive_review_text(text):
+    """Bound the interactive review body while keeping head and tail.
+
+    The API scoring path caps article content at 3,000 characters; the
+    interactive path must not transport unbounded feed bodies either (one
+    51,754-character article dominated a worker's batch load on
+    2026-11-18).  Head and tail keep the lede and the closing milestone
+    wording that the scoring rubric keys on.
+    """
+    trimmed = str(text or "").strip()
+    if len(trimmed) <= _INTERACTIVE_REVIEW_TEXT_LIMIT:
+        return trimmed
+    marker = "\n…[interactive review text bounded]…\n"
+    head_limit = _INTERACTIVE_REVIEW_TEXT_LIMIT - _INTERACTIVE_REVIEW_TEXT_TAIL - len(marker)
+    return (
+        trimmed[:head_limit]
+        + marker
+        + trimmed[-_INTERACTIVE_REVIEW_TEXT_TAIL:]
+    )
+
+
 def write_manual_review_bundle(
     path,
     articles,
@@ -681,10 +706,10 @@ def write_manual_review_bundle(
         summary = str(article.get("summary") or "")
         if content.strip():
             content_basis = "feed_body"
-            review_text = content
+            review_text = _bounded_interactive_review_text(content)
         elif summary.strip():
             content_basis = "summary_only"
-            review_text = summary
+            review_text = _bounded_interactive_review_text(summary)
         else:
             raise ValueError(
                 f"manual review article {semantic_key} has no auditable review text"
@@ -796,24 +821,30 @@ def write_interactive_rss_fixture(path, articles, health, *, reference_time=None
         clean_articles.append(article)
 
     clean_health = [dict(item) for item in health]
-    fresh_total = sum(int(item.get("fresh_entries", 0) or 0) for item in clean_health)
-    # Ingestion deduplicates URLs before this hand-off. Preserve the source's
-    # observed count while making the sealed fixture replayable by load_rss_fixture.
-    excess = fresh_total - len(clean_articles)
-    if excess < 0:
-        raise ValueError("RSS health fresh count is smaller than the article set")
-    for item in reversed(clean_health):
-        if excess <= 0:
-            break
+    # Ingestion deduplicates URLs before this hand-off. Attribute the
+    # per-source fresh counts by the articles actually ingested from each
+    # feed (article feed_url), never by deducting from the tail of the
+    # health list: tail-side deduction zeroed trailing first-party sources
+    # (SpaceX, Moderna) for duplicates that came from other feeds
+    # (2026-11-18). The original observed count is preserved as
+    # captured_fresh_entries for audit.
+    from collections import Counter
+
+    attributed_by_feed = Counter(
+        str(article.get("feed_url") or "") for article in clean_articles
+    )
+    for item in clean_health:
         fresh = int(item.get("fresh_entries", 0) or 0)
-        reduction = min(fresh, excess)
-        if reduction:
-            item["captured_fresh_entries"] = fresh
-            item["fresh_entries"] = fresh - reduction
-            item["fresh"] = item["fresh_entries"] > 0
-            excess -= reduction
-    if excess:
-        raise ValueError("cannot normalize RSS health to the deduplicated article set")
+        attributed = min(fresh, attributed_by_feed.get(str(item.get("url") or ""), 0))
+        item["captured_fresh_entries"] = fresh
+        item["fresh_entries"] = attributed
+        item["fresh"] = attributed > 0
+    total_attributed = sum(int(item["fresh_entries"]) for item in clean_health)
+    if total_attributed != len(clean_articles):
+        raise ValueError(
+            "RSS health cannot be attributed to the deduplicated article set: "
+            f"articles={len(clean_articles)} attributed={total_attributed}"
+        )
 
     payload = {
         "schema_version": 1,

@@ -41,6 +41,7 @@
     {"source": "industry-radar/main.py", "destination": "industry-radar/main.py"},
     {"source": "industry-radar/official_newsrooms.py", "destination": "industry-radar/official_newsrooms.py"},
     {"source": "industry-radar/smic_newsroom.py", "destination": "industry-radar/smic_newsroom.py"},
+    {"source": "industry-radar/qualcomm_newsroom.py", "destination": "industry-radar/qualcomm_newsroom.py"},
     {"source": "industry-radar/official_article_capture.py", "destination": "industry-radar/official_article_capture.py"},
     {"source": "industry-radar/official_space_newsrooms.py", "destination": "industry-radar/official_space_newsrooms.py"},
     {"source": "industry-radar/pipeline_deep_dive.py", "destination": "industry-radar/pipeline_deep_dive.py"},

@@ -1,6 +1,6 @@
 {
   "artifact_type": "sanitized-public-export",
-  "candidate_fingerprint": "24c04056b65dacd9038fc470432d936218b1f951b0f9e09539831298408e800f",
+  "candidate_fingerprint": "77d29474145b3704e846557b2e86d5825f5244f62a72300df19e4133d24470ec",
   "entries": [
     {
       "destination": ".github/workflows/public-boundary.yml",
@@ -22,8 +22,8 @@
     },
     {
       "destination": "PUBLIC_EXPORT_POLICY.json",
-      "sha256": "a2554e7e087e22dabd9cbacd31038a9627e6bc6734af4585be52e94334fbc4a0",
-      "size": 5593,
+      "sha256": "bbb01e3b8aaef4ffb2a61516481793912bb2ac332c39b23fb5cf138ba69af88a",
+      "size": 5702,
       "source": "public/public_export_policy.json"
     },
     {
@@ -64,8 +64,8 @@
     },
     {
       "destination": "industry-radar/cache_manager.py",
-      "sha256": "4d1213050f01ad00f318c44860a4a783dfc2062f9fb3f7364dd6e5d76b2df7e4",
-      "size": 16325,
+      "sha256": "0cba89d09cc85a0025e2fa01714af2dca1938f22e102764d69657daf272a5259",
+      "size": 18830,
       "source": "industry-radar/cache_manager.py"
     },
     {
@@ -94,8 +94,8 @@
     },
     {
       "destination": "industry-radar/evidence_corroboration.py",
-      "sha256": "1489798f97df0dd73680984a999e25972c874b573ecb73566e21f2e654da0b4f",
-      "size": 43183,
+      "sha256": "d6c041aa6490f53fda53e8a94a95cd4696482adce6a844c31996f64e8ccd794c",
+      "size": 44129,
       "source": "industry-radar/evidence_corroboration.py"
     },
     {
@@ -136,8 +136,8 @@
     },
     {
       "destination": "industry-radar/llm_cost_policy.py",
-      "sha256": "c58275963c92e855da40bda113d90d98304786b19d2d1bcb0225a156286be7f4",
-      "size": 33231,
+      "sha256": "3d6e0b745b6e3d87cb105e5e620badd8989561bfe068e5aa1ec3498575f8e50b",
+      "size": 34551,
       "source": "industry-radar/llm_cost_policy.py"
     },
     {
@@ -231,8 +231,14 @@
       "source": "industry-radar/provider_errors.py"
     },
     {
+      "destination": "industry-radar/qualcomm_newsroom.py",
+      "sha256": "824c335a2e77dd62dd6ebefbd0317e9be1b9d9cdbabc3846bc499a8307fdc87b",
+      "size": 5285,
+      "source": "industry-radar/qualcomm_newsroom.py"
+    },
+    {
       "destination": "industry-radar/requirements.txt",
-      "sha256": "1a09f68fbc133a0cde5a78c815b7a4042bcc4e4428bceb523a13a7d0ae8abdc9",
+      "sha256": "2c92175976dff63a9dff33e85a489efcf4137dcdbc46dae9ea77c35612306284",
       "size": 194,
       "source": "industry-radar/requirements.txt"
     },
@@ -310,8 +316,8 @@
     },
     {
       "destination": "scripts/smoke_public_radar.py",
-      "sha256": "8590f50c7cd1b5997982ad37378ef15dcd3ffd0340e6fc11b6afdbc6dc663f1c",
-      "size": 4377,
+      "sha256": "a2977100264ccb0f74725c26171dc7271021207409cc219e71d8f59196f695d7",
+      "size": 4647,
       "source": "scripts/smoke_public_radar.py"
     },
     {
@@ -324,5 +330,5 @@
   "policy_version": "public-export-v2-exact",
   "schema_version": 1,
   "source_dirty": false,
-  "source_revision": "0278412a2387e73eb1d569808aba5362d5f763a4"
+  "source_revision": "c5fe1e67ad13c8a04f38fbe46106659a74215f6f"
 }

@@ -332,6 +332,22 @@ def _trade_maturity(article):
     return ""
 
 
+def _memoized_trade_maturity(article, maturity_memo):
+    """Return ``_trade_maturity`` through an optional per-pass memo.
+
+    The corroboration pass evaluates pair gates in nested loops; without a
+    memo the full evidence text of the same article is re-scanned once per
+    pair (348 articles × their primaries).  Keyed by ``id()`` like the
+    existing per-pass token memo; articles live for the whole pass.
+    """
+    if maturity_memo is None:
+        return _trade_maturity(article)
+    key = id(article)
+    if key not in maturity_memo:
+        maturity_memo[key] = _trade_maturity(article)
+    return maturity_memo[key]
+
+
 def _references_exact_article(article, other):
     other_url = _canonical_evidence_url(other.get("link"))
     return bool(other_url) and other_url in {
@@ -345,7 +361,7 @@ def _current_trade_maturity(article):
     return bool(_trade_maturity(article))
 
 
-def _independent_mutual_t1_pair(article, other):
+def _independent_mutual_t1_pair(article, other, *, maturity_memo=None):
     """Prove two official T1 publishers independently attest one current event.
 
     Independence and event identity are deterministic. Exact cross-links are
@@ -407,8 +423,8 @@ def _independent_mutual_t1_pair(article, other):
     )
     if not event_type or event_type != other_event_type:
         return False
-    milestone = _trade_maturity(article)
-    other_milestone = _trade_maturity(other)
+    milestone = _memoized_trade_maturity(article, maturity_memo)
+    other_milestone = _memoized_trade_maturity(other, maturity_memo)
     if not milestone or milestone != other_milestone:
         return False
     if not (
@@ -436,7 +452,7 @@ def _independent_mutual_t1_pair(article, other):
     }
 
 
-def _regulator_issuer_pair(article, regulator):
+def _regulator_issuer_pair(article, regulator, *, maturity_memo=None):
     """Prove that a regulator and issuer independently describe one approval."""
     if article.get("source_tier") != "T1" or regulator.get("source_tier") != "T0":
         return False
@@ -464,8 +480,10 @@ def _regulator_issuer_pair(article, regulator):
         and event_type in set(regulator.get("authority_for") or [])
     ):
         return False
-    if _trade_maturity(article) != "regulatory_approval" or _trade_maturity(
-        regulator
+    if _memoized_trade_maturity(
+        article, maturity_memo
+    ) != "regulatory_approval" or _memoized_trade_maturity(
+        regulator, maturity_memo
     ) != "regulatory_approval":
         return False
     if not (
@@ -882,6 +900,7 @@ def attach_same_batch_primary_corroboration(articles, *, max_days=3):
         if canonical_url:
             primaries_by_url[canonical_url].append(primary)
     primary_tokens = {id(article): _event_tokens(article) for article in primaries}
+    maturity_memo = {}
     source_token_frequency = defaultdict(Counter)
     for primary in primaries:
         source_id = str(primary.get("source_id") or primary.get("source") or "")
@@ -916,7 +935,9 @@ def attach_same_batch_primary_corroboration(articles, *, max_days=3):
             regulator_matches = []
             for primary in primaries:
                 primary_published = _published_datetime(primary)
-                cluster = _regulator_issuer_pair(article, primary)
+                cluster = _regulator_issuer_pair(
+                    article, primary, maturity_memo=maturity_memo
+                )
                 if (
                     primary_published is None
                     or abs((published - primary_published).total_seconds())
@@ -976,7 +997,9 @@ def attach_same_batch_primary_corroboration(articles, *, max_days=3):
                 if id(primary) == id(article):
                     continue
                 primary_published = _published_datetime(primary)
-                cluster = _independent_mutual_t1_pair(article, primary)
+                cluster = _independent_mutual_t1_pair(
+                    article, primary, maturity_memo=maturity_memo
+                )
                 if (
                     primary_published is None
                     or abs((published - primary_published).total_seconds())
